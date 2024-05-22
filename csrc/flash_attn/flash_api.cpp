@@ -293,6 +293,15 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
     if (is_causal) { window_size_right = 0; }
 
+    // do only checks here
+    if (out_.has_value()) {
+        auto out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
+    }
+
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
@@ -321,12 +330,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x head_size
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
-        CHECK_DEVICE(out);
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, sizes[1], sizes[2], head_size_og);
         if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2);
+            out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
         }
         if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {

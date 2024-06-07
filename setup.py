@@ -263,7 +263,7 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
-PYTORCH_VERSION = "2.3.0"
+PYTORCH_VERSION = "2.3.1"
 CUDA_VERSION = "12.1"
 
 setup(

@@ -50,7 +50,7 @@ jobs:
           os: ['ubuntu-20.04']
           python-version: ['3.8', '3.9', '3.10', '3.11']
           pytorch-version: ['2.4.0']  # Should be synced with setup.py.
-          cuda-version: ['12.1']
+          cuda-version: ['12.1', '11.8']
 
     steps:
       - name: Checkout

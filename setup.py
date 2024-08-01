@@ -281,11 +281,21 @@ class NinjaBuildExtension(BuildExtension):
 
 
 PYTORCH_VERSION = "2.4.0"
-CUDA_VERSION = "12.1"
+MAIN_CUDA_VERSION = "12.1"
+
+
+def get_version() -> str:
+    version = get_package_version()
+    cuda_version = str(bare_metal_version)
+    if cuda_version != MAIN_CUDA_VERSION:
+        cuda_version_str = cuda_version.replace(".", "")[:3]
+        version += f"+cu{cuda_version_str}"
+    return version
+
 
 setup(
     name="vllm-flash-attn",
-    version=get_package_version(),
+    version=get_version(),
     packages=find_packages(
         exclude=(
             "build",
@@ -300,7 +310,7 @@ setup(
     ),
     author="vLLM Team",
     description="Forward-only flash-attn",
-    long_description=f"Forward-only flash-attn package built for PyTorch {PYTORCH_VERSION} and CUDA {CUDA_VERSION}",
+    long_description=f"Forward-only flash-attn package built for PyTorch {PYTORCH_VERSION} and CUDA {MAIN_CUDA_VERSION}",
     url="https://github.com/vllm-project/flash-attention.git",
     classifiers=[
         "Programming Language :: Python :: 3",

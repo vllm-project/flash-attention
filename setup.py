@@ -32,7 +32,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "flash_attn"
+PACKAGE_NAME = "vllm_flash_attn"
 
 BASE_WHEEL_URL = (
     "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
@@ -40,10 +40,10 @@ BASE_WHEEL_URL = (
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+FORCE_BUILD = True
+SKIP_CUDA_BUILD = False
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+FORCE_CXX11_ABI = torch._C._GLIBCXX_USE_CXX11_ABI
 
 
 def get_platform():
@@ -106,7 +106,7 @@ if not SKIP_CUDA_BUILD:
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-    check_if_cuda_home_none("flash_attn")
+    check_if_cuda_home_none(PACKAGE_NAME)
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
     if CUDA_HOME is not None:
@@ -132,7 +132,7 @@ if not SKIP_CUDA_BUILD:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
     ext_modules.append(
         CUDAExtension(
-            name="flash_attn_2_cuda",
+            name="vllm_flash_attn_2_cuda",
             sources=[
                 "csrc/flash_attn/flash_api.cpp",
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
@@ -167,22 +167,6 @@ if not SKIP_CUDA_BUILD:
                 "csrc/flash_attn/src/flash_fwd_hdim224_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim160_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim224_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim224_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_bwd_hdim256_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
@@ -233,10 +217,10 @@ if not SKIP_CUDA_BUILD:
                         # "--ptxas-options=-O2",
                         # "-lineinfo",
                         # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        # "-DFLASHATTENTION_DISABLE_DROPOUT",
+                        "-DFLASHATTENTION_DISABLE_DROPOUT",
                         # "-DFLASHATTENTION_DISABLE_ALIBI",
                         # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
+                        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
                         # "-DFLASHATTENTION_DISABLE_LOCAL",
                     ]
                     + generator_flag
@@ -253,7 +237,7 @@ if not SKIP_CUDA_BUILD:
 
 
 def get_package_version():
-    with open(Path(this_dir) / "flash_attn" / "__init__.py", "r") as f:
+    with open(Path(this_dir) / PACKAGE_NAME / "__init__.py", "r") as f:
         version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
@@ -261,29 +245,6 @@ def get_package_version():
         return f"{public_version}+{local_version}"
     else:
         return str(public_version)
-
-
-def get_wheel_url():
-    # Determine the version numbers that will be used to determine the correct wheel
-    # We're using the CUDA version used to build torch, not the one currently installed
-    # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
-    torch_cuda_version = parse(torch.version.cuda)
-    torch_version_raw = parse(torch.__version__)
-    # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
-    # to save CI time. Minor versions should be compatible.
-    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
-    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
-    platform_name = get_platform()
-    flash_version = get_package_version()
-    # cuda_version = f"{cuda_version_raw.major}{cuda_version_raw.minor}"
-    cuda_version = f"{torch_cuda_version.major}{torch_cuda_version.minor}"
-    torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
-    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
-
-    # Determine wheel URL based on CUDA version, torch version, python version and OS
-    wheel_filename = f"{PACKAGE_NAME}-{flash_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{flash_version}", wheel_name=wheel_filename)
-    return wheel_url, wheel_filename
 
 
 class CachedWheelsCommand(_bdist_wheel):
@@ -297,28 +258,6 @@ class CachedWheelsCommand(_bdist_wheel):
     def run(self):
         if FORCE_BUILD:
             return super().run()
-
-        wheel_url, wheel_filename = get_wheel_url()
-        print("Guessing wheel URL: ", wheel_url)
-        try:
-            urllib.request.urlretrieve(wheel_url, wheel_filename)
-
-            # Make the archive
-            # Lifted from the root wheel processing command
-            # https://github.com/pypa/wheel/blob/cf71108ff9f6ffc36978069acb28824b44ae028e/src/wheel/bdist_wheel.py#LL381C9-L381C85
-            if not os.path.exists(self.dist_dir):
-                os.makedirs(self.dist_dir)
-
-            impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-
-            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
-            print("Raw wheel path", wheel_path)
-            os.rename(wheel_filename, wheel_path)
-        except (urllib.error.HTTPError, urllib.error.URLError):
-            print("Precompiled wheel not found. Building from source...")
-            # If the wheel could not be downloaded, build from source
-            super().run()
 
 
 class NinjaBuildExtension(BuildExtension):
@@ -341,8 +280,11 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+PYTORCH_VERSION = "2.4.0"
+CUDA_VERSION = "12.1"
+
 setup(
-    name=PACKAGE_NAME,
+    name="vllm-flash-attn",
     version=get_package_version(),
     packages=find_packages(
         exclude=(
@@ -353,15 +295,13 @@ setup(
             "dist",
             "docs",
             "benchmarks",
-            "flash_attn.egg-info",
+            f"{PACKAGE_NAME}.egg-info",
         )
     ),
-    author="Tri Dao",
-    author_email="tri@tridao.me",
-    description="Flash Attention: Fast and Memory-Efficient Exact Attention",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/Dao-AILab/flash-attention",
+    author="vLLM Team",
+    description="Forward-only flash-attn",
+    long_description=f"Forward-only flash-attn package built for PyTorch {PYTORCH_VERSION} and CUDA {CUDA_VERSION}",
+    url="https://github.com/vllm-project/flash-attention.git",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
@@ -374,13 +314,6 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.8",
-    install_requires=[
-        "torch",
-        "einops",
-    ],
-    setup_requires=[
-        "packaging",
-        "psutil",
-        "ninja",
-    ],
+    install_requires=[f"torch == {PYTORCH_VERSION}"],
+    setup_requires=["psutil"],
 )

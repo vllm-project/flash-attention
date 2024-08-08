@@ -24,4 +24,4 @@ var/
 .idea/
 
 # Dev
-venv
+*env/

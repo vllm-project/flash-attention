@@ -5,10 +5,10 @@ import torch
 from transformers import AutoTokenizer, GPTBigCodeConfig
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeForCausalLM
 
-from flash_attn.models.bigcode import bigcode_config_to_gpt2_config, inv_remap_state_dict_hf_bigcode
-from flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_bigcode
-from flash_attn.utils.generation import update_graph_cache
-from flash_attn.utils.pretrained import state_dict_from_pretrained
+from vllm_flash_attn.models.bigcode import bigcode_config_to_gpt2_config, inv_remap_state_dict_hf_bigcode
+from vllm_flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_bigcode
+from vllm_flash_attn.utils.generation import update_graph_cache
+from vllm_flash_attn.utils.pretrained import state_dict_from_pretrained
 
 
 @pytest.mark.parametrize("model_name", ["bigcode/starcoderbase-1b", "WizardLM/WizardCoder-1B-V1.0"])

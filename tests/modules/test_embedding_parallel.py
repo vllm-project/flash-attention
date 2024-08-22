@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from apex.transformer import parallel_state
 from einops import rearrange
-from flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
+from vllm_flash_attn.modules.embedding import GPT2Embeddings, ParallelGPT2Embeddings
 
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 

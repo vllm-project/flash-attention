@@ -16,8 +16,8 @@ import shutil
 import pytest
 import torch
 from einops import rearrange
-from flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
-from flash_attn.models.llama import (
+from vllm_flash_attn.models.gpt import GPTLMHeadModel, combine_state_dicts_tp, shard_state_dict_tp
+from vllm_flash_attn.models.llama import (
     config_from_checkpoint,
     inv_remap_state_dict_hf_llama,
     llama_config_to_gpt2_config,
@@ -25,9 +25,9 @@ from flash_attn.models.llama import (
     remap_state_dict_meta_llama,
     state_dicts_from_checkpoint,
 )
-from flash_attn.utils.distributed import all_gather_raw
-from flash_attn.utils.generation import update_graph_cache
-from flash_attn.utils.pretrained import state_dict_from_pretrained
+from vllm_flash_attn.utils.distributed import all_gather_raw
+from vllm_flash_attn.utils.generation import update_graph_cache
+from vllm_flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import LlamaConfig, LlamaTokenizer
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 from transformers import AutoConfig

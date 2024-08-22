@@ -3,14 +3,14 @@ import re
 import pytest
 import torch
 from einops import rearrange
-from flash_attn.models.gpt import (
+from vllm_flash_attn.models.gpt import (
     GPTLMHeadModel,
     remap_state_dict_hf_gpt2,
     shard_state_dict_tp,
     combine_state_dicts_tp,
 )
-from flash_attn.utils.generation import InferenceParams
-from flash_attn.utils.pretrained import state_dict_from_pretrained
+from vllm_flash_attn.utils.generation import InferenceParams
+from vllm_flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import GPT2Config, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHeadModelHF
 
@@ -421,7 +421,7 @@ def test_gpt2_speculative_decoding(model_name, optimized, cg):
     )
     max_length = 100
 
-    from flash_attn.utils.generation import decode_speculative
+    from vllm_flash_attn.utils.generation import decode_speculative
 
     torch.manual_seed(42)
     print(f"Speculative decoding, {optimized = }")

@@ -6,9 +6,9 @@ import re
 import pytest
 import torch
 from einops import rearrange
-from flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_gpt2
-from flash_attn.utils.distributed import all_gather_raw
-from flash_attn.utils.pretrained import state_dict_from_pretrained
+from vllm_flash_attn.models.gpt import GPTLMHeadModel, remap_state_dict_hf_gpt2
+from vllm_flash_attn.utils.distributed import all_gather_raw
+from vllm_flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import GPT2Config, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel as GPT2LMHeadModelHF
 

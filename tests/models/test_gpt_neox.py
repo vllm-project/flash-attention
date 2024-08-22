@@ -4,9 +4,9 @@ import time
 
 import pytest
 import torch
-from flash_attn.models.gpt import GPTLMHeadModel
-from flash_attn.models.gpt_neox import gpt_neox_config_to_gpt2_config, remap_state_dict_hf_gpt_neox
-from flash_attn.utils.pretrained import state_dict_from_pretrained
+from vllm_flash_attn.models.gpt import GPTLMHeadModel
+from vllm_flash_attn.models.gpt_neox import gpt_neox_config_to_gpt2_config, remap_state_dict_hf_gpt_neox
+from vllm_flash_attn.utils.pretrained import state_dict_from_pretrained
 from transformers import AutoTokenizer, GPTNeoXConfig
 from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXForCausalLM
 

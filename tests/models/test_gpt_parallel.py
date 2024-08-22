@@ -9,9 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from apex.transformer import parallel_state
 from einops import rearrange
-from flash_attn.losses.cross_entropy import CrossEntropyLoss
-from flash_attn.models.gpt import GPTLMHeadModel, shard_state_dict_tp
-from flash_attn.utils.distributed import allreduce_sequence_parallel_grad
+from vllm_flash_attn.losses.cross_entropy import CrossEntropyLoss
+from vllm_flash_attn.models.gpt import GPTLMHeadModel, shard_state_dict_tp
+from vllm_flash_attn.utils.distributed import allreduce_sequence_parallel_grad
 from transformers import GPT2Config
 
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8

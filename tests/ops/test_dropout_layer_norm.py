@@ -4,13 +4,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from flash_attn.ops.layer_norm import (
+from vllm_flash_attn.ops.layer_norm import (
     DropoutAddLayerNorm,
     dropout_add_layer_norm,
     dropout_add_layer_norm_parallel_residual,
     dropout_add_layer_norm_subset,
 )
-from flash_attn.ops.rms_norm import (
+from vllm_flash_attn.ops.rms_norm import (
     DropoutAddRMSNorm,
     dropout_add_rms_norm,
     dropout_add_rms_norm_parallel_residual,

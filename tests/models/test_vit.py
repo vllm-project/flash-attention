@@ -2,7 +2,7 @@ import re
 
 import pytest
 import torch
-from flash_attn.models.vit import vit_base_patch16_224 as flash_vit_base_patch16_224
+from vllm_flash_attn.models.vit import vit_base_patch16_224 as flash_vit_base_patch16_224
 from timm.models.vision_transformer import vit_base_patch16_224
 
 

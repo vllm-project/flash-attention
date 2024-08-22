@@ -7,7 +7,9 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import vllm_flash_attn_2_cuda as flash_attn_cuda
+
+import vllm_flash_attn._C as flash_attn_cuda  # noqa: F401
+# import vllm_flash_attn_2_cuda as flash_attn_cuda
 
 # isort: on
 

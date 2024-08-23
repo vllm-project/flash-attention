@@ -83,8 +83,7 @@ def _is_hip() -> bool:
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
-        # TODO limited API
-        super().__init__(name, sources=[], py_limited_api=False, **kwa)
+        super().__init__(name, sources=[], py_limited_api=True, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 

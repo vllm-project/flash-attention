@@ -133,14 +133,9 @@ define_gpu_extension_target(
         SOURCES csrc/flash_attn/flash_api.cpp ${FLASH_ATTN_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_GPU_FLAGS}
         ARCHITECTURES ${VLLM_GPU_ARCHES}
-        # pybind does not support SOABI
-        # USE_SABI 3
+        USE_SABI 3
         WITH_SOABI
 )
-
-# TODO(luka): remove this once PyBind is removed
-find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
-target_link_libraries(_C PRIVATE ${TORCH_PYTHON_LIBRARY})
 
 target_include_directories(_C PRIVATE
         csrc/flash_attn

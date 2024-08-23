@@ -1,91 +1,45 @@
 # Copyright (c) 2023, Tri Dao.
-
+import logging
 import sys
-import warnings
 import os
 import re
 import ast
+from collections import namedtuple
 from pathlib import Path
-from packaging.version import parse, Version
-import platform
+from typing import Dict
+from shutil import which
+from packaging.version import Version, parse
 
-from setuptools import setup, find_packages
 import subprocess
-
-import urllib.request
-import urllib.error
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
-    CppExtension,
-    CUDAExtension,
     CUDA_HOME,
 )
 
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+
+logger = logging.getLogger(__name__)
+
+# Enivronment variables
+Envs = namedtuple("Envs", ["VERBOSE", "MAX_JOBS", "NVCC_THREADS", "VLLM_TARGET_DEVICE", "CMAKE_BUILD_TYPE"])
+envs = Envs(
+    VERBOSE=bool(int(os.getenv("VERBOSE", "0"))),
+    MAX_JOBS=os.getenv("MAX_JOBS"),
+    NVCC_THREADS=os.getenv("NVCC_THREADS"),
+    VLLM_TARGET_DEVICE=os.getenv("VLLM_TARGET_DEVICE", "cuda"),
+    CMAKE_BUILD_TYPE=os.getenv("CMAKE_BUILD_TYPE"),
+)
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
-
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 PACKAGE_NAME = "vllm_flash_attn"
-
-BASE_WHEEL_URL = (
-    "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
-)
-
-# FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
-# SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-FORCE_BUILD = True
-SKIP_CUDA_BUILD = False
-# For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = torch._C._GLIBCXX_USE_CXX11_ABI
-
-
-def get_platform():
-    """
-    Returns the platform name as used in wheel filenames.
-    """
-    if sys.platform.startswith("linux"):
-        return f'linux_{platform.uname().machine}'
-    elif sys.platform == "darwin":
-        mac_version = ".".join(platform.mac_ver()[0].split(".")[:2])
-        return f"macosx_{mac_version}_x86_64"
-    elif sys.platform == "win32":
-        return "win_amd64"
-    else:
-        raise ValueError("Unsupported platform: {}".format(sys.platform))
-
-
-def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
-    output = raw_output.split()
-    release_idx = output.index("release") + 1
-    bare_metal_version = parse(output[release_idx].split(",")[0])
-
-    return raw_output, bare_metal_version
-
-
-def check_if_cuda_home_none(global_option: str) -> None:
-    if CUDA_HOME is not None:
-        return
-    # warn instead of error because user could be downloading prebuilt wheels, so nvcc won't be necessary
-    # in that case.
-    warnings.warn(
-        f"{global_option} was requested, but nvcc was not found.  Are you sure your environment has nvcc available?  "
-        "If you're installing within a container from https://hub.docker.com/r/pytorch/pytorch, "
-        "only images whose names contain 'devel' will provide nvcc."
-    )
-
-
-def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
-    return nvcc_extra_args + ["--threads", nvcc_threads]
-
 
 cmdclass = {}
 ext_modules = []
@@ -94,146 +48,186 @@ ext_modules = []
 # files included in the source distribution, in case the user compiles from source.
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
-if not SKIP_CUDA_BUILD:
-    print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
-    TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
-    # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = []
-    torch_dir = torch.__path__[0]
-    if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
-        generator_flag = ["-DOLD_GENERATOR_PATH"]
+def is_sccache_available() -> bool:
+    return which("sccache") is not None
 
-    check_if_cuda_home_none(PACKAGE_NAME)
-    # Check, if CUDA11 is installed for compute capability 8.0
-    cc_flag = []
-    if CUDA_HOME is not None:
-        _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
-        if bare_metal_version < Version("11.6"):
-            raise RuntimeError(
-                "FlashAttention is only supported on CUDA 11.6 and above.  "
-                "Note: make sure nvcc has a supported version by running nvcc -V."
-            )
-    # cc_flag.append("-gencode")
-    # cc_flag.append("arch=compute_75,code=sm_75")
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_80,code=sm_80")
-    if CUDA_HOME is not None:
-        if bare_metal_version >= Version("11.8"):
-            cc_flag.append("-gencode")
-            cc_flag.append("arch=compute_90,code=sm_90")
 
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
-    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
-    if FORCE_CXX11_ABI:
-        torch._C._GLIBCXX_USE_CXX11_ABI = True
-    ext_modules.append(
-        CUDAExtension(
-            name="vllm_flash_attn_2_cuda",
-            sources=[
-                "csrc/flash_attn/flash_api.cpp",
-                "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim224_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim224_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim32_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim96_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim160_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim224_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim224_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_hdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim224_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim224_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim160_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim224_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim224_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
-            ],
-            extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"] + generator_flag,
-                "nvcc": append_nvcc_threads(
-                    [
-                        "-O3",
-                        "-std=c++17",
-                        "-U__CUDA_NO_HALF_OPERATORS__",
-                        "-U__CUDA_NO_HALF_CONVERSIONS__",
-                        "-U__CUDA_NO_HALF2_OPERATORS__",
-                        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                        "--expt-relaxed-constexpr",
-                        "--expt-extended-lambda",
-                        "--use_fast_math",
-                        # "--ptxas-options=-v",
-                        # "--ptxas-options=-O2",
-                        # "-lineinfo",
-                        # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                        "-DFLASHATTENTION_DISABLE_DROPOUT",
-                        # "-DFLASHATTENTION_DISABLE_ALIBI",
-                        # "-DFLASHATTENTION_DISABLE_SOFTCAP",
-                        "-DFLASHATTENTION_DISABLE_UNEVEN_K",
-                        # "-DFLASHATTENTION_DISABLE_LOCAL",
-                    ]
-                    + generator_flag
-                    + cc_flag
-                ),
-            },
-            include_dirs=[
-                Path(this_dir) / "csrc" / "flash_attn",
-                Path(this_dir) / "csrc" / "flash_attn" / "src",
-                Path(this_dir) / "csrc" / "cutlass" / "include",
-            ],
-        )
-    )
+def is_ccache_available() -> bool:
+    return which("ccache") is not None
+
+
+def is_ninja_available() -> bool:
+    return which("ninja") is not None
+
+
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+
+VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
+
+
+def _is_cuda() -> bool:
+    has_cuda = torch.version.cuda is not None
+    return VLLM_TARGET_DEVICE == "cuda" and has_cuda
+
+
+def _is_hip() -> bool:
+    return (VLLM_TARGET_DEVICE == "cuda"
+            or VLLM_TARGET_DEVICE == "rocm") and torch.version.hip is not None
+
+
+class CMakeExtension(Extension):
+
+    def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
+        # TODO limited API
+        super().__init__(name, sources=[], py_limited_api=False, **kwa)
+        self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
+
+
+class cmake_build_ext(build_ext):
+    # A dict of extension directories that have been configured.
+    did_config: Dict[str, bool] = {}
+
+    #
+    # Determine number of compilation jobs and optionally nvcc compile threads.
+    #
+    def compute_num_jobs(self):
+        # `num_jobs` is either the value of the MAX_JOBS environment variable
+        # (if defined) or the number of CPUs available.
+        num_jobs = envs.MAX_JOBS
+        if num_jobs is not None:
+            num_jobs = int(num_jobs)
+            logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
+        else:
+            try:
+                # os.sched_getaffinity() isn't universally available, so fall
+                #  back to os.cpu_count() if we get an error here.
+                num_jobs = len(os.sched_getaffinity(0))
+            except AttributeError:
+                num_jobs = os.cpu_count()
+
+        nvcc_threads = None
+        if _is_cuda() and get_nvcc_cuda_version() >= Version("11.2"):
+            # `nvcc_threads` is either the value of the NVCC_THREADS
+            # environment variable (if defined) or 1.
+            # when it is set, we reduce `num_jobs` to avoid
+            # overloading the system.
+            nvcc_threads = envs.NVCC_THREADS
+            if nvcc_threads is not None:
+                nvcc_threads = int(nvcc_threads)
+                logger.info(
+                    "Using NVCC_THREADS=%d as the number of nvcc threads.",
+                    nvcc_threads)
+            else:
+                nvcc_threads = 1
+            num_jobs = max(1, num_jobs // nvcc_threads)
+
+        return num_jobs, nvcc_threads
+
+    #
+    # Perform cmake configuration for a single extension.
+    #
+    def configure(self, ext: CMakeExtension) -> None:
+        # If we've already configured using the CMakeLists.txt for
+        # this extension, exit early.
+        if ext.cmake_lists_dir in cmake_build_ext.did_config:
+            return
+
+        cmake_build_ext.did_config[ext.cmake_lists_dir] = True
+
+        # Select the build type.
+        # Note: optimization level + debug info are set by the build type
+        default_cfg = "Debug" if self.debug else "RelWithDebInfo"
+        cfg = envs.CMAKE_BUILD_TYPE or default_cfg
+
+        # where .so files will be written, should be the same for all extensions
+        # that use the same CMakeLists.txt.
+        outdir = os.path.abspath(
+            os.path.dirname(self.get_ext_fullpath(ext.name)))
+
+        cmake_args = [
+            '-DCMAKE_BUILD_TYPE={}'.format(cfg),
+            '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}'.format(outdir),
+            '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}'.format(self.build_temp),
+            '-DVLLM_TARGET_DEVICE={}'.format(VLLM_TARGET_DEVICE),
+        ]
+
+        verbose = envs.VERBOSE
+        if verbose:
+            cmake_args += ['-DCMAKE_VERBOSE_MAKEFILE=ON']
+
+        if is_sccache_available():
+            cmake_args += [
+                '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
+                '-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache',
+                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
+            ]
+        elif is_ccache_available():
+            cmake_args += [
+                '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache',
+                '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
+            ]
+
+        # Pass the python executable to cmake so it can find an exact
+        # match.
+        cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+
+        # Pass the python path to cmake so it can reuse the build dependencies
+        # on subsequent calls to python.
+        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
+
+        #
+        # Setup parallelism and build tool
+        #
+        num_jobs, nvcc_threads = self.compute_num_jobs()
+
+        if nvcc_threads:
+            cmake_args += ['-DNVCC_THREADS={}'.format(nvcc_threads)]
+
+        if is_ninja_available():
+            build_tool = ['-G', 'Ninja']
+            cmake_args += [
+                '-DCMAKE_JOB_POOL_COMPILE:STRING=compile',
+                '-DCMAKE_JOB_POOLS:STRING=compile={}'.format(num_jobs),
+            ]
+        else:
+            # Default build tool to whatever cmake picks.
+            build_tool = []
+        subprocess.check_call(
+            ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
+            cwd=self.build_temp)
+
+    def build_extensions(self) -> None:
+        # Ensure that CMake is present and working
+        try:
+            subprocess.check_output(['cmake', '--version'])
+        except OSError as e:
+            raise RuntimeError('Cannot find CMake executable') from e
+
+        # Create build directory if it does not exist.
+        if not os.path.exists(self.build_temp):
+            os.makedirs(self.build_temp)
+
+        targets = []
+        # Build all the extensions
+        for ext in self.extensions:
+            self.configure(ext)
+            targets.append(remove_prefix(ext.name, "vllm_flash_attn."))
+
+        num_jobs, _ = self.compute_num_jobs()
+
+        build_args = [
+            "--build",
+            ".",
+            f"-j={num_jobs}",
+            *[f"--target={name}" for name in targets],
+        ]
+
+        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
 
 
 def get_package_version():
@@ -245,19 +239,6 @@ def get_package_version():
         return f"{public_version}+{local_version}"
     else:
         return str(public_version)
-
-
-class CachedWheelsCommand(_bdist_wheel):
-    """
-    The CachedWheelsCommand plugs into the default bdist wheel, which is ran by pip when it cannot
-    find an existing wheel (which is currently the case for all flash attention installs). We use
-    the environment parameters to detect whether there is already a pre-built version of a compatible
-    wheel available and short-circuits the standard full build pipeline.
-    """
-
-    def run(self):
-        if FORCE_BUILD:
-            return super().run()
 
 
 class NinjaBuildExtension(BuildExtension):
@@ -284,30 +265,42 @@ PYTORCH_VERSION = "2.4.0"
 MAIN_CUDA_VERSION = "12.1"
 
 
+def get_nvcc_cuda_version() -> Version:
+    """Get the CUDA version from nvcc.
+
+    Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
+    """
+    assert CUDA_HOME is not None, "CUDA_HOME is not set"
+    nvcc_output = subprocess.check_output([CUDA_HOME + "/bin/nvcc", "-V"],
+                                          universal_newlines=True)
+    output = nvcc_output.split()
+    release_idx = output.index("release") + 1
+    nvcc_cuda_version = parse(output[release_idx].split(",")[0])
+    return nvcc_cuda_version
+
+
 def get_version() -> str:
     version = get_package_version()
-    cuda_version = str(bare_metal_version)
+    cuda_version = str(get_nvcc_cuda_version())
     if cuda_version != MAIN_CUDA_VERSION:
         cuda_version_str = cuda_version.replace(".", "")[:3]
         version += f"+cu{cuda_version_str}"
     return version
 
 
+ext_modules.append(CMakeExtension(name="vllm_flash_attn._C"))
+
 setup(
     name="vllm-flash-attn",
     version=get_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            f"{PACKAGE_NAME}.egg-info",
-        )
-    ),
+    packages=find_packages(exclude=("build",
+                                    "csrc",
+                                    "include",
+                                    "tests",
+                                    "dist",
+                                    "docs",
+                                    "benchmarks",
+                                    f"{PACKAGE_NAME}.egg-info",)),
     author="vLLM Team",
     description="Forward-only flash-attn",
     long_description=f"Forward-only flash-attn package built for PyTorch {PYTORCH_VERSION} and CUDA {MAIN_CUDA_VERSION}",
@@ -318,11 +311,7 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
-    if ext_modules
-    else {
-        "bdist_wheel": CachedWheelsCommand,
-    },
+    cmdclass={"build_ext": cmake_build_ext} if len(ext_modules) > 0 else {},
     python_requires=">=3.8",
     install_requires=[f"torch == {PYTORCH_VERSION}"],
     setup_requires=["psutil"],

@@ -18,7 +18,7 @@ set(ignoreMe "${VLLM_PYTHON_PATH}")
 # Supported python versions. These should be kept in sync with setup.py.
 set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
 
-# Supported NVIDIA architectures.
+# Supported NVIDIA architectures. TODO(luka) this might be incorrect
 set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
 
 # Supported AMD GPU architectures.
@@ -66,6 +66,11 @@ find_package(Torch REQUIRED)
 #
 if (NOT HIP_FOUND AND CUDA_FOUND)
     set(VLLM_GPU_LANG "CUDA")
+
+    # Check CUDA is at least 11.6
+    if (CUDA_VERSION VERSION_LESS 11.6)
+        message(FATAL_ERROR "CUDA version 11.6 or greater is required.")
+    endif ()
 
     if (NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
         message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
@@ -121,22 +126,21 @@ endif ()
 file(GLOB FLASH_ATTN_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
 message(DEBUG "FLASH_ATTN_GEN_SRCS: ${FLASH_ATTN_GEN_SRCS}")
 
-set(VLLM_EXT_SRC
-        csrc/flash_attn/flash_api.cpp
-        ${FLASH_ATTN_GEN_SRCS}
-)
-
 define_gpu_extension_target(
         _C
         DESTINATION vllm_flash_attn
         LANGUAGE ${VLLM_GPU_LANG}
-        SOURCES ${VLLM_EXT_SRC}
+        SOURCES csrc/flash_attn/flash_api.cpp ${FLASH_ATTN_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_GPU_FLAGS}
         ARCHITECTURES ${VLLM_GPU_ARCHES}
         # pybind does not support SOABI
         # USE_SABI 3
-        # WITH_SOABI
+        WITH_SOABI
 )
+
+# TODO(luka): remove this once PyBind is removed
+find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
+target_link_libraries(_C PRIVATE ${TORCH_PYTHON_LIBRARY})
 
 target_include_directories(_C PRIVATE
         csrc/flash_attn
@@ -145,8 +149,10 @@ target_include_directories(_C PRIVATE
 
 # remove macros
 target_compile_options(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__>)
-target_compile_definitions(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K>)
+# other options
 target_compile_options(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math>)
+# custom definitions (TODO: both langs?)
+target_compile_definitions(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K>)
 
 # Check for old generator
 find_file(OLD_GENERATOR_FILE "ATen/CUDAGeneratorImpl.h" ${TORCH_INCLUDE_DIRS} NO_DEFAULT_PATH)

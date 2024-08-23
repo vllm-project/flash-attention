@@ -8,7 +8,7 @@ import torch.nn as nn
 # isort: off
 # We need to import the CUDA kernels after importing torch
 
-import vllm_flash_attn._C # noqa: F401
+import vllm_flash_attn.vllm_flash_attn_c # noqa: F401
 
 # isort: on
 
@@ -50,7 +50,7 @@ def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops._C.fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.fwd(
         q,
         k,
         v,
@@ -88,7 +88,7 @@ def _flash_attn_varlen_forward(
     out=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops._C.varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.varlen_fwd(
         q,
         k,
         v,
@@ -141,7 +141,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = torch.ops._C.bwd(
+    ) = torch.ops.vllm_flash_attn_c.bwd(
         dout,
         q,
         k,
@@ -195,7 +195,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = torch.ops._C.varlen_bwd(
+    ) = torch.ops.vllm_flash_attn_c.varlen_bwd(
         dout,
         q,
         k,
@@ -1293,7 +1293,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = torch.ops._C.fwd_kvcache(
+    out, softmax_lse = torch.ops.vllm_flash_attn_c.fwd_kvcache(
         q,
         k_cache,
         v_cache,

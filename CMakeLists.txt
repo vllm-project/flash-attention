@@ -127,7 +127,7 @@ file(GLOB FLASH_ATTN_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
 message(DEBUG "FLASH_ATTN_GEN_SRCS: ${FLASH_ATTN_GEN_SRCS}")
 
 define_gpu_extension_target(
-        _C
+        vllm_flash_attn_c
         DESTINATION vllm_flash_attn
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES csrc/flash_attn/flash_api.cpp ${FLASH_ATTN_GEN_SRCS}
@@ -137,20 +137,20 @@ define_gpu_extension_target(
         WITH_SOABI
 )
 
-target_include_directories(_C PRIVATE
+target_include_directories(vllm_flash_attn_c PRIVATE
         csrc/flash_attn
         csrc/flash_attn/src
         csrc/cutlass/include)
 
 # remove macros
-target_compile_options(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__>)
+target_compile_options(vllm_flash_attn_c PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__ -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__>)
 # other options
-target_compile_options(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math>)
+target_compile_options(vllm_flash_attn_c PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math>)
 # custom definitions (TODO: both langs?)
-target_compile_definitions(_C PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K>)
+target_compile_definitions(vllm_flash_attn_c PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K>)
 
 # Check for old generator
 find_file(OLD_GENERATOR_FILE "ATen/CUDAGeneratorImpl.h" ${TORCH_INCLUDE_DIRS} NO_DEFAULT_PATH)
 if (OLD_GENERATOR_FILE)
-    target_compile_definitions(_C PRIVATE -DOLD_GENERATOR_PATH)
+    target_compile_definitions(vllm_flash_attn_c PRIVATE -DOLD_GENERATOR_PATH)
 endif ()

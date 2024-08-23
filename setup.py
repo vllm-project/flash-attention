@@ -287,7 +287,7 @@ def get_version() -> str:
     return version
 
 
-ext_modules.append(CMakeExtension(name="vllm_flash_attn._C"))
+ext_modules.append(CMakeExtension(name="vllm_flash_attn.vllm_flash_attn_c"))
 
 setup(
     name="vllm-flash-attn",

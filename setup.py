@@ -44,8 +44,7 @@ PACKAGE_NAME = "vllm_flash_attn"
 cmdclass = {}
 ext_modules = []
 
-# We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
-# files included in the source distribution, in case the user compiles from source.
+# TODO(luka): This should be replaced with a fetch_content call in CMakeLists.txt
 subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 

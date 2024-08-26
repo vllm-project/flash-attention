@@ -18,11 +18,6 @@
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-// Tuple with N elements of the same type
-template <typename T, size_t N>
-using Tuple = void;
-
-
 void set_params_fprop(Flash_fwd_params &params,
         // sizes
                       const size_t b,
@@ -246,7 +241,8 @@ void set_params_splitkv(Flash_fwd_params &params, const int batch_size,
 }
 
 void
-set_params_alibi(Flash_fwd_params &params, const c10::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads) {
+set_params_alibi(Flash_fwd_params &params, const c10::optional<at::Tensor> &alibi_slopes_, int batch_size,
+                 int num_heads) {
 #ifdef FLASHATTENTION_DISABLE_ALIBI
     TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
     params.alibi_slopes_ptr = nullptr;
@@ -732,11 +728,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 const c10::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
                 const double softmax_scale,
                 bool is_causal,
-                int64_t  window_size_left,
-                int64_t  window_size_right,
+                int64_t window_size_left,
+                int64_t window_size_right,
                 const double softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int64_t  num_splits
+                int64_t num_splits
 ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1004,7 +1000,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-    ops.def("fwd(Tensor! q, Tensor k, Tensor v, Tensor? out, Tensor? alibi_slopes, "
+    ops.def("fwd(Tensor! q, Tensor k, Tensor v, Tensor!? out, Tensor? alibi_slopes, "
             "float p_dropout, float softmax_scale, bool is_causal, int window_size_left, int window_size_right, "
             "float softcap, bool return_softmax, Generator? gen)"
             "-> Tensor[]");
@@ -1019,7 +1015,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? block_table, Tensor? alibi_slopes, "
-            "Tensor? out, float softmax_scale, bool is_causal, int window_size_left, int window_size_right, "
+            "Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, int window_size_right, "
             "float softcap, bool is_rotary_interleaved, int num_splits) -> Tensor[]");
     ops.impl("fwd_kvcache", torch::kCUDA, &mha_fwd_kvcache);
 }

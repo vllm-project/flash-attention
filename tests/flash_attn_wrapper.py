@@ -87,3 +87,17 @@ def flash_attn_with_kvcache(
         alibi_slopes=alibi_slopes,
         softcap=softcap,
     )
+
+@flash_attn_with_kvcache.register_fake  # type: ignore
+def _(
+        decode_query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        cache_seqlens: Optional[torch.Tensor] = None,
+        block_table: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        alibi_slopes: Optional[torch.Tensor] = None,
+        softcap: float = 0.0,
+) -> torch.Tensor:
+    return torch.empty_like(decode_query)

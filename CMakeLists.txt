@@ -43,8 +43,7 @@ find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
 # Update cmake's `CMAKE_PREFIX_PATH` with torch location.
 #
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
-message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
-message(STATUS "TORCH_INSTALL_PREFIX: ${TORCH_INSTALL_PREFIX}")
+message(DEBUG "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
 
 # Ensure the 'nvcc' command is in the PATH
 find_program(NVCC_EXECUTABLE nvcc)

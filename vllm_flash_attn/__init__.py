@@ -1,6 +1,7 @@
 __version__ = "2.6.1"
 
-from vllm_flash_attn.flash_attn_interface import (
+# Use relative import to support build-from-source installation in vLLM
+from .flash_attn_interface import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,

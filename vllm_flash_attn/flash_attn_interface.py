@@ -7,8 +7,8 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-
-import vllm_flash_attn.vllm_flash_attn_c # noqa: F401
+# Use relative import to support build-from-source installation in vLLM
+from . import vllm_flash_attn_c # noqa: F401
 
 # isort: on
 

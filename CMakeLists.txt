@@ -45,12 +45,6 @@ find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 message(DEBUG "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
 
-# Ensure the 'nvcc' command is in the PATH
-find_program(NVCC_EXECUTABLE nvcc)
-if (CUDA_FOUND AND NOT NVCC_EXECUTABLE)
-    message(FATAL_ERROR "nvcc not found")
-endif ()
-
 #
 # Import torch cmake configuration.
 # Torch also imports CUDA (and partially HIP) languages with some customizations,

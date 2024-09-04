@@ -1,3 +1,8 @@
+#
+# This file is copied verbatim from vLLM:
+# https://github.com/vllm-project/vllm/blob/main/tests/kernels/test_flash_attn.py
+#
+
 from typing import List, Optional, Tuple
 
 import pytest

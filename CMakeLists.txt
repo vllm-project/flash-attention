@@ -123,7 +123,7 @@ message(DEBUG "FLASH_ATTN_GEN_SRCS: ${FLASH_ATTN_GEN_SRCS}")
 
 define_gpu_extension_target(
         vllm_flash_attn_c
-        DESTINATION vllm_flash_attn
+        DESTINATION .
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES csrc/flash_attn/flash_api.cpp ${FLASH_ATTN_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_GPU_FLAGS}

@@ -142,15 +142,8 @@ class cmake_build_ext(build_ext):
         default_cfg = "Debug" if self.debug else "RelWithDebInfo"
         cfg = envs.CMAKE_BUILD_TYPE or default_cfg
 
-        # where .so files will be written, should be the same for all extensions
-        # that use the same CMakeLists.txt.
-        outdir = os.path.abspath(
-            os.path.dirname(self.get_ext_fullpath(ext.name)))
-
         cmake_args = [
             '-DCMAKE_BUILD_TYPE={}'.format(cfg),
-            '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}'.format(outdir),
-            '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}'.format(self.build_temp),
             '-DVLLM_TARGET_DEVICE={}'.format(VLLM_TARGET_DEVICE),
         ]
 
@@ -211,10 +204,11 @@ class cmake_build_ext(build_ext):
             os.makedirs(self.build_temp)
 
         targets = []
+        target_name = lambda s: remove_prefix(s, "vllm_flash_attn.")
         # Build all the extensions
         for ext in self.extensions:
             self.configure(ext)
-            targets.append(remove_prefix(ext.name, "vllm_flash_attn."))
+            targets.append(target_name(ext.name))
 
         num_jobs, _ = self.compute_num_jobs()
 
@@ -226,6 +220,17 @@ class cmake_build_ext(build_ext):
         ]
 
         subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+
+        # Install the libraries
+        for ext in self.extensions:
+            # Install the extension into the proper location
+            outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
+
+            install_args = [
+                "cmake", "--install", ".", "--prefix", outdir, "--component",
+                target_name(ext.name)
+            ]
+            subprocess.check_call(install_args, cwd=self.build_temp)
 
 
 def get_package_version():

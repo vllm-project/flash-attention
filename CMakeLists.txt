@@ -15,6 +15,30 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 # Suppress potential warnings about unused manually-specified variables
 set(ignoreMe "${VLLM_PYTHON_PATH}")
 
+# Supported python versions. These should be kept in sync with setup.py.
+set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
+
+# Supported NVIDIA architectures.
+set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
+
+# Supported AMD GPU architectures.
+set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
+
+#
+# Supported/expected torch versions for CUDA/ROCm.
+#
+# Currently, having an incorrect pytorch version results in a warning
+# rather than an error.
+#
+# Note: the CUDA torch version is derived from pyproject.toml and various
+# requirements.txt files and should be kept consistent.  The ROCm torch
+# versions are derived from Dockerfile.rocm
+#
+set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
+set(TORCH_SUPPORTED_VERSION_ROCM "2.5.0")
+
+find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
+
 if (VLLM_PARENT_BUILD)
     # vLLM extracts the supported architectures from the global CMAKE_CUDA_FLAGS, which are set by torch.
     # Because CMAKE_CUDA_FLAGS has been modified, we cannot use the same logic.
@@ -23,39 +47,38 @@ if (VLLM_PARENT_BUILD)
     macro(check_found NAME VAR)
         if (NOT ${VAR})
             message(FATAL_ERROR "${NAME} must have been found by parent.")
-        endif()
+        endif ()
     endmacro()
 
     check_found("Torch" TORCH_FOUND)
-    check_found("Python" Python_FOUND)
 
     set(VLLM_FA_GPU_FLAGS ${VLLM_GPU_FLAGS})
-else()
+    set(VLLM_FA_GPU_ARCHES ${VLLM_GPU_ARCHES})
+
+    # Allow direct override of GPU architectures.
+    # These have to be in CMake syntax (75-real, 89-virtual, etc).
+    if (DEFINED ENV{VLLM_FA_CMAKE_GPU_ARCHES})
+        message(STATUS "Overriding GPU architectures to $ENV{VLLM_FA_CMAKE_GPU_ARCHES}")
+        set(VLLM_FA_GPU_ARCHES $ENV{VLLM_FA_CMAKE_GPU_ARCHES})
+
+        # Generally, we want to build with a subset of the parent arches.
+        foreach (VLLM_FA_GPU_ARCH IN LISTS VLLM_FA_GPU_ARCHES)
+            if (NOT VLLM_FA_GPU_ARCH IN_LIST ${VLLM_GPU_ARCHES})
+                message(WARNING "Using GPU architecture ${VLLM_FA_GPU_ARCH}, "
+                        "which is not included in the parent list.")
+            endif ()
+        endforeach ()
+
+        # TODO Check that these are supported arches.
+        if (VLLM_GPU_LANG STREQUAL "CUDA")
+            #            check_supported_archs(VLLM_FA_GPU_ARCHES ${CUDA_SUPPORTED_ARCHS})
+        elseif (VLLM_GPU_LANG STREQUAL "HIP")
+            #
+        endif ()
+    endif ()
+
+else ()
     message(STATUS "Standalone vllm-flash-attn build.")
-
-    # Supported python versions. These should be kept in sync with setup.py.
-    set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
-
-    # Supported NVIDIA architectures. TODO(luka) this might be incorrect
-    set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
-
-    # Supported AMD GPU architectures.
-    set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
-
-    #
-    # Supported/expected torch versions for CUDA/ROCm.
-    #
-    # Currently, having an incorrect pytorch version results in a warning
-    # rather than an error.
-    #
-    # Note: the CUDA torch version is derived from pyproject.toml and various
-    # requirements.txt files and should be kept consistent.  The ROCm torch
-    # versions are derived from Dockerfile.rocm
-    #
-    set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
-    set(TORCH_SUPPORTED_VERSION_ROCM "2.5.0")
-
-    find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
 
     #
     # Update cmake's `CMAKE_PREFIX_PATH` with torch location.
@@ -88,6 +111,8 @@ else()
                     "expected for CUDA build, saw ${Torch_VERSION} instead.")
         endif ()
     elseif (HIP_FOUND)
+        message(FATAL_ERROR "ROCm build is not currently supported for vllm-flash-attn.")
+
         set(VLLM_GPU_LANG "HIP")
 
         # Importing torch recognizes and sets up some HIP/ROCm configuration but does
@@ -110,7 +135,7 @@ else()
     # the supported versions for the current language.
     # The final set of arches is stored in `VLLM_GPU_ARCHES`.
     #
-    override_gpu_arches(VLLM_GPU_ARCHES
+    override_gpu_arches(VLLM_FA_GPU_ARCHES
             ${VLLM_GPU_LANG}
             "${${VLLM_GPU_LANG}_SUPPORTED_ARCHS}")
 
@@ -127,7 +152,7 @@ else()
     if (NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
         list(APPEND VLLM_FA_GPU_FLAGS "--threads=${NVCC_THREADS}")
     endif ()
-endif()
+endif ()
 
 # Other flags
 list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math)
@@ -146,7 +171,7 @@ define_gpu_extension_target(
         LANGUAGE ${VLLM_GPU_LANG}
         SOURCES csrc/flash_attn/flash_api.cpp ${FLASH_ATTN_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
-        ARCHITECTURES ${VLLM_GPU_ARCHES}
+        ARCHITECTURES ${VLLM_FA_GPU_ARCHES}
         USE_SABI 3
         WITH_SOABI
 )

@@ -63,7 +63,7 @@ if (VLLM_PARENT_BUILD)
 
         # Generally, we want to build with a subset of the parent arches.
         foreach (VLLM_FA_GPU_ARCH IN LISTS VLLM_FA_GPU_ARCHES)
-            if (NOT VLLM_FA_GPU_ARCH IN_LIST ${VLLM_GPU_ARCHES})
+            if (NOT VLLM_FA_GPU_ARCH IN_LIST VLLM_GPU_ARCHES)
                 message(WARNING "Using GPU architecture ${VLLM_FA_GPU_ARCH}, "
                         "which is not included in the parent list.")
             endif ()

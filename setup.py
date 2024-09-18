@@ -230,8 +230,15 @@ class cmake_build_ext(build_ext):
             if outdir == self.build_temp:
                 continue
 
+            # CMake appends the extension prefix to the install path,
+            # and outdir already contains that prefix, so we need to remove it.
+            prefix = outdir
+            for i in range(ext.name.count('.')):
+                prefix = prefix.parent
+
+            # prefix here should actually be the same for all components
             install_args = [
-                "cmake", "--install", ".", "--prefix", outdir, "--component",
+                "cmake", "--install", ".", "--prefix", prefix, "--component",
                 target_name(ext.name)
             ]
             subprocess.check_call(install_args, cwd=self.build_temp)
@@ -246,6 +253,7 @@ def get_package_version():
         return f"{public_version}+{local_version}"
     else:
         return str(public_version)
+
 
 PYTORCH_VERSION = "2.4.0"
 MAIN_CUDA_VERSION = "12.1"

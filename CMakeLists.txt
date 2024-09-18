@@ -157,6 +157,9 @@ endif ()
 # Other flags
 list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math)
 
+# Replace instead of appending, nvcc doesn't like duplicate -O flags.
+string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
+
 #
 # _C extension
 #
@@ -183,9 +186,6 @@ target_include_directories(vllm_flash_attn_c PRIVATE
 
 # custom definitions
 target_compile_definitions(vllm_flash_attn_c PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K)
-
-# Make sure RelWithDebInfo uses -03 and not -O2
-target_compile_options(vllm_flash_attn_c PRIVATE $<$<CONFIG:RELWITHDEBINFO>:-O3>)
 
 # Check for old generator
 find_file(OLD_GENERATOR_FILE "ATen/CUDAGeneratorImpl.h" ${TORCH_INCLUDE_DIRS} NO_DEFAULT_PATH)

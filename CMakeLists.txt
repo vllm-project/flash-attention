@@ -30,12 +30,10 @@ set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx11
 # Currently, having an incorrect pytorch version results in a warning
 # rather than an error.
 #
-# Note: the CUDA torch version is derived from pyproject.toml and various
-# requirements.txt files and should be kept consistent.  The ROCm torch
-# versions are derived from Dockerfile.rocm
+# Note: these should be kept in sync with the torch version in setup.py.
+# Likely should also be in sync with the vLLM version.
 #
 set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
-set(TORCH_SUPPORTED_VERSION_ROCM "2.5.0")
 
 find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
 
@@ -68,13 +66,6 @@ if (VLLM_PARENT_BUILD)
                         "which is not included in the parent list.")
             endif ()
         endforeach ()
-
-        # TODO Check that these are supported arches.
-        if (VLLM_GPU_LANG STREQUAL "CUDA")
-            #            check_supported_archs(VLLM_FA_GPU_ARCHES ${CUDA_SUPPORTED_ARCHS})
-        elseif (VLLM_GPU_LANG STREQUAL "HIP")
-            #
-        endif ()
     endif ()
 
 else ()
@@ -164,7 +155,6 @@ string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_R
 # _C extension
 #
 
-# TODO(luka): happy to hardcode, but these are generated so globbing seems fine.
 file(GLOB FLASH_ATTN_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*.cu")
 message(DEBUG "FLASH_ATTN_GEN_SRCS: ${FLASH_ATTN_GEN_SRCS}")
 
@@ -185,7 +175,14 @@ target_include_directories(vllm_flash_attn_c PRIVATE
         csrc/cutlass/include)
 
 # custom definitions
-target_compile_definitions(vllm_flash_attn_c PRIVATE FLASHATTENTION_DISABLE_DROPOUT FLASHATTENTION_DISABLE_UNEVEN_K)
+target_compile_definitions(vllm_flash_attn_c PRIVATE
+        # FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        # FLASHATTENTION_DISABLE_ALIBI
+        # FLASHATTENTION_DISABLE_SOFTCAP
+        FLASHATTENTION_DISABLE_UNEVEN_K
+        # FLASHATTENTION_DISABLE_LOCAL
+)
 
 # Check for old generator
 find_file(OLD_GENERATOR_FILE "ATen/CUDAGeneratorImpl.h" ${TORCH_INCLUDE_DIRS} NO_DEFAULT_PATH)

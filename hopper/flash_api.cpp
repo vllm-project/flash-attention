@@ -461,7 +461,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
-    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
+    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 87 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
     int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
@@ -648,7 +648,7 @@ mha_fwd_get_scheduler_metadata(
 
     if (params.num_splits_dynamic_ptr) {
         auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
-        auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
+        auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 87 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1361,7 +1361,7 @@ std::vector<at::Tensor> mha_bwd(
               : 64));
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
-    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 87 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
     int const kBlockN_sm90 = head_size_rounded <= 128
         ? 128
         : (head_size_rounded <= 192 ? 96 : 80);
@@ -1372,7 +1372,7 @@ std::vector<at::Tensor> mha_bwd(
         : (head_size_rounded <= 96 ? 128
            : (head_size_rounded <= 128 ? 96
               : (head_size_rounded <= 192 ? 64 : 64)));
-    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 87 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
     int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);

@@ -22,7 +22,7 @@ set(ignoreMe "${VLLM_PYTHON_PATH}")
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 
 # Supported NVIDIA architectures.
-set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
+set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.7;8.9;9.0")
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND CUDA_SUPPORTED_ARCHS "10.0" "10.1" "12.0")
 endif()
@@ -135,7 +135,7 @@ if (FA2_ENABLED)
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX;8.7" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
         set_gencode_flags_for_srcs(

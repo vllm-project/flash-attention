@@ -88,7 +88,7 @@ def _flash_attn_varlen_forward(
     out=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.varlen_fwd(
+    out, softmax_lse = torch.ops.vllm_flash_attn_c.varlen_fwd(
         q,
         k,
         v,
@@ -112,7 +112,9 @@ def _flash_attn_varlen_forward(
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
-    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+    # NOTE(woosuk): out_padded, S_dmask, and rng_state are None
+    # because we only use the forward pass in the vLLM.
+    return out, q, k, v, None, softmax_lse, None, None
 
 
 def _flash_attn_backward(

@@ -50,7 +50,7 @@ def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state = torch.ops.vllm_flash_attn_c.fwd(
+    out, softmax_lse = torch.ops.vllm_flash_attn_c.fwd(
         q,
         k,
         v,
@@ -65,7 +65,9 @@ def _flash_attn_forward(
         return_softmax,
         None,
     )
-    return out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state
+    # NOTE(woosuk): out_padded, S_dmask, and rng_state are None
+    # because we only use the forward pass in the vLLM.
+    return out, q, k, v, out, softmax_lse, None, None
 
 
 def _flash_attn_varlen_forward(

@@ -659,22 +659,23 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                                p_dropout, /*num_splits*/ 0, dprops, opts);
     }
 
+    // NOTE(woosuk): Commented out because they are not used in inference.
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    int64_t counter_offset = params.b * params.h * 32;
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
-    // Forward kernel will populate memory with the seed and offset.
-    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+    // int64_t counter_offset = params.b * params.h * 32;
+    // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+    // // Forward kernel will populate memory with the seed and offset.
+    // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
-    if (p_dropout > 0.0)  {
-        auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-            gen_, at::cuda::detail::getDefaultCUDAGenerator());
-        // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-    }
+    // if (p_dropout > 0.0)  {
+    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //     // See Note [Acquire lock when using random generators]
+    //     std::lock_guard<std::mutex> lock(gen->mutex_);
+    //     params.philox_args = gen->philox_cuda_state(counter_offset);
+    // }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 
@@ -697,12 +698,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
         out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
-        out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
-        q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
+        // NOTE(woosuk): The two lines are not necessary because out_padded and q_padded are not used.
+        // out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
+        // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
 
-    return {out, q_padded, k_padded, v_padded, out_padded, softmax_lse, p, rng_state};
+    return {out, softmax_lse};
 }
 
 std::vector<at::Tensor>

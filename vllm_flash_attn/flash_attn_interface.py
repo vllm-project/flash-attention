@@ -65,9 +65,7 @@ def _flash_attn_forward(
         return_softmax,
         None,
     )
-    # NOTE(woosuk): out_padded, S_dmask, and rng_state are None
-    # because we only use the forward pass in the vLLM.
-    return out, q, k, v, out, softmax_lse, None, None
+    return out, softmax_lse
 
 
 def _flash_attn_varlen_forward(
@@ -112,11 +110,7 @@ def _flash_attn_varlen_forward(
         return_softmax,
         None,
     )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
-    # NOTE(woosuk): out_padded, S_dmask, and rng_state are None
-    # because we only use the forward pass in the vLLM.
-    return out, q, k, v, None, softmax_lse, None, None
+    return out, softmax_lse
 
 
 def flash_attn_func(

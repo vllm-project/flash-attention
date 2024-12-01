@@ -150,7 +150,6 @@ list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --
 
 # Replace instead of appending, nvcc doesn't like duplicate -O flags.
 string(REPLACE "-O2" "-O3" CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}")
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G -g")
 
 #
 # _C extension
@@ -189,4 +188,19 @@ target_compile_definitions(vllm_flash_attn_c PRIVATE
 find_file(OLD_GENERATOR_FILE "ATen/CUDAGeneratorImpl.h" ${TORCH_INCLUDE_DIRS} NO_DEFAULT_PATH)
 if (OLD_GENERATOR_FILE)
     target_compile_definitions(vllm_flash_attn_c PRIVATE -DOLD_GENERATOR_PATH)
+endif ()
+
+
+# Add debug symbols and device debugging flags
+set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_CUDA_FLAGS_DEBUG "-g -G")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3")
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -G")
+
+# Append GPU-specific debugging flags
+list(APPEND VLLM_FA_GPU_FLAGS --device-debug --noinline)
+
+# Conditionally disable fast math for debugging
+if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+    list(REMOVE_ITEM VLLM_FA_GPU_FLAGS --use_fast_math)
 endif ()

@@ -2,7 +2,7 @@
 # A simple build script for local testing.
 # NOTE: This script is not used for the actual build process.
 
-PYTORCH_VERSION="2.4.0"
+PYTORCH_VERSION="2.5.1"
 
 pip install packaging ninja;
 pip install torch==${PYTORCH_VERSION};

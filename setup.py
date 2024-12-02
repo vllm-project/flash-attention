@@ -255,7 +255,7 @@ def get_package_version():
         return str(public_version)
 
 
-PYTORCH_VERSION = "2.4.0"
+PYTORCH_VERSION = "2.5.1"
 MAIN_CUDA_VERSION = "12.1"
 
 

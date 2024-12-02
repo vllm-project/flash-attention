@@ -590,9 +590,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size_og);
         if (seqlenq_ngroups_swapped) {
-            out = out.reshape({batch_size, num_heads_k, ngroups, head_size_og}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size_og});
+            // NOTE(woosuk): We create a temporary buffer and copy the result to the `out_` tensor eventually.
+            // This is because we reshaped the `q` tensor for the splik-KV optimization, and the `out_` tensor
+            // has the same shape as the original `q` tensor, not the reshaped one.
+            out = torch::empty_like(q_padded);
         }
-        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
+        else if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
     } else {
         out = torch::empty_like(q_padded);
     }
@@ -690,7 +693,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    at::Tensor out_padded = out;
+    // at::Tensor out_padded = out;
     if (head_size_og % 8 != 0) {
         out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
         if (out_.has_value()) { out_.value().copy_(out); }
@@ -699,7 +702,15 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (seqlenq_ngroups_swapped) {
         int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size_og};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size_og};
-        out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
+        out = out.reshape(size_before).transpose(1, 2);
+        if (out_.has_value()) {
+            // NOTE(woosuk): In this case, we should avoid `out.reshape(size_after)` because it causes
+            // a redundant clone operation. Instead, we directly copy the result to the `out_` tensor.
+            out_.value().view({batch_size, num_heads_k, max_seqlen_q, head_size_og}).copy_(out);
+            out = out_.value();
+        } else {
+            out = out.reshape(size_after);
+        }
         // NOTE(woosuk): The two lines are not needed because out_padded and q_padded are not used.
         // out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);

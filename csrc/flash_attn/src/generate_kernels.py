@@ -25,6 +25,14 @@ void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cu
 }}
 """
 
+KERNEL_IMPL_TEMPLATE_FWD_SPARSE = """#include "flash_fwd_launch_template.h"
+
+template<>
+void run_mha_fwd_sparse_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{
+    run_mha_fwd_sparse_hdim{HEAD_DIM}<{DTYPE}, {IS_CAUSAL}>(params, stream);
+}}
+"""
+
 KERNEL_IMPL_TEMPLATE_FWD_SPLIT = """#include "flash_fwd_launch_template.h"
 
 template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
@@ -53,6 +61,10 @@ class Kernel:
             return KERNEL_IMPL_TEMPLATE_FWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, IS_CAUSAL=self.is_causal
             )
+        elif self.direction == "fwd_sparse":
+            return KERNEL_IMPL_TEMPLATE_FWD_SPARSE.format(
+                DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim, IS_CAUSAL=self.is_causal
+            )
         elif self.direction == "bwd":
             return KERNEL_IMPL_TEMPLATE_BWD.format(
                 DTYPE=DTYPE_MAP[self.dtype], HEAD_DIM=self.head_dim
@@ -68,7 +80,7 @@ class Kernel:
 
 
 def get_all_kernels() -> List[Kernel]:
-    for direction in ["fwd", "fwd_split"]:
+    for direction in ["fwd", "fwd_split", "fwd_sparse"]:
         for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
     for direction in ["bwd"]:

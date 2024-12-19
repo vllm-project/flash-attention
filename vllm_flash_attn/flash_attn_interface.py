@@ -45,6 +45,30 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     elif head_dim <= 256:
         return 64
 
+def _sparse_attn_forward(
+    q, k, v, block_count, block_offset, column_count, column_index,dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
+):
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, softmax_lse = torch.ops.vllm_flash_attn_c.fwd_sparse(
+        q,
+        k,
+        v,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        out,
+        alibi_slopes,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        return_softmax,
+        None,
+    )
+    return out, softmax_lse
 
 def _flash_attn_forward(
     q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
@@ -112,6 +136,46 @@ def _flash_attn_varlen_forward(
     )
     return out, softmax_lse
 
+def sparse_attn_func(
+    q,
+    k,
+    v,
+    block_count,
+    block_offset,
+    column_count,
+    column_index,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    return_softmax_lse=False,
+    out=None,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = _sparse_attn_forward(
+        q,
+        k,
+        v,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        dropout_p,
+        softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        return_softmax=return_attn_probs and dropout_p > 0,
+        out=out,
+    )
+    return (out, softmax_lse) if return_softmax_lse else out
 
 def flash_attn_func(
     q,

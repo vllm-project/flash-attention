@@ -267,3 +267,60 @@ def test_varlen_with_paged_kv(
     )
     torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
+
+@pytest.mark.parametrize("seq_lens", [(1023, 2049), (1023, 1023), (32, 32), (65, 65), (129, 129)])
+@pytest.mark.parametrize("num_heads", [1, 2, 4])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_sparse_attention(
+        seq_lens: List[Tuple[int, int]],
+        num_heads: Tuple[int, int],
+        head_size: int,
+        dtype: torch.dtype,
+) -> None:
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    block_size_M = 64
+    block_size_N = 64
+    batch_size = 1
+    seqlen_q, seqlen_k = seq_lens
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    NUM_ROWS = (seqlen_q + block_size_M - 1) // block_size_M
+    NNZ_S = seqlen_k // block_size_M // 2
+    NNZ_V = seqlen_k - NNZ_S * block_size_M
+    block_count = torch.tensor([NNZ_S] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    column_count = torch.tensor([NNZ_V] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    block_offset = torch.tensor([[i * block_size_M for i in range(NNZ_S)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
+    column_index = torch.tensor([[NNZ_S * block_size_M + i for i in range(NNZ_V)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
+    from vllm_flash_attn import sparse_attn_func, flash_attn_func
+    out, lse = sparse_attn_func(
+        q,
+        k,
+        v,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        return_softmax_lse=True,
+    )
+
+    ref_out, ref_lse = flash_attn_func(
+        q,
+        k,
+        v,
+        return_softmax_lse=True,
+    )
+
+    torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(out - ref_out))}"
+    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(lse - ref_lse))}"

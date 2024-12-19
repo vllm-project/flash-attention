@@ -3,6 +3,7 @@ import torch
 
 from vllm_flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 from vllm_flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
+from vllm_flash_attn import sparse_attn_func as _sparse_attn_func
 
 
 @torch.library.custom_op("vllm::flash_attn_varlen_func", mutates_args=[])
@@ -101,3 +102,33 @@ def _(
         softcap: float = 0.0,
 ) -> torch.Tensor:
     return torch.empty_like(decode_query)
+
+@torch.library.custom_op("vllm::sparse_attn_func", mutates_args=[])
+def sparse_attn_func(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        block_count: torch.Tensor,
+        block_offset: torch.Tensor,
+        column_count: torch.Tensor,
+        column_index: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        causal: bool = False,
+        softcap: float = 0.0,
+        alibi_slopes: Optional[torch.Tensor] = None,
+        return_softmax_lse: Optional[bool] = False,
+) -> torch.Tensor:
+    return _sparse_attn_func(
+        q=q,
+        k=k,
+        v=v,
+        block_count=block_count,
+        block_offset=block_offset,
+        column_count=column_count,
+        column_index=column_index,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        return_softmax_lse=return_softmax_lse,
+    )

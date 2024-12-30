@@ -714,7 +714,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         // NOTE(woosuk): The two lines are not needed because out_padded and q_padded are not used.
         // out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
-        softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
+        int64_t lse_size_before[] = {num_heads, batch_size, max_seqlen_q};
+        int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
+        softmax_lse = softmax_lse.reshape(lse_size_before).transpose(1, 2).reshape(lse_size_after);
     }
 
     return {out, softmax_lse};

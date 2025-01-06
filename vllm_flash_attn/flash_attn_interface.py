@@ -156,6 +156,38 @@ def sparse_attn_func(
     return_softmax_lse=False,
     out=None,
 ):
+    """Compute attention with virtical and slash sparsity patterns.
+    Most Arguments are the same with the flash_attn_func interface, except for 4 extra args:
+    block_count and block_offset for slash sparsity patterns, and
+    column_count and column_index for virtical sparsity patterns.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        block_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
+        block_offset: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_S)
+        column_count: (batch_size, nheads, cdiv(seqlen, BLOCK_M))
+        column_index: (batch_size, nheads, cdiv(seqlen, BLOCK_M), NNZ_V)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+    """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     out, softmax_lse = _sparse_attn_forward(

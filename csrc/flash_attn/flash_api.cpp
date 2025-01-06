@@ -206,10 +206,10 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
         seqlenq_ngroups_swapped,
         unpadded_lse
     );
-    params.block_count = (int*)block_count.data_ptr();
-    params.block_offset = (int*)block_offset.data_ptr();
-    params.column_count = (int*)column_count.data_ptr();
-    params.column_index = (int*)column_index.data_ptr();
+    params.block_count = block_count.const_data_ptr<int>();
+    params.block_offset = block_offset.const_data_ptr<int>();
+    params.column_count = column_count.const_data_ptr<int>();
+    params.column_index = column_index.const_data_ptr<int>();
     TORCH_CHECK(block_count.size(2) == block_offset.size(2));
     TORCH_CHECK(column_index.size(2) == block_offset.size(2));
     TORCH_CHECK(column_count.size(2) == column_index.size(2));

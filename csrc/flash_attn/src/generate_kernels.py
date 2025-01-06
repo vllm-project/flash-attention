@@ -25,7 +25,7 @@ void run_mha_fwd_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cu
 }}
 """
 
-KERNEL_IMPL_TEMPLATE_FWD_SPARSE = """#include "flash_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SPARSE = """#include "flash_fwd_sparse_launch_template.h"
 
 template<>
 void run_mha_fwd_sparse_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream) {{

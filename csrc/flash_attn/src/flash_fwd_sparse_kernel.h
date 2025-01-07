@@ -156,10 +156,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     // PREDICATES
     //
 
-    // // Allocate predicate tensors for m and n
-    // Tensor tQpQ = make_tensor<bool>(make_shape(size<1>(tQsQ), size<2>(tQsQ)), Stride<_1,_0>{});
-    // Tensor tKVpKV = make_tensor<bool>(make_shape(size<1>(tKsK), size<2>(tKsK)), Stride<_1,_0>{});
-
     // Construct identity layout for sQ and sK
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
@@ -434,9 +430,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     if (num_cols > 0) {
         auto* cols_ptr = params.column_index + ((bidb * params.h + bidh) * params.NUM_ROWS + m_block) * params.NNZ_V;
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-        // tKgKBlock.data() = tKgKBlockData + blks_ptr[0] * int64_t(params.k_row_stride);
-        // flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgKBlock, tKsK, tKVcKV, tKVpKV,
-        //                                    binfo.actual_seqlen_k - blks_ptr[0]);
         #pragma unroll
         for (int m = 0; m < size<1>(tKgKToken); ++m) {
             if (Is_even_MN || get<0>(tKVcKV(0, m, 0)) < num_cols) {  // Is_even_MN
@@ -445,7 +438,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 for (int k = 0; k < size<2>(tKgKToken); ++k) {
                     if (Is_even_K || tKVpKV(k)) {
                         cute::copy(gmem_tiled_copy_QKV, tKgKToken(_, m, k), tKsK(_, m, k));
-                    } else if (true) {  // Clear_OOB_K
+                    } else {  // Clear_OOB_K
                         cute::clear(tKsK(_, m, k));
                     }
                 }
@@ -463,7 +456,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Advance gV
             if (n < num_cols_block - 1) {
-                // flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgVBlock, tVsV, tKVcKV, tKVpKV);
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVgVToken); ++m) {
                     if (true) {  // Is_even_MN
@@ -480,9 +472,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 }
             } else {
                 // Clear the smem tiles to account for predicated off loads
-                // flash::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-                //     gmem_tiled_copy_QKV, tVgVBlock, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - start_n
-                // );
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVgVToken); ++m) {
                     if (Is_even_MN || n * kBlockN + get<0>(tKVcKV(0, m, 0)) < num_cols) {  // Is_even_MN
@@ -491,11 +480,11 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                         for (int k = 0; k < size<2>(tVgVToken); ++k) {
                             if (Is_even_K || tKVpKV(k)) {
                                 cute::copy(gmem_tiled_copy_QKV, tVgVToken(_, m, k), tVsV(_, m, k));
-                            } else if (true) {  // Clear_OOB_K
+                            } else {  // Clear_OOB_K
                                 cute::clear(tVsV(_, m, k));
                             }
                         }
-                    } else if (true) {  // Clear_OOB_MN
+                    } else {  // Clear_OOB_MN
                         cute::clear(tVsV(_, m, _));
                     }
                 }
@@ -511,9 +500,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 flash::apply_softcap(acc_s, params.softcap);
             }
 
-            // mask.template apply_mask<Is_causal, Is_even_MN>(
-            //     acc_s, cols_ptr[n * kBlockN], m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-            // );
             if (n >= num_cols_block - n_masking_steps) {
                 Tensor tensor = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
                 const int lane_id = threadIdx.x % 32;
@@ -546,8 +532,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             flash::cp_async_wait<0>();
             __syncthreads();
             if (n < num_cols_block - 2) {
-                // tKgKBlock.data() = tKgKBlockData + blks_ptr[block_index + 1] * int64_t(params.k_row_stride);
-                // flash::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgKBlock, tKsK, tKVcKV, tKVpKV);
                 #pragma unroll
                 for (int m = 0; m < size<1>(tKgKToken); ++m) {
                     if (true) {  // Is_even_MN
@@ -567,9 +551,6 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                 // isn't right and we get race conditions.
                 cute::cp_async_fence();
             } else if (n == num_cols_block - 2) {
-                // tKgKBlock.data() = tKgKBlockData + blks_ptr[block_index + 1] * int64_t(params.k_row_stride);
-                // flash::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgKBlock, tKsK, tKVcKV, tKVpKV,
-                //                            binfo.actual_seqlen_k - blks_ptr[block_index + 1]);
                 #pragma unroll
                 for (int m = 0; m < size<1>(tKgKToken); ++m) {
                     if (Is_even_MN || (n + 1) * kBlockN + get<0>(tKVcKV(0, m, 0)) < num_cols) {  // Is_even_MN

@@ -156,10 +156,12 @@ def sparse_attn_func(
     return_softmax_lse=False,
     out=None,
 ):
-    """Compute attention with virtical and slash sparsity patterns.
+    """Compute attention with vertical and slash sparsity patterns.
     Most Arguments are the same with the flash_attn_func interface, except for 4 extra args:
     block_count and block_offset for slash sparsity patterns, and
-    column_count and column_index for virtical sparsity patterns.
+    column_count and column_index for vertical sparsity patterns.
+    For more details please refer to MInference
+    (Paper: https://arxiv.org/abs/2407.02490, Code: https://github.com/microsoft/MInference).
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
@@ -174,6 +176,7 @@ def sparse_attn_func(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+            Sliding window is not supported for sparse_attn_func, so only (-1, -1) is valid.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.

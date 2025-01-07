@@ -214,6 +214,10 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
     TORCH_CHECK(column_index.size(2) == block_offset.size(2));
     TORCH_CHECK(column_count.size(2) == column_index.size(2));
     params.NUM_ROWS = block_count.size(2);
+    // params.NUM_ROWS should be equal to cdiv(seqlen_q, BLOCK_M), and BLOCK_M has to be 64 for now.
+    constexpr int BLOCK_M = 64;
+    int expected_num_rows = (seqlen_q + BLOCK_M - 1) / BLOCK_M;
+    TORCH_CHECK(params.NUM_ROWS == expected_num_rows);
     params.NNZ_S = block_offset.size(3);
     params.NNZ_V = column_index.size(3);
 }
@@ -355,6 +359,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                const bool return_softmax,
                c10::optional<at::Generator> gen_) {
 
+    TORCH_CHECK(window_size_left == -1, "sliding window is not supported in sparse_attn_func.");
+    TORCH_CHECK(window_size_right == -1, "sliding window is not supported in sparse_attn_func.");
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;

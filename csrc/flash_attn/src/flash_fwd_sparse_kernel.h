@@ -458,15 +458,13 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             if (n < num_cols_block - 1) {
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVgVToken); ++m) {
-                    if (true) {  // Is_even_MN
-                        tVgVToken.data() = tVgVTokenData + cols_ptr[n * kBlockN + get<0>(tKVcKV(0, m, 0))] * int64_t(params.v_row_stride);
-                        #pragma unroll
-                        for (int k = 0; k < size<2>(tVgVToken); ++k) {
-                            if (Is_even_K || tKVpKV(k)) {
-                                cute::copy(gmem_tiled_copy_QKV, tVgVToken(_, m, k), tVsV(_, m, k));
-                            } else if (true) {  // Clear_OOB_K
-                                cute::clear(tVsV(_, m, k));
-                            }
+                    tVgVToken.data() = tVgVTokenData + cols_ptr[n * kBlockN + get<0>(tKVcKV(0, m, 0))] * int64_t(params.v_row_stride);
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(tVgVToken); ++k) {
+                        if (Is_even_K || tKVpKV(k)) {
+                            cute::copy(gmem_tiled_copy_QKV, tVgVToken(_, m, k), tVsV(_, m, k));
+                        } else {  // Clear_OOB_K
+                            cute::clear(tVsV(_, m, k));
                         }
                     }
                 }
@@ -534,16 +532,14 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
             if (n < num_cols_block - 2) {
                 #pragma unroll
                 for (int m = 0; m < size<1>(tKgKToken); ++m) {
-                    if (true) {  // Is_even_MN
-                        int token_idx = cols_ptr[(n + 1) * kBlockN + get<0>(tKVcKV(0, m, 0))];
-                        tKgKToken.data() = tKgKTokenData + token_idx * int64_t(params.k_row_stride);
-                        #pragma unroll
-                        for (int k = 0; k < size<2>(tKgKToken); ++k) {
-                            if (Is_even_K || tKVpKV(k)) {
-                                cute::copy(gmem_tiled_copy_QKV, tKgKToken(_, m, k), tKsK(_, m, k));
-                            } else if (true) {  // Clear_OOB_K
-                                cute::clear(tKsK(_, m, k));
-                            }
+                    int token_idx = cols_ptr[(n + 1) * kBlockN + get<0>(tKVcKV(0, m, 0))];
+                    tKgKToken.data() = tKgKTokenData + token_idx * int64_t(params.k_row_stride);
+                    #pragma unroll
+                    for (int k = 0; k < size<2>(tKgKToken); ++k) {
+                        if (Is_even_K || tKVpKV(k)) {
+                            cute::copy(gmem_tiled_copy_QKV, tKgKToken(_, m, k), tKsK(_, m, k));
+                        } else {  // Clear_OOB_K
+                            cute::clear(tKsK(_, m, k));
                         }
                     }
                 }
@@ -560,7 +556,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
                         for (int k = 0; k < size<2>(tKgKToken); ++k) {
                             if (Is_even_K || tKVpKV(k)) {
                                 cute::copy(gmem_tiled_copy_QKV, tKgKToken(_, m, k), tKsK(_, m, k));
-                            } else if (true) {  // Clear_OOB_K
+                            } else {  // Clear_OOB_K
                                 cute::clear(tKsK(_, m, k));
                             }
                         }

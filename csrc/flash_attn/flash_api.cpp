@@ -181,8 +181,6 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
                             void *softmax_lse_d,
                             float p_dropout,
                             float softmax_scale,
-                            int window_size_left,
-                            int window_size_right,
                             const float softcap,
                             bool seqlenq_ngroups_swapped=false,
                             const bool unpadded_lse=false) {
@@ -200,8 +198,8 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
         softmax_lse_d,
         p_dropout,
         softmax_scale,
-        window_size_left,
-        window_size_right,
+        -1,  // window_size_left
+        -1,  // window_size_right
         softcap,
         seqlenq_ngroups_swapped,
         unpadded_lse
@@ -353,14 +351,10 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                const double p_dropout,
                const double softmax_scale,
                bool is_causal,
-               int64_t window_size_left,
-               int64_t window_size_right,
                const double softcap,
                const bool return_softmax,
                c10::optional<at::Generator> gen_) {
 
-    TORCH_CHECK(window_size_left == -1, "sliding window is not supported in sparse_attn_func.");
-    TORCH_CHECK(window_size_right == -1, "sliding window is not supported in sparse_attn_func.");
     auto dprops = at::cuda::getCurrentDeviceProperties();
     // bool is_sm75 = dprops->major == 7 && dprops->minor == 5;
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -398,12 +392,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
-    if (window_size_left >= seqlen_k) { window_size_left = -1; }
-    if (window_size_right >= seqlen_k) { window_size_right = -1; }
-
     // causal=true is the same as causal=false in this case
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
-    if (is_causal) { window_size_right = 0; }
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
@@ -483,8 +473,6 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                             softmax_lse.data_ptr(),
                             p_dropout,
                             softmax_scale,
-                            window_size_left,
-                            window_size_right,
                             softcap
                      );
 
@@ -1290,7 +1278,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("fwd_sparse(Tensor! q, Tensor k, Tensor v, "
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
             "Tensor!? out, Tensor? alibi_slopes, "
-            "float p_dropout, float softmax_scale, bool is_causal, int window_size_left, int window_size_right, "
+            "float p_dropout, float softmax_scale, bool is_causal, "
             "float softcap, bool return_softmax, Generator? gen)"
             "-> Tensor[]");
     ops.impl("fwd_sparse", torch::kCUDA, &mha_fwd_sparse);

@@ -46,7 +46,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
         return 64
 
 def _sparse_attn_forward(
-    q, k, v, block_count, block_offset, column_count, column_index,dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax, *, out=None
+    q, k, v, block_count, block_offset, column_count, column_index,dropout_p, softmax_scale, causal, softcap, alibi_slopes, return_softmax, *, out=None
 ):
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse = torch.ops.vllm_flash_attn_c.fwd_sparse(
@@ -62,8 +62,6 @@ def _sparse_attn_forward(
         dropout_p,
         softmax_scale,
         causal,
-        window_size[0],
-        window_size[1],
         softcap,
         return_softmax,
         None,
@@ -147,7 +145,6 @@ def sparse_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
@@ -160,8 +157,7 @@ def sparse_attn_func(
     Most Arguments are the same with the flash_attn_func interface, except for 4 extra args:
     block_count and block_offset for slash sparsity patterns, and
     column_count and column_index for vertical sparsity patterns.
-    For more details please refer to MInference
-    (Paper: https://arxiv.org/abs/2407.02490, Code: https://github.com/microsoft/MInference).
+    For more details please refer to Appendix C.4.2 of paper https://arxiv.org/abs/2407.02490.
 
     Arguments:
         q: (batch_size, seqlen, nheads, headdim)
@@ -175,8 +171,6 @@ def sparse_attn_func(
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-            Sliding window is not supported for sparse_attn_func, so only (-1, -1) is valid.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -204,7 +198,6 @@ def sparse_attn_func(
         dropout_p,
         softmax_scale,
         causal=causal,
-        window_size=window_size,
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         return_softmax=return_attn_probs and dropout_p > 0,

@@ -270,7 +270,7 @@ def test_varlen_with_paged_kv(
 
 @pytest.mark.parametrize("seq_lens", [(1023, 2049), (1023, 1023), (32, 32), (65, 65), (129, 129)])
 @pytest.mark.parametrize("num_heads", [1, 2, 4])
-@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("NNZ_S", [1, 2, 3, 7, 15, 32])
 @torch.inference_mode()

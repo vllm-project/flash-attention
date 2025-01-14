@@ -39,7 +39,8 @@ def ref_paged_attn(
     for i in range(num_seqs):
         query_len = query_lens[i]
         kv_len = kv_lens[i]
-        q = query[start_idx:start_idx + query_len]
+        # clone to avoid clobbering the query tensor
+        q = query[start_idx:start_idx + query_len].clone()
         q *= scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size

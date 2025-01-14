@@ -268,6 +268,7 @@ def test_varlen_with_paged_kv(
     torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
 
+@pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("seq_lens", [(1, 1), (1, 1024), (1, 2048), (1023, 2049), (1023, 1023), (32, 32), (65, 65), (129, 129)])
 @pytest.mark.parametrize("num_heads", [1, 2, 4])
 @pytest.mark.parametrize("head_size", [128])
@@ -275,6 +276,7 @@ def test_varlen_with_paged_kv(
 @pytest.mark.parametrize("NNZ_S", [0, 1, 2, 3, 7, 15, 32])
 @torch.inference_mode()
 def test_sparse_attention(
+        batch_size: int,
         seq_lens: List[Tuple[int, int]],
         num_heads: Tuple[int, int],
         head_size: int,
@@ -285,7 +287,6 @@ def test_sparse_attention(
     torch.cuda.manual_seed_all(0)
     block_size_M = 64
     block_size_N = 64
-    batch_size = 1
     seqlen_q, seqlen_k = seq_lens
     q = torch.randn(
         batch_size, seqlen_q, num_heads, head_size, dtype=dtype, requires_grad=False
@@ -300,10 +301,10 @@ def test_sparse_attention(
     if NNZ_S * block_size_N > seqlen_k:
         return
     NNZ_V = seqlen_k - NNZ_S * block_size_N
-    block_count = torch.tensor([NNZ_S] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
-    column_count = torch.tensor([NNZ_V] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
-    block_offset = torch.tensor([[i * block_size_N for i in range(NNZ_S)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
-    column_index = torch.tensor([[NNZ_S * block_size_N + i for i in range(NNZ_V)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
+    block_count = torch.tensor([NNZ_S] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    column_count = torch.tensor([NNZ_V] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    block_offset = torch.tensor([[i * block_size_N for i in range(NNZ_S)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
+    column_index = torch.tensor([[NNZ_S * block_size_N + i for i in range(NNZ_V)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
     from vllm_flash_attn import sparse_attn_func, flash_attn_func
     out, lse = sparse_attn_func(
         q,

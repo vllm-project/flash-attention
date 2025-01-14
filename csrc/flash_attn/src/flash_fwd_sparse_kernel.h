@@ -81,9 +81,11 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
     const index_t row_offset_k_token =
-        (bidh / params.h_h_k_ratio) * params.k_head_stride;
+        binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)
+        + (bidh / params.h_h_k_ratio) * params.k_head_stride;
     const index_t row_offset_v_token =
-        (bidh / params.h_h_k_ratio) * params.v_head_stride;
+        binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)
+        + (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
     Tensor gKToken = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr) + row_offset_k_token),
         Shape<Int<kBlockN>, Int<kHeadDim>>{},

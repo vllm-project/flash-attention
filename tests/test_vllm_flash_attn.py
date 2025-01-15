@@ -268,3 +268,154 @@ def test_varlen_with_paged_kv(
     )
     torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("seq_lens", [(1, 1), (1, 1024), (1, 2048), (1023, 2049), (1023, 1023), (32, 32), (65, 65), (129, 129)])
+@pytest.mark.parametrize("num_heads", [1, 2, 4])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("NNZ_S", [0, 1, 2, 3, 7, 15, 32])
+@torch.inference_mode()
+def test_sparse_attention(
+        batch_size: int,
+        seq_lens: Tuple[int, int],
+        num_heads: int,
+        head_size: int,
+        dtype: torch.dtype,
+        NNZ_S: int,
+) -> None:
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    block_size_M = 64
+    block_size_N = 64
+    seqlen_q, seqlen_k = seq_lens
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, num_heads, head_size, dtype=dtype, requires_grad=False
+    )
+    NUM_ROWS = (seqlen_q + block_size_M - 1) // block_size_M
+    if NNZ_S * block_size_N > seqlen_k:
+        return
+    NNZ_V = seqlen_k - NNZ_S * block_size_N
+    block_count = torch.tensor([NNZ_S] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    column_count = torch.tensor([NNZ_V] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS)
+    block_offset = torch.tensor([[i * block_size_N for i in range(NNZ_S)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
+    column_index = torch.tensor([[NNZ_S * block_size_N + i for i in range(NNZ_V)]] * batch_size * NUM_ROWS * num_heads, dtype=torch.int32).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
+    from vllm_flash_attn import sparse_attn_func, flash_attn_func
+    out, lse = sparse_attn_func(
+        q,
+        k,
+        v,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        return_softmax_lse=True,
+    )
+
+    ref_out, ref_lse = flash_attn_func(
+        q,
+        k,
+        v,
+        return_softmax_lse=True,
+    )
+
+    torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(out - ref_out))}"
+    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(lse - ref_lse))}"
+
+@pytest.mark.parametrize("seq_lens", [[(1024, 1328)],
+                                      [(1024, 1328), (1, 2048)],
+                                      [(1025, 1328), (2, 2048)],
+                                      [(1025, 2049), (2, 1281)],
+                                     ])
+@pytest.mark.parametrize("head_size", [128])
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_sparse_attention_varlen(
+        seq_lens: List[Tuple[int, int]],
+        head_size: int,
+        dtype: torch.dtype,
+) -> None:
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    block_size_M = 64
+    block_size_N = 64
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_heads = 1
+    query = torch.randn(sum(query_lens),
+                        num_heads,
+                        head_size,
+                        dtype=dtype)
+    key = torch.randn(sum(kv_lens),
+                      num_heads,
+                      head_size,
+                      dtype=dtype)
+    value = torch.randn_like(key)
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    cu_kv_lens = torch.tensor([0] + kv_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+
+    NUM_ROWS = (max_query_len + block_size_M - 1) // block_size_M
+    NNZ_S = 20
+    NNZ_V = 2048
+    batch_size = len(query_lens)
+
+    block_counts = []
+    column_counts = []
+    block_offsets = []
+    column_indices = []
+    for b in range(batch_size):
+        block_counts.append(torch.tensor([NNZ_S] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(num_heads, NUM_ROWS))
+        columns = kv_lens[b] - NNZ_S * block_size_N
+        column_counts.append(torch.tensor([columns] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(num_heads, NUM_ROWS))
+        block_offsets.append(torch.tensor([[i * block_size_N for i in range(NNZ_S)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(num_heads, NUM_ROWS, NNZ_S))
+        column_indices.append(torch.tensor([[NNZ_S * block_size_N + i for i in range(NNZ_V)]] * NUM_ROWS * num_heads, dtype=torch.int32).reshape(num_heads, NUM_ROWS, NNZ_V))
+    block_count = torch.concat(block_counts).reshape(batch_size, num_heads, NUM_ROWS)
+    column_count = torch.concat(column_counts).reshape(batch_size, num_heads, NUM_ROWS)
+    block_offset = torch.concat(block_offsets).reshape(batch_size, num_heads, NUM_ROWS, NNZ_S)
+    column_index = torch.concat(column_indices).reshape(batch_size, num_heads, NUM_ROWS, NNZ_V)
+    from vllm_flash_attn import sparse_attn_varlen_func, flash_attn_varlen_func
+    out, lse = sparse_attn_varlen_func(
+        query,
+        key,
+        value,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        return_softmax_lse=True,
+    )
+
+    ref_out, ref_lse = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_query_lens,
+        cu_seqlens_k=cu_kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        return_softmax_lse=True,
+    )
+
+    torch.testing.assert_close(out, ref_out, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(out - ref_out))}"
+    torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(lse - ref_lse))}"

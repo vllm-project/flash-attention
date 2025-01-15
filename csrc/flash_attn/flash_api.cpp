@@ -645,25 +645,6 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
     }
 
     Flash_fwd_params params;
-    // set_params_fprop(params,
-    //                  batch_size,
-    //                  max_seqlen_q, max_seqlen_k,
-    //                  seqlen_q_rounded, seqlen_k_rounded,
-    //                  num_heads, num_heads_k,
-    //                  head_size, head_size_rounded,
-    //                  q_padded, k_padded, v_padded, out,
-    //                  cu_seqlens_q_d,
-    //                  cu_seqlens_k.data_ptr(),
-    //                  seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
-    //                  return_softmax ? p.data_ptr() : nullptr,
-    //                  softmax_lse.data_ptr(),
-    //                  p_dropout,
-    //                  softmax_scale,
-    //                  -1,
-    //                  -1,
-    //                  softcap,
-    //                  seqlenq_ngroups_swapped,
-    //                  /*unpadded_lse*/true);
     set_params_fprop_sparse(params,
                             batch_size,
                             max_seqlen_q, max_seqlen_k,

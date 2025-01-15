@@ -4,6 +4,7 @@ __version__ = "2.6.2"
 from .flash_attn_interface import (
     flash_attn_func,
     sparse_attn_func,
+    sparse_attn_varlen_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )

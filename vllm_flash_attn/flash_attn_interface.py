@@ -8,7 +8,14 @@ import torch.nn as nn
 # isort: off
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
-from . import vllm_flash_attn_c # noqa: F401
+try:
+    from . import vllm_flash_attn_c # noqa: F401
+except:
+    # We may put the cpp extension .so file in a different folder. So we
+    # should allow this happens.
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning("Failed to load from OSS vllm_flash_attn_c build, please ensure we use other way to load it.")
 
 # isort: on
 

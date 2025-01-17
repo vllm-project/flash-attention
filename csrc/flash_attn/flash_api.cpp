@@ -46,7 +46,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false) {
+                      const bool unpadded_lse=false,
+                      const bool is_kvc=false) {
 
     // Reset the parameters
     params = {};
@@ -59,11 +60,19 @@ void set_params_fprop(Flash_fwd_params &params,
     params.v_ptr = v.data_ptr();
     // All stride are in elements, not bytes.
     params.q_row_stride = q.stride(-3);
-    params.k_row_stride = k.stride(-3);
-    params.v_row_stride = v.stride(-3);
     params.q_head_stride = q.stride(-2);
-    params.k_head_stride = k.stride(-2);
-    params.v_head_stride = v.stride(-2);
+    params.is_kvc_cache = is_kvc;
+    if (!is_kvc) {
+        params.k_row_stride = k.stride(-3);
+        params.v_row_stride = v.stride(-3);
+        params.k_head_stride = k.stride(-2);
+        params.v_head_stride = v.stride(-2);
+    } else {
+        params.k_row_stride = k.stride(1);
+        params.v_row_stride = v.stride(1);
+        // head stride not used
+    }
+
     params.o_ptr = out.data_ptr();
     params.o_row_stride = out.stride(-3);
     params.o_head_stride = out.stride(-2);
@@ -950,6 +959,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
+    const bool is_KVC = paged_KV && (block_table.dim() > 2);
+
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -962,11 +973,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
     const int head_size_og = sizes[2];
-    const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+    const int num_heads_k = paged_KV ? (!is_KVC ? k.size(2): block_table.size(1)) : k.size(1);
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
-    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    const int max_num_blocks_per_seq = !paged_KV ? 0 : (!is_KVC ? block_table.size(1) : block_table.size(2));
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 1 : k.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
@@ -1002,13 +1013,29 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
         CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
     } else {
-        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        if (!is_KVC) {
+            CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_og);
+            CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_og);
+            CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        } else {
+            CHECK_SHAPE(k, num_blocks, page_block_size, head_size_og);
+            CHECK_SHAPE(v, num_blocks, page_block_size, head_size_og);
+            // [ batch_size, kv_heads, blocks ]
+            // printf("batch_size=%d, num_heads_k=%d, max_num_blocks_per_seq=%d",
+            //        batch_size, num_heads_k, max_num_blocks_per_seq);
+            // std::cout << "block_tables shape\n" << block_table.sizes() << std::endl;
+            CHECK_SHAPE(block_table, batch_size, num_heads_k, max_num_blocks_per_seq);
+        }
     }
 
+    bool seqlen_by_head = false;
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    if (!is_KVC) {
+        CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    } else {
+        seqlen_by_head = cu_seqlens_k.size(0) > batch_size + 1;
+        // CHECK_SHAPE(cu_seqlens_k, batch_size + 1 + batch_size * num_heads_k + 1);
+    }
     if (seqused_k.has_value()){
         auto seqused_k_ = seqused_k.value();
         TORCH_CHECK(seqused_k_.dtype() == torch::kInt32, "seqused_k must have dtype int32");
@@ -1090,12 +1117,22 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_right,
                      softcap,
                      seqlenq_ngroups_swapped,
-                     /*unpadded_lse*/true);
+                     /*unpadded_lse*/true,
+                     /*is_kvc*/is_KVC);
     params.total_q = total_q;
+    params.seqlen_by_head = seqlen_by_head;
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
-        params.block_table_batch_stride = block_table.stride(0);
+        if (!is_KVC) {
+            params.block_table_batch_stride = block_table.stride(0);
+        } else {
+            params.kseqlen_batch_stride = num_heads_k;
+            params.block_table_batch_stride = block_table.stride(0);
+            params.block_table_head_stride = block_table.stride(1);
+        }
+        // std::cout << "\n" << k_padded.strides() << std::endl;
+        // std::cout << k_padded.sizes() << std::endl;
         params.k_batch_stride = k_padded.stride(0);
         params.v_batch_stride = v_padded.stride(0);
     }
@@ -1222,6 +1259,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
+    const bool is_KVC = paged_KV && (block_table.dim() > 2);
 
     const auto sizes = q.sizes();
 
@@ -1232,12 +1270,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int num_heads_og = num_heads;
     const int head_size_og = sizes[3];
 
-    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    const int max_num_blocks_per_seq = !paged_KV ? 0 : (!is_KVC ? block_table.size(1) : block_table.size(2));
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
-    const int num_heads_k = kcache.size(2);
+    const int num_heads_k = !is_KVC ? kcache.size(2) : block_table.size(1);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention forward only supports head dimension at most 256");
@@ -1265,9 +1303,16 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
         CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
     } else {
-        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        if (!is_KVC) {
+            CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+            CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+            CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        } else {
+            CHECK_SHAPE(kcache, num_blocks, page_block_size, head_size_og);
+            CHECK_SHAPE(vcache, num_blocks, page_block_size, head_size_og);
+            // [ batch_size, kv_heads, blocks ]
+            CHECK_SHAPE(block_table, batch_size, num_heads_k, max_num_blocks_per_seq);
+        }
     }
 
     at::Tensor q_padded, kcache_padded, vcache_padded;
@@ -1328,8 +1373,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
-                     );
+                     softcap,
+                     /*seqlenq_ngroups_swapped=*/false,
+                     /*unpadded_lse=*/false,
+                     /*is_kvc=*/is_KVC);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {
@@ -1370,8 +1417,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
         CHECK_DEVICE(seqlens_k);
         CHECK_CONTIGUOUS(seqlens_k);
-        CHECK_SHAPE(seqlens_k, batch_size);
+        if (!is_KVC) {
+            CHECK_SHAPE(seqlens_k, batch_size);
+        } else {
+            CHECK_SHAPE(seqlens_k, batch_size * num_heads_k);
+        }
         params.cu_seqlens_k = static_cast<int *>(seqlens_k.data_ptr());
+        params.seqlen_by_head = is_KVC;
     }
     params.is_seqlens_k_cumulative = !(seqlens_k_.has_value());
 
@@ -1417,7 +1469,13 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
-        params.block_table_batch_stride = block_table.stride(0);
+        if (!is_KVC) {
+            params.block_table_batch_stride = block_table.stride(0);
+        } else {
+            params.kseqlen_batch_stride = num_heads_k;
+            params.block_table_batch_stride = block_table.stride(0);
+            params.block_table_head_stride = block_table.stride(1);
+        }
     }
     params.page_block_size = page_block_size;
 

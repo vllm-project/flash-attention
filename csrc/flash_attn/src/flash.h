@@ -103,7 +103,11 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Paged KV cache
     int * __restrict__ block_table;
+    bool is_kvc_cache;
+    bool seqlen_by_head;
+    index_t kseqlen_batch_stride;
     index_t block_table_batch_stride;
+    index_t block_table_head_stride;
     int page_block_size;
 
     // The dropout probability (probability of keeping an activation).

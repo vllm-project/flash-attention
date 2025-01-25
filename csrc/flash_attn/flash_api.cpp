@@ -181,6 +181,8 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
                             void *softmax_lse_d,
                             float p_dropout,
                             float softmax_scale,
+                            int64_t window_size_left,
+                            int64_t window_size_right,
                             const float softcap,
                             bool seqlenq_ngroups_swapped=false,
                             const bool unpadded_lse=false) {
@@ -198,8 +200,8 @@ void set_params_fprop_sparse(Flash_fwd_params &params,
         softmax_lse_d,
         p_dropout,
         softmax_scale,
-        -1,  // window_size_left
-        -1,  // window_size_right
+        window_size_left,
+        window_size_right,
         softcap,
         seqlenq_ngroups_swapped,
         unpadded_lse
@@ -395,6 +397,10 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     // causal=true is the same as causal=false in this case
     if (seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }
 
+    int64_t window_size_left = -1;
+    int64_t window_size_right = -1;
+    if (is_causal) { window_size_right = 0; }
+
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_og);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_og);
@@ -460,6 +466,8 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                             softmax_lse.data_ptr(),
                             p_dropout,
                             softmax_scale,
+                            window_size_left,
+                            window_size_right,
                             softcap
                      );
 
@@ -572,6 +580,10 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
 
+    int64_t window_size_left = -1;
+    int64_t window_size_right = -1;
+    if (is_causal) { window_size_right = 0; }
+
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
     const int total_q = q.sizes()[0];
@@ -662,6 +674,8 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                             softmax_lse.data_ptr(),
                             p_dropout,
                             softmax_scale,
+                            window_size_left,
+                            window_size_right,
                             softcap
                      );
     params.total_q = total_q;

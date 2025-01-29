@@ -1,0 +1,2 @@
+# Renamed from .cpp during build
+*.cu

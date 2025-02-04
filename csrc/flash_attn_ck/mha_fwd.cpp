@@ -253,6 +253,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         p = torch::empty({ 0 }, opts);
     }
 
+    // NOTE(woosuk/luka): Commented out because they are not used in inference.
+    // TODO this is commented out on CUDA
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
@@ -266,6 +268,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         hipLaunchKernelGGL(
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
+    // TODO end comment
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
@@ -317,5 +320,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse};
+//    return {out, softmax_lse, p, rng_state};
 }

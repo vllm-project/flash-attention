@@ -4,8 +4,10 @@ project(vllm_flash_attn LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(FA2_ENABLED ON)
-set(FA3_ENABLED ON)
+option(FA2_ENABLED "Enable building Flash Attention 2" ON)
+option(FA3_ENABLED "Enable building Flash Attention 3 (CUDA only)" ON)
+
+option(VLLM_FA_API_ONLY "Only build backend kernels used by vLLM (varlen_fwd and fwd_kvcache)" ON)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
@@ -234,7 +236,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 
         # custom definitions
         target_compile_definitions(_vllm_fa3_C PRIVATE
-                FLASHATTENTION_DISABLE_BACKWARD
+                $<IF:${VLLM_FA_API_ONLY},FLASHATTENTION_DISABLE_BACKWARD,> # vLLM API does not require bwd
                 FLASHATTENTION_DISABLE_DROPOUT
                 # FLASHATTENTION_DISABLE_ALIBI
                 # FLASHATTENTION_DISABLE_SOFTCAP
@@ -260,8 +262,15 @@ elseif (VLLM_GPU_LANG STREQUAL "HIP")
     set(FA_GENERATED_OUTDIR ${CMAKE_CURRENT_BINARY_DIR}/gen)
     set(CK_GEN_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/csrc/composable_kernel/example/ck_tile/01_fmha/generate.py)
     file(MAKE_DIRECTORY ${FA_GENERATED_OUTDIR})
+
+    # bwd kernels not required for vLLM API
+    set(ROCm_CK_KERNELS "fwd" "fwd_appendkv" "fwd_splitkv")
+    if(NOT VLLM_FA_API_ONLY)
+        list(APPEND ROCm_CK_KERNELS "bwd")
+    endif()
+
     # TODO(luka) only run if required
-    foreach (KERNEL IN ITEMS "fwd" "fwd_appendkv" "fwd_splitkv" "bwd")
+    foreach (KERNEL IN LISTS ROCm_CK_KERNELS)
         execute_process(
                 COMMAND
                 "${Python_EXECUTABLE}" "${CK_GEN_SCRIPT}" "-d" "${KERNEL}" "--output_dir" "${FA_GENERATED_OUTDIR}" "--receipt" "2"
@@ -289,12 +298,18 @@ elseif (VLLM_GPU_LANG STREQUAL "HIP")
     set(VLLM_FA2_CPP_CU_SRCS
         # csrc/flash_attn_ck/flash_api.cpp # only contains declarations & PyBind
         csrc/flash_attn_ck/flash_common.cpp
-        csrc/flash_attn_ck/mha_bwd.cpp
         csrc/flash_attn_ck/mha_fwd_kvcache.cpp
-        csrc/flash_attn_ck/mha_fwd.cpp
-        csrc/flash_attn_ck/mha_varlen_bwd.cpp
         csrc/flash_attn_ck/mha_varlen_fwd.cpp
     )
+
+    # The rest are not required for vLLM API
+    if(NOT VLLM_FA_API_ONLY)
+        list(APPEND VLLM_FA2_CPP_CU_SRCS
+            csrc/flash_attn_ck/mha_bwd.cpp
+            csrc/flash_attn_ck/mha_fwd.cpp
+            csrc/flash_attn_ck/mha_varlen_bwd.cpp>
+        )
+    endif ()
 
     foreach(CPP_FILE ${VLLM_FA2_CPP_CU_SRCS})
         string(REGEX REPLACE "\.cpp$" ".cu" CU_FILE ${CPP_FILE})

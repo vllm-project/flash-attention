@@ -450,6 +450,9 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
     auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size}, opts.dtype(at::kFloat));
 
+    // NOTE(woosuk/luka): Commented out because they are not used in inference.
+
+    // TODO comment
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
@@ -463,6 +466,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         hipLaunchKernelGGL(
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
+    // TODO end comment
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
@@ -551,5 +555,6 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse};
+//    return {out, softmax_lse, p, rng_state};
 }

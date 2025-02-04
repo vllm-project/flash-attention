@@ -44,10 +44,6 @@ PACKAGE_NAME = "vllm_flash_attn"
 cmdclass = {}
 ext_modules = []
 
-# TODO(luka): This should be replaced with a fetch_content call in CMakeLists.txt
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
-
 def is_sccache_available() -> bool:
     return which("sccache") is not None
 
@@ -78,6 +74,12 @@ def _is_hip() -> bool:
     return (VLLM_TARGET_DEVICE == "cuda"
             or VLLM_TARGET_DEVICE == "rocm") and torch.version.hip is not None
 
+# TODO(luka): This should be replaced with a fetch_content call in CMakeLists.txt
+if _is_hip():
+    # if not USE_TRITON_ROCM:
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"])
+else:
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 class CMakeExtension(Extension):
 
@@ -255,7 +257,7 @@ def get_package_version():
         return str(public_version)
 
 
-PYTORCH_VERSION = "2.4.0"
+PYTORCH_VERSION = "2.5.1"
 MAIN_CUDA_VERSION = "12.1"
 
 
@@ -275,15 +277,33 @@ def get_nvcc_cuda_version() -> Version:
 
 def get_version() -> str:
     version = get_package_version()
-    cuda_version = str(get_nvcc_cuda_version())
-    if cuda_version != MAIN_CUDA_VERSION:
-        cuda_version_str = cuda_version.replace(".", "")[:3]
-        version += f"+cu{cuda_version_str}"
+
+    sep = "+" if "+" not in version else "."  # dev versions might contain +
+
+    if _is_cuda():
+        if envs.VLLM_USE_PRECOMPILED:
+            version += f"{sep}precompiled"
+        else:
+            cuda_version = str(get_nvcc_cuda_version())
+            if cuda_version != MAIN_CUDA_VERSION:
+                cuda_version_str = cuda_version.replace(".", "")[:3]
+                # skip this for source tarball, required for pypi
+                if "sdist" not in sys.argv:
+                    version += f"{sep}cu{cuda_version_str}"
+    elif _is_hip():
+        # Get the Rocm Version
+        # TODO rocm_version = get_rocm_version() or torch.version.hip
+        rocm_version = torch.version.hip
+        if rocm_version and rocm_version != MAIN_CUDA_VERSION:
+            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+    else:
+        raise RuntimeError("Unknown runtime environment")
     return version
 
 
 ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa2_C"))
-ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
+if _is_cuda():
+    ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
 
 setup(
     name="vllm-flash-attn",

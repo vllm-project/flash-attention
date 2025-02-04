@@ -61,9 +61,11 @@ function (hipify_sources_target OUT_SRCS NAME ORIG_SRCS)
   # Split into C++ and non-C++ (i.e. CUDA) sources.
   #
   set(SRCS ${ORIG_SRCS})
-  set(CXX_SRCS ${ORIG_SRCS})
-  list(FILTER SRCS EXCLUDE REGEX "\.(cc)|(cpp)$")
-  list(FILTER CXX_SRCS INCLUDE REGEX "\.(cc)|(cpp)$")
+  set(EXCLUDED_SRCS ${ORIG_SRCS})
+  set(EXCLUDE_REGEX "\.(cc|cpp|hip)$")
+  list(FILTER SRCS EXCLUDE REGEX ${EXCLUDE_REGEX})
+  list(FILTER EXCLUDED_SRCS INCLUDE REGEX ${EXCLUDE_REGEX})
+  message(DEBUG "Excluded source files: ${EXCLUDED_SRCS}")
 
   #
   # Generate ROCm/HIP source file names from CUDA file names.
@@ -78,15 +80,16 @@ function (hipify_sources_target OUT_SRCS NAME ORIG_SRCS)
   endforeach()
 
   set(CSRC_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+  set(CSRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/csrc)
   add_custom_target(
     hipify${NAME}
-    COMMAND ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${SRCS}
+    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p "${CSRC_DIR}" -o "${CSRC_BUILD_DIR}" ${SRCS}
     DEPENDS ${CMAKE_SOURCE_DIR}/cmake/hipify.py ${SRCS}
     BYPRODUCTS ${HIP_SRCS}
     COMMENT "Running hipify on ${NAME} extension source files.")
 
   # Swap out original extension sources with hipified sources.
-  list(APPEND HIP_SRCS ${CXX_SRCS})
+  list(APPEND HIP_SRCS ${EXCLUDED_SRCS})
   set(${OUT_SRCS} ${HIP_SRCS} PARENT_SCOPE)
 endfunction()
 

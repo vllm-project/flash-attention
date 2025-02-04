@@ -111,6 +111,10 @@ mha_fwd_kvcache(at::Tensor &q,                                     // batch_size
                 bool is_rotary_interleaved, // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits);
 
+#ifndef FLASHATTENTION_DISABLE_PYBIND
+
+#include <torch/python.h>
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
         m.doc() = "FlashAttention";
@@ -120,3 +124,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
         m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }
+#endif

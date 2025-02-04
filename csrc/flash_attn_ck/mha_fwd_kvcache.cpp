@@ -317,6 +317,8 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     int seqlen_q = sizes[1];
     int num_heads = sizes[2];
     const int head_size_og = sizes[3];
+    const int seqlen_q_og = seqlen_q;
+    const int num_heads_og = num_heads;
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
@@ -389,8 +391,12 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_og);
-        if (head_size_og % 8 != 0) { out = torch::empty_like(q_padded); }
+        CHECK_SHAPE(out, batch_size, seqlen_q_og, num_heads_og, head_size_og);
+        if (head_size_og % 8 != 0) {
+            out = torch::empty_like(q_padded);
+        } else if (seqlenq_ngroups_swapped) {
+            out = out.reshape({batch_size, num_heads, seqlen_q, head_size_og}).transpose(1, 2);
+        }
     } else {
         out = torch::empty_like(q_padded);
     }

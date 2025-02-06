@@ -311,9 +311,16 @@ int64_t resolve_thread_kv_page_slice_offset(
     int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
 
     if (partial_block_size) {
-        auto final_row_offset = 
-          ceil_div(*partial_block_size, kGmemRowsPerThread) * kGmemRowsPerThread;
-        block_row_offset = std::min(block_row_offset, int64_t(final_row_offset));
+        // if we have a partial block, we need to adjust the row offset to avoid
+        // reading of the end end of the block_table
+        // get the offset of the last row in the kBlockN we care about
+        auto final_row_offset = std::max(*partial_block_size - 1, 0);
+        // adjust the row offset to account for each thread loadking multiple
+        // rows
+        auto final_thread_row_offset = 
+          ceil_div(final_row_offset, kGmemRowsPerThread) * kGmemRowsPerThread;
+        block_row_offset = std::min(
+            block_row_offset, int64_t(final_thread_row_offset));
     }
 
     const int64_t global_row_offset = block_row_offset + n_block * kBlockN;

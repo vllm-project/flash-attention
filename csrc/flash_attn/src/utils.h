@@ -315,7 +315,7 @@ int64_t resolve_thread_kv_page_slice_offset(
         // reading of the end end of the block_table
         // get the offset of the last row in the kBlockN we care about
         auto final_row_offset = std::max(*partial_block_size - 1, 0);
-        // adjust the row offset to account for each thread loadking multiple
+        // adjust the row offset to account for each thread loading multiple
         // rows
         auto final_thread_row_offset = 
           ceil_div(final_row_offset, kGmemRowsPerThread) * kGmemRowsPerThread;

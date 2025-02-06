@@ -297,16 +297,26 @@ void cp_async_wait() {
 // assumes that the tensor has already been positioned at the correct head.
 template <typename Kernel_traits>
 __forceinline__ __device__
-int64_t resolve_thread_kv_page_slice_offset(const int tidx, const int n_block_max, const int page_block_size, 
-                            const int* block_table, const int page_stride, const int row_stride) {
+int64_t resolve_thread_kv_page_slice_offset(
+    const int tidx, const int n_block, const int page_block_size, 
+    const int* block_table, const int page_stride, const int row_stride,
+    std::optional<int> partial_block_size = std::nullopt
+) {
     constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
     constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
     constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     
     const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
-    const int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
-    const int64_t global_row_offset = block_row_offset + (n_block_max - 1) * kBlockN;
+    int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+
+    if (partial_block_size) {
+        auto final_row_offset = 
+          ceil_div(*partial_block_size, kGmemRowsPerThread) * kGmemRowsPerThread;
+        block_row_offset = std::min(block_row_offset, int64_t(final_row_offset));
+    }
+
+    const int64_t global_row_offset = block_row_offset + n_block * kBlockN;
     const int64_t page_offset = global_row_offset % page_block_size;
     const int64_t virtual_page_idx = global_row_offset / page_block_size;
 

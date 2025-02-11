@@ -59,7 +59,7 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
     -> Optional[str]:
     assert fa_version in [2, 3], f"Unsupported FA version: {fa_version}"
     if fa_version == 2:
-        return _is_fa3_supported(device)[1]
+        return _is_fa2_supported(device)[1]
     elif fa_version == 3:
         return _is_fa3_supported(device)[1]
 

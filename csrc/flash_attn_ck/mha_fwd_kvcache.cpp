@@ -569,5 +569,7 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
         out = out.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
+
+    std::cout << "End of mha_kvcache" << std::endl;
     return {out, softmax_lse};
 }

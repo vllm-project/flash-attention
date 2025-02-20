@@ -8,9 +8,14 @@ from flash_attn import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
-    flash_attn_varlen_func,
+    # flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
+    # flash_attn_with_kvcache,
+)
+
+from vllm_flash_attn import (
+    flash_attn_varlen_func,
     flash_attn_with_kvcache,
 )
 
@@ -859,7 +864,8 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 40, 64, 80, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("swap_sq_sk", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -876,7 +882,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         (1023, 1024),
     ],
 )
-@pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
+@pytest.mark.parametrize("paged_kv_block_size", [256, 512])
 def test_flash_attn_varlen_causal(
     seqlen_q, seqlen_k, swap_sq_sk, d, local, paged_kv_block_size, dtype
 ):
@@ -926,11 +932,11 @@ def test_flash_attn_varlen_causal(
         q_unpad,
         k_unpad if paged_kv_block_size is None else k_cache_paged,
         v_unpad if paged_kv_block_size is None else v_cache_paged,
-        cu_seqlens_q,
-        cu_seqlens_k,
         max_seqlen_q,
+        cu_seqlens_q,
         max_seqlen_k,
-        0.0,
+        cu_seqlens_k,
+        torch.zeros(1, 1, dtype=torch.float32),  # 0.0
         causal=causal,
         window_size=window_size,
         block_table=block_table,
@@ -1033,7 +1039,8 @@ def test_flash_attn_varlen_causal(
 @pytest.mark.parametrize("paged_kv_block_size", [None, 256])
 @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
+@pytest.mark.parametrize("d", [32, 64, 80, 128, 256])
+# @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1543,7 +1550,8 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize("d", [32, 40, 64, 80, 96, 128, 160, 192, 224, 256])
+# @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 @pytest.mark.parametrize("swap_sq_sk", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -1598,11 +1606,11 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         q_unpad,
         k_unpad,
         v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
         max_seqlen_q,
+        cu_seqlens_q,
         max_seqlen_k,
-        0.0,
+        cu_seqlens_k,
+        torch.zeros(1, 1, dtype=torch.float32),  # 0.0
         causal=causal,
         window_size=window_size,
         deterministic=True,

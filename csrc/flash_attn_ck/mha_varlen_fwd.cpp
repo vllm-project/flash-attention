@@ -555,6 +555,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
+    std::cout << "End of mha_varlen" << std::endl;
     return {out, softmax_lse};
 //    return {out, softmax_lse, p, rng_state};
 }

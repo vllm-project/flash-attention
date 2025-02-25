@@ -95,6 +95,9 @@ def flash_attn_varlen_func(
     return_softmax_lse=False,
     out=None,
     fa_version: int = DEFAULT_FA_VERSION,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -207,7 +210,7 @@ def flash_attn_varlen_func(
             alibi_slopes,
             None,             # kv_batch_idx
             None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
             real_window_size[0], real_window_size[1],
@@ -246,6 +249,9 @@ def flash_attn_with_kvcache(
     *,
     out=None,
     fa_version: int = DEFAULT_FA_VERSION,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -380,7 +386,7 @@ def flash_attn_with_kvcache(
             alibi_slopes,
             cache_batch_idx,  # kv_batch_idx
             None, None,       # rotary_cos, rotary_sin
-            None, None, None, # q_descale, k_descale, v_descale
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal,
             window_size[0], window_size[1],

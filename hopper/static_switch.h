@@ -117,14 +117,6 @@
     constexpr static bool CONST_NAME = false;                                                    \
     return __VA_ARGS__();                                                                        \
   }()
-#elif defined(FLASHATTENTION_VARLEN_ONLY)
-  #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
-  [&] {                                                                                          \
-    TORCH_CHECK(COND, "This flash attention build only supports varlen "                         \
-                      "(for build size reasons).");                                              \
-    constexpr static bool CONST_NAME = true;                                                     \
-    return __VA_ARGS__();                                                                        \
-  }()
 #else
   #define VARLEN_SWITCH BOOL_SWITCH
 #endif

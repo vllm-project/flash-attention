@@ -11,9 +11,11 @@ import torch
 from einops import rearrange, repeat
 
 from vllm_flash_attn.flash_attn_interface import (
+    flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    is_fa_version_supported
+    is_fa_version_supported,
+    fa_version_unsupported_reason
 )
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
@@ -23,15 +25,49 @@ DTYPES = [torch.float16, torch.bfloat16]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
-VERSIONS = \
-    ([2] if is_fa_version_supported(2) else []) + \
-    ([3] if is_fa_version_supported(3) else [])
+VERSIONS = [2, 3]
+
+
+def construct_local_mask(
+    seqlen_q,
+    seqlen_k,
+    window_size=(-1, -1),  # -1 means infinite window size
+    query_padding_mask=None,
+    key_padding_mask=None,
+    device=None,
+    key_leftpad=None,
+):
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    if window_size[0] < 0:
+        return col_idx > row_idx + sk - sq + window_size[1]
+    else:
+        sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        return torch.logical_or(
+            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
+            col_idx < row_idx + sk - sq - window_size[0],
+        )
 
 
 def ref_attn(
     q,
     k,
     v,
+    scale,
     query_padding_mask=None,
     key_padding_mask=None,
     attn_bias=None,
@@ -74,10 +110,11 @@ def ref_attn(
     k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
     v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
     d = q.shape[-1]
+    q *= scale
     if not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+        scores = torch.einsum("bthd,bshd->bhts", q, k)
     else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+        scores = torch.einsum("bthd,bshd->bhts", q, k)
     
     lse_ref = scores.logsumexp(dim=-1)    
     
@@ -176,6 +213,59 @@ def ref_paged_attn(
         start_idx += query_len
 
     return torch.cat(outputs, dim=0)
+
+
+@pytest.mark.parametrize("seq_len", [1, 10, 256, 533])
+@pytest.mark.parametrize("batch_size", [1, 7, 32])
+@pytest.mark.parametrize("num_heads", NUM_HEADS)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
+@pytest.mark.parametrize("fa_version", VERSIONS)
+@torch.inference_mode()
+def test_flash_attn(
+        seq_len: int,
+        batch_size: int,
+        num_heads: Tuple[int, int],
+        head_size: int,
+        dtype: torch.dtype,
+        soft_cap: Optional[float],
+        fa_version: int,
+) -> None:
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    scale = head_size**-0.5
+
+    query = torch.randn(
+        batch_size, seq_len, num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(
+        batch_size, seq_len, num_kv_heads, head_size, dtype=dtype)
+
+    output = flash_attn_func(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        causal=True,
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=fa_version,
+    )
+
+    ref_output, _ = ref_attn(
+        q=query,
+        k=key,
+        v=value,
+        scale=scale,
+        causal=True,
+        softcap=soft_cap if soft_cap is not None else 0,
+    )
+    torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output - ref_output))}"
 
 
 @pytest.mark.parametrize("kv_lens", [[1328, 18, 463], [1, 54, 293, 70]])

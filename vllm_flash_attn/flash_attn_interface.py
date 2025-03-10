@@ -74,6 +74,115 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def flash_attn_func(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    *,
+    return_softmax_lse=False,
+    out=None,
+    fa_version: int = DEFAULT_FA_VERSION,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    if fa_version == 2:
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out, softmax_lse = torch.ops._vllm_fa2_C.fwd(
+            q,
+            k,
+            v,
+            out,
+            alibi_slopes,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size[0], window_size[1],
+            softcap,
+            return_softmax_lse and dropout_p > 0,
+            None,
+        )
+    elif fa_version == 3:
+        out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
+            q, k, v,
+            None, None,       # k_new, v_new
+            out,
+            None, None,       # cu_seqlens_q, cu_seqlens_k
+            None,             # cu_seqlens_k_new
+            None, None,       # seqused_q, seqused_k
+            None, None,       # max_seqlen_q, max_seqlen_k
+            None,
+            alibi_slopes,
+            None,             # kv_batch_idx
+            None, None,       # rotary_cos, rotary_sin
+            None, None, None, # q_descale, k_descale, v_descale
+            softmax_scale,
+            causal,
+            window_size[0], window_size[1],
+            0,                # sink_token_length
+            softcap,
+            True,             # rotary_interleaved
+            0,                # num_splits
+            None,             # pack_gqa
+            0,                # sm_margin
+        )
+
+    return (out, softmax_lse) if return_softmax_lse else out
+
+
 def flash_attn_varlen_func(
     q,
     k,

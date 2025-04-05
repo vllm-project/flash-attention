@@ -22,7 +22,7 @@ inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, in
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int num_m_blocks, int size_one_kv_head, bool is_causal_or_local, int max_splits) {
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int num_m_blocks, int size_one_kv_head, bool is_causal_or_local, int max_splits, int min_n_blocks=4) {
     // If we have enough to almost fill the SMs, then just use 1 split
     // However, in the case of super long seqlen where each head of KV doesn't even fit into
     // L2 (we assume conservatively that L2 size is 50MB), we want to split.
@@ -45,13 +45,13 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
         float eff = n_waves / ceil(n_waves);
-        // printf("num_splits = %d, eff = %f\n", num_splits, eff);
+        if (num_n_blocks / num_splits < min_n_blocks) eff *= 0.85;
+        //if (num_n_blocks / num_splits < 1) eff = 0.5f;
         if (eff > max_efficiency) { max_efficiency = eff; }
         efficiency.push_back(eff);
     }
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
+        if (efficiency[num_splits - 1] >= 0.95 * max_efficiency) {
             return num_splits;
         }
     }

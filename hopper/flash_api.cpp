@@ -402,10 +402,13 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     #else
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
-    // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
-    int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
-    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
+    // pass std::numeric_limits<int>::max() since we don't know if we are packing yet, so set to max so we can see if it makes sense
+    // with the largest tile size possible
+    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
+    TileConfig tc = get_tile_config(
+        params.arch, params.d, params.dv, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, std::numeric_limits<int>::max(),
+        false /*v_colmajor*/, params.page_table, params.softcap > 0.f, params.knew_ptr, varlen);
+    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, tc.kBlockM);
     #endif
 }
 
@@ -417,13 +420,17 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table, params.softcap > 0.f);
+    int seqlen_q_packgqa = params.seqlen_q * (!params.pack_gqa ? 1 : params.h / params.h_k);
+
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
-    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
-    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
-    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+    TileConfig tc = get_tile_config(
+        params.arch, params.d, params.dv, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, seqlen_q_packgqa,
+        false /*v_colmajor*/, params.page_table, params.softcap > 0.f, params.knew_ptr, varlen);
+
+    int const kBlockM = tc.kBlockM;
+    int const kBlockN = tc.kBlockN;
+
     // If is_local, we're not going to load all of seqlen_k
     int const seqlen_k_loaded = !params.is_local
         ? params.seqlen_k
@@ -721,9 +728,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.page_size = page_size;
     params.num_pages = num_pages;
 
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable Split for PackedGQA to save on compile time and binary size.
+    //  Generally PackedGQA implies decode which implies longer context length.
+    if (params.pack_gqa) params.num_splits = std::max(params.num_splits, 2);
+    //printf("num_splits: %d\n", params.num_splits);
 
     if (k_new_.has_value()) {
         at::Tensor k_new, v_new;

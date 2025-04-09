@@ -8,7 +8,7 @@
 
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int qhead_per_khead, int blockM) {
     // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
-    if (varlen_q) return true;
+    if (varlen_q && seqlen_q <= blockM) return true;
     // Heuristic: PackGQA is a bit slower but can help if seqlen_q is small or not near a multiple of kBlockM
     auto round_up = [](int a, int b) { return (a + b - 1) / b * b; };
     float nopack_gqa_efficiency = float(seqlen_q) / float(round_up(seqlen_q, blockM));
@@ -38,6 +38,8 @@ inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n
     }
     // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if (num_n_blocks <= 4) { return 1; }
+    // If num_n_blocks is small and we have some level of parallelism, use 1 split.
+    if (num_n_blocks <= 8 && batch_nheads_mblocks >= 32) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;

@@ -190,3 +190,14 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+  #define CONST_MAX_SEQLEN_Q_SWITCH(SEQLEN_Q, ...)                                               \
+  [&] {                                                                                          \
+    if (SEQLEN_Q <= 64) {                                                                        \
+      constexpr static int kMaxSeqlenQ = 64;                                                     \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int kMaxSeqlenQ = std::numeric_limits<int>::max();                        \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()

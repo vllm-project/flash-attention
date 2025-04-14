@@ -46,25 +46,26 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
+    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
-        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
+        flash::CollectiveMainloopFwdSm90<SeqlenInfo_t, kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
+        flash::CollectiveMainloopFwdSm80<SeqlenInfo_t, kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     using SchedulerPersistent = std::conditional_t<Varlen,
-        flash::VarlenDynamicPersistentTileScheduler<kBlockM, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>,
+        flash::VarlenDynamicPersistentTileScheduler<SeqlenInfo_t, TileShape_MNK, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Is_causal, Is_local, AppendKV, Arch >= 90 /*WarpSpecialized*/>,
         std::conditional_t<!Is_causal && !Is_local,
-            flash::StaticPersistentTileScheduler<Split>,
-            flash::DynamicPersistentTileScheduler<CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/>
+            flash::StaticPersistentTileScheduler<SeqlenInfo_t, TileShape_MNK, Split, Is_causal, Is_local, Varlen, AppendKV, PackGQA>,
+            flash::DynamicPersistentTileScheduler<SeqlenInfo_t, TileShape_MNK, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Is_causal, Is_local, AppendKV, Arch >= 90 /*WarpSpecialized*/>
         >
     >;
-    using SchedulerSingleTile = flash::SingleTileScheduler<Varlen, Split, PackGQA, kBlockM>;
+    using SchedulerSingleTile = flash::SingleTileScheduler<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, kBlockM, AppendKV, Is_causal, Is_local>;
     // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
@@ -122,11 +123,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         {params.v_descale_batch_stride, params.v_descale_head_stride},
         params.window_size_left, params.window_size_right,
         params.softcap,
-        params.num_splits,
         params.kv_batch_idx,
-        params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
-        params.seqused_q, params.seqused_k,
-        params.leftpad_k, params.seqlens_rotary
+        is_varlen_k_new, is_varlen_q, is_varlen_k
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
@@ -147,12 +145,21 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
     typename flash::TileSchedulerArguments scheduler_args {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
-        params.h / params.h_k,
+        qhead_per_khead,
         params.seqlen_q,
         params.seqlen_k, params.d, params.dv, sizeof(Element),
-        params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
-        // params.num_m_blocks_ptr,
+        params.tile_count_semaphore, 
+        params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew, 
+        params.seqused_q, params.seqused_k, 
+        params.leftpad_k, params.seqlens_rotary, 
+        {seqlen_q, params.d, params.h, batch_q}, // shape_Q
+        {!params.page_table ? (!is_varlen_k ? params.seqlen_k : params.total_k) : params.page_size,
+         params.d, params.h_k, !params.page_table ? batch_k : params.num_pages}, // shape_K
+        {!is_varlen_k_new ? params.seqlen_knew : params.total_knew, params.d, params.h_k, !is_varlen_k_new ? params.b : 1}, // shape_K_new
+        params.page_table, 
+        {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
         params.num_splits_dynamic_ptr,
+        params.window_size_left, params.window_size_right
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {

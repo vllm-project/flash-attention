@@ -8,11 +8,16 @@
 #include "cutlass/arch/barrier.h"
 
 #include "named_barrier.hpp"
+#include "block.h"
 #include "utils.h"
+#include "seqlen.h"
 
 namespace flash {
 
 ///////////////////////////////////////////////////////////////////////////////
+
+using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
+using ShapePageTable = cute::Shape<int32_t, int32_t>;  // (batch, max_num_pages_per_seq)
 
 // Host side kernel arguments
 struct TileSchedulerArguments {
@@ -22,41 +27,92 @@ struct TileSchedulerArguments {
     int const seqlen;  // Only used if Varlen and cu_seqlens == nullptr and seqused == nullptr
     int const seqlen_k, headdim, headdim_v, element_size;  // Used to calculate L2 swizzling
     int* const tile_count_semaphore = nullptr;
-    int const* const cu_seqlens = nullptr;
-    int const* const seqused = nullptr;
-    // int const* const num_m_blocks_ptr = nullptr;
+    int const* const cu_seqlens_q = nullptr;
+    int const* const cu_seqlens_k = nullptr;
+    int const* const cu_seqlens_k_new = nullptr;
+    int const* const seqused_q = nullptr;
+    int const* const seqused_k = nullptr;
+    int const* const leftpad_k = nullptr;
+    int const* const seqlens_rotary = nullptr;
+    ShapeQKV const shape_Q;
+    ShapeQKV const shape_K;
+    ShapeQKV const shape_K_new;
+    int const* const ptr_pagetable = nullptr;
+    ShapePageTable const shape_pagetable;
     int const* const num_splits_dynamic_ptr = nullptr;
+    int const window_size_left = -1;
+    int const window_size_right = 0;
+};
+
+template<bool AppendKV>
+struct BlockCoord {};
+
+template<>
+struct BlockCoord<false> {
+    int const m_block = -1;
+    int const bidh = -1;
+    int const bidb = -1;
+    int const n_block_min = 0;
+    int const n_block_max = 0;
+    int const peer_id = 0;   // Where to write the partial results / split_k index
+    int const num_peers = 0; // Number of peers / num_splits
+};
+
+template<>
+struct BlockCoord<true>: public BlockCoord<false> {
+    int const n_block_new_min = 0;
+    int const n_block_new_max = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128>
+template<typename SeqlenInfo_t, typename TileShape_MNK, bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128, bool AppendKV=false, bool Is_causal=false, bool Is_local=false>
 class SingleTileScheduler {
 
 public:
-
     using SharedStorage = int;
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
     // Device side kernel params
     struct Params {
         int const num_blocks, num_head, num_batch, num_splits;
-        int const qhead_per_khead;
+        cutlass::FastDivmod qhead_per_khead;
         int const seqlen;
         cutlass::FastDivmod nsplits_divmod;
-        int const* const cu_seqlens;
-        int const* const seqused;
+        int const* const cu_seqlens_q = nullptr;
+        int const* const cu_seqlens_k = nullptr;
+        int const* const cu_seqlens_k_new = nullptr;
+        int const* const seqused_q = nullptr;
+        int const* const seqused_k = nullptr;
+        int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
+        ShapeQKV shape_Q;
+        ShapeQKV shape_K;
+        ShapeQKV shape_K_new;
+        int const* const ptr_pagetable = nullptr;
+        ShapePageTable shape_pagetable;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const window_size_left;
+        int const window_size_right;
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         assert(!Split || !Varlen || args.num_splits_dynamic_ptr != nullptr);
-        assert(!Split || !Varlen || args.num_splits < (1 << 16)); // We use the top 16 bits to store num_splits
+        assert(!Split || !Varlen || args.num_splits < (1 << 16)); // We use the top 16 bits to store num_splits in VarlenDynamic
         return {args.num_blocks, args.num_head, args.num_batch, !Split ? 1 : args.num_splits,
-                args.qhead_per_khead, args.seqlen,
+                cutlass::FastDivmod(args.qhead_per_khead),
+                args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
-                !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused,
-                args.num_splits_dynamic_ptr};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.shape_Q, args.shape_K, args.shape_K_new,
+                args.ptr_pagetable,
+                args.shape_pagetable,
+                args.num_splits_dynamic_ptr,
+                args.window_size_left, args.window_size_right};
     }
 
     static dim3
@@ -64,55 +120,93 @@ public:
         return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
 
+    Params const& params;
     struct WorkTileInfo {
-        int block_idx = 0;
-        int bidh = 0;
-        int bidb = 0;
-        int split_idx = 0;
-
-        CUTLASS_DEVICE
-        bool
-        is_valid(Params const& params) const {
-            return bidb >= 0;
-        }
-
-        CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t, int32_t>
-        get_block_coord(Params const& params) const {
-            return {block_idx, bidh, bidb, !Split ? 0 : split_idx};
-        }
-
+        BlockCoord<AppendKV> block_coord;
+        SeqlenInfo_t seqlen_info;
     };
 
     CUTLASS_DEVICE
-    SingleTileScheduler(SharedStorage* const smem_scheduler) { }
+    bool
+    is_valid(WorkTileInfo const& work_tile) const {
+        return work_tile.block_coord.bidb >= 0;
+    }
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    get_block_coord(WorkTileInfo const& work_tile) const {
+        return work_tile.block_coord;
+    }
+
+    CUTLASS_DEVICE
+    SeqlenInfo_t
+    get_seqlen_info(WorkTileInfo const& work_tile) const {
+        return work_tile.seqlen_info;
+    }
+
+    CUTLASS_DEVICE
+    SingleTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : params(params) { }
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
-        WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
-        if constexpr (Split) {
-            int split_idx;
-            work_info.bidh = params.nsplits_divmod.divmod(split_idx, work_info.bidh);
-            work_info.split_idx = split_idx;
-        }
+    get_initial_work() const {
+        int const m_block = blockIdx.x;
+        int bidb = blockIdx.z;
+        int bidh = blockIdx.y;
+        int peer_id = 0;
+        int num_peers = 1;
+
+        SeqlenInfo_t seqlen_info{
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+
         bool is_valid_tile = true;
+        if constexpr (Split) {
+            peer_id = params.nsplits_divmod.divmod(peer_id, bidh);
+            num_peers = params.nsplits_divmod.divisor;
+        }
         if constexpr (Varlen) {
-            int seqlen = params.seqused
-                ? params.seqused[work_info.bidb]
-                : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
-            if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
-            is_valid_tile = work_info.block_idx * kBlock < seqlen;
+            int seqlen_q_ = params.seqused_q
+                ? params.seqused_q[bidb]
+                : (params.cu_seqlens_q ? params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb] : params.seqlen);
+            if constexpr (PackGQA) { seqlen_q_ *= params.qhead_per_khead_divmod.divisor; }
+            is_valid_tile = m_block * kBlock < seqlen_q_;
+
+            if constexpr (Split) {
+                int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[bidb] : num_peers;
+                is_valid_tile &= peer_id < num_splits_dynamic;
+                num_peers = num_splits_dynamic;
+            }
         }
-        if constexpr (Varlen && Split) {
-            int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[work_info.bidb] : params.num_splits;
-            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
-            // Use the top 16 bits to store num_splits
-            work_info.split_idx |= (num_splits_dynamic << 16);
+        if (!is_valid_tile) { bidb = -1; }
+
+        // Calculate n_block_min/max based on causality and local window
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, peer_id & 0xFFFF /* Get actual peer_id */, num_peers,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        
+        if constexpr (AppendKV) {
+            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
+                seqlen_info, m_block, bidb, peer_id & 0xFFFF /* Get actual peer_id */, num_peers,
+                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            return {
+                {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers, 
+                 get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)},
+                seqlen_info
+            };
+        } else {
+            return {
+                {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers},
+                seqlen_info
+            };
         }
-        work_info.bidb = is_valid_tile ? work_info.bidb : -1;
-        return work_info;
     }
 
     CUTLASS_DEVICE
@@ -121,38 +215,69 @@ public:
 
     CUTLASS_DEVICE
     void
-    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+    prefetch_next_work(WorkTileInfo& current_work) const {
+    }
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-        return {0, 0, -1, 0};
+    get_next_work(WorkTileInfo const& current_work) const {
+        return { BlockCoord<AppendKV>{}, {} };
     }
 
 };
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<bool Split=false>
+template<typename SeqlenInfo_t,typename TileShape_MNK, bool Split=false, bool Is_causal=false, bool Is_local=false, bool Varlen=false, bool AppendKV=false, bool PackGQA=false>
 class StaticPersistentTileScheduler {
 
 public:
 
     using SharedStorage = int;
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
     // Device side kernel params
     struct Params {
         int total_blocks;
         cutlass::FastDivmod m_block_divmod, head_divmod;
         cutlass::FastDivmod nsplits_divmod;
+        int num_splits; // Static number of splits
+        cutlass::FastDivmod qhead_per_khead_divmod;
+        ShapeQKV shape_Q;
+        ShapeQKV shape_K;
+        ShapeQKV shape_K_new;
+        int const* cu_seqlens_q = nullptr; // Assuming null for non-varlen static
+        int const* cu_seqlens_k = nullptr;
+        int const* cu_seqlens_k_new = nullptr;
+        int const* seqused_q = nullptr;
+        int const* seqused_k = nullptr;
+        int const* leftpad_k = nullptr;
+        int const* seqlens_rotary = nullptr;
+        int const* ptr_pagetable = nullptr;
+        int window_size_left;
+        int window_size_right;
+        // Params specific to this scheduler
+        int num_m_blocks; // Needed for BlockMN_t
     };
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
-        return {args.num_blocks * args.num_head * args.num_batch * (!Split ? 1 : args.num_splits),
-                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * (!Split ? 1 : args.num_splits)),
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits)};
+        int num_splits_val = !Split ? 1 : args.num_splits;
+        return {args.num_blocks * args.num_head * args.num_batch * num_splits_val,
+                cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * num_splits_val),
+                cutlass::FastDivmod(num_splits_val),
+                num_splits_val,
+                cutlass::FastDivmod(args.qhead_per_khead),
+                args.shape_Q, args.shape_K, args.shape_K_new,
+                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_pagetable,
+                args.window_size_left, args.window_size_right,
+                args.num_blocks
+               };
     }
 
     static dim3
@@ -162,34 +287,80 @@ public:
 
     struct WorkTileInfo {
         int tile_idx;
-
-        CUTLASS_DEVICE
-        bool
-        is_valid(Params const& params) const {
-            return tile_idx < params.total_blocks;
-        }
-
-        CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t, int32_t>
-        get_block_coord(Params const& params) const {
-            int block, bidh, bidb;
-            bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(block, tile_idx));
-            int split_idx = 0;
-            if constexpr (Split) {
-                bidh = params.nsplits_divmod.divmod(split_idx, bidh);
-            }
-            return {block, bidh, bidb, split_idx};
-        }
-
     };
 
+    Params const& params;
+
     CUTLASS_DEVICE
-    StaticPersistentTileScheduler(SharedStorage* const smem_scheduler) {};
+    bool
+    is_valid(WorkTileInfo const& work_tile) const {
+        return work_tile.tile_idx < params.total_blocks;
+    }
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    get_block_coord(WorkTileInfo const& work_tile) const {
+        int m_block, bidh, bidb;
+        bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, work_tile.tile_idx));
+        int peer_id = 0;
+        int num_peers = 1;
+        if constexpr (Split) {
+            num_peers = params.nsplits_divmod.divisor;
+            bidh = params.nsplits_divmod.divmod(peer_id, bidh);
+        }
+
+        SeqlenInfo_t seqlen_info{
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, peer_id, num_peers,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+
+        if constexpr (AppendKV) {
+            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
+                seqlen_info, m_block, bidb, peer_id, num_peers,
+                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
+                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
+        } else {
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
+        }
+    }
+
+    CUTLASS_DEVICE
+    SeqlenInfo_t
+    get_seqlen_info(WorkTileInfo const& work_tile) const {
+         // Recompute block coord parts needed for SeqlenInfo
+        int m_block, bidh, bidb;
+        bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, work_tile.tile_idx));
+        // No need for split info here as SeqlenInfo is per batch item (bidb)
+
+        return SeqlenInfo_t {
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+    }
+
+
+    CUTLASS_DEVICE
+    StaticPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : params(params) {};
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
+    get_initial_work() const {
         return {int(blockIdx.x)};
     }
 
@@ -199,19 +370,19 @@ public:
 
     CUTLASS_DEVICE
     void
-    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {}
+    prefetch_next_work(WorkTileInfo& current_work) const {
+    }
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    get_next_work(WorkTileInfo const& current_work) const {
         return {current_work.tile_idx + int(gridDim.x)};
     }
 
 };
 
-template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
-        bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
+template<typename SeqlenInfo_t, typename TileShape_MNK, int NumMmaThreads, int NumProducerThreads, bool Split, bool PackGQA, bool Is_causal, bool Is_local, bool AppendKV, bool WarpSpecialized>
 class DynamicPersistentTileScheduler {
 
     // This scheduler targets the causal (or local) case where each tile takes different
@@ -228,6 +399,9 @@ class DynamicPersistentTileScheduler {
 
 public:
     using SharedStorage = int;
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
 protected:
     SharedStorage* const tile_count_smem;
@@ -242,6 +416,28 @@ public:
         cutlass::FastDivmod const l2_minor_residual_divmod;
         int const num_hb_quotient;
         int* const tile_count_semaphore;
+        int const num_splits; // Static number of splits
+        cutlass::FastDivmod qhead_per_khead_divmod;
+        ShapeQKV shape_Q;
+        ShapeQKV shape_K;
+        ShapeQKV shape_K_new;
+        int const* cu_seqlens_q = nullptr; // Assuming null for non-varlen dynamic
+        int const* cu_seqlens_k = nullptr;
+        int const* cu_seqlens_k_new = nullptr;
+        int const* seqused_q = nullptr;
+        int const* seqused_k = nullptr;
+        int const* leftpad_k = nullptr;
+        int const* seqlens_rotary = nullptr;
+        int const* ptr_pagetable = nullptr;
+        int window_size_left;
+        int window_size_right;
+        // Params needed for L2 swizzling calculation
+        int const seqlen_k;
+        int const headdim;
+        int const headdim_v;
+        int const element_size;
+        // Num M blocks
+        int num_m_blocks;
     };
 
     static Params
@@ -256,6 +452,7 @@ public:
         // swizzle. Instead we want to divide by the remainder.
         int const num_hb_remainder = (args.num_head * args.num_batch) % swizzle;
         int const num_split_blocks = args.num_blocks * (!Split ? 1 : args.num_splits);
+        int const num_splits_val = !Split ? 1 : args.num_splits;
         // printf("num_split_blocks = %d, num_head = %d, num_batch = %d, swizzle = %d, PackGQA = %d, qhead_per_khead = %d, num_hb_remainder = %d\n", num_split_blocks, args.num_head, args.num_batch, swizzle, int(PackGQA), args.qhead_per_khead, num_hb_remainder);
         assert(args.tile_count_semaphore != nullptr);
         return {num_split_blocks * args.num_head * args.num_batch,
@@ -264,7 +461,17 @@ public:
                 // don't divide by 0
                 cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
                 (args.num_head * args.num_batch) / swizzle,
-                args.tile_count_semaphore};
+                args.tile_count_semaphore,
+                num_splits_val,
+                cutlass::FastDivmod(args.qhead_per_khead),
+                args.shape_Q, args.shape_K, args.shape_K_new,
+                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_pagetable,
+                args.window_size_left, args.window_size_right,
+                args.seqlen_k, args.headdim, args.headdim_v, args.element_size,
+                args.num_blocks
+               };
     }
 
     static dim3
@@ -274,45 +481,97 @@ public:
 
     struct WorkTileInfo {
         int tile_idx;
-
-        CUTLASS_DEVICE
-        bool
-        is_valid(Params const& params) const {
-            return tile_idx < params.total_blocks;
-        }
-
-        CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t, int32_t>
-        get_block_coord(Params const& params) const {
-            int block, bidh, bidb;
-            int l2_mod, bidhb, bidhb_residual;
-            bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
-            // If we're in the last section (called residual), we don't want to divide by
-            // swizzle. Instead we want to divide by the remainder.
-            if (bidhb < params.num_hb_quotient) {
-                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
-            } else {
-                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
-            }
-            bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
-            int split_idx = 0;
-            if constexpr (Split) {
-                split_idx = params.m_block_divmod.divmod(block, block);
-            }
-            // Longest-processing-time-first
-            block = params.m_block_divmod.divisor - 1 - block;
-            return {block, bidh, bidb, split_idx};
-        }
-
     };
 
+    Params const& params;
+
     CUTLASS_DEVICE
-    DynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) : tile_count_smem(smem_scheduler) {};
+    bool
+    is_valid(WorkTileInfo const& work_tile) const {
+        return work_tile.tile_idx < params.total_blocks;
+    }
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    get_block_coord(WorkTileInfo const& work_tile) const {
+        int m_block, bidh, bidb;
+        int l2_mod, bidhb, bidhb_residual;
+        bidhb = params.l2_major_divmod.divmod(l2_mod, work_tile.tile_idx);
+        // If we're in the last section (called residual), we don't want to divide by
+        // swizzle. Instead we want to divide by the remainder.
+        if (bidhb < params.num_hb_quotient) {
+            m_block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+        } else {
+            m_block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+        }
+        bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
+        int peer_id = 0;
+        int num_peers = 1;
+        if constexpr (Split) {
+            num_peers = params.num_splits; // Static splits for Dynamic scheduler
+            peer_id = params.m_block_divmod.divmod(m_block, m_block); // This uses m_block_divmod's divisor (num_m_blocks)
+        }
+        // Longest-processing-time-first means we process m_blocks in reverse order
+        m_block = params.m_block_divmod.divisor - 1 - m_block;
+
+        SeqlenInfo_t seqlen_info{
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, peer_id, num_peers,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+
+        if constexpr (AppendKV) {
+            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
+                seqlen_info, m_block, bidb, peer_id, num_peers,
+                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
+                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
+        } else {
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
+        }
+    }
+
+    CUTLASS_DEVICE
+    SeqlenInfo_t
+    get_seqlen_info(WorkTileInfo const& work_tile) const {
+         // Recompute block coord parts needed for SeqlenInfo
+        int m_block, bidh, bidb;
+        int l2_mod, bidhb, bidhb_residual;
+        bidhb = params.l2_major_divmod.divmod(l2_mod, work_tile.tile_idx);
+        if (bidhb < params.num_hb_quotient) {
+            m_block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+        } else {
+            m_block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+        }
+        bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
+
+        return SeqlenInfo_t{
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+    }
+
+
+    CUTLASS_DEVICE
+    DynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : tile_count_smem(smem_scheduler), params(params) {};
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
+    get_initial_work() const {
         return {int(blockIdx.x)};
     }
 
@@ -326,7 +585,7 @@ public:
 
     CUTLASS_DEVICE
     void
-    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
+    prefetch_next_work(WorkTileInfo& current_work) const {
         if (threadIdx.x % NumProducerThreads == 0) {
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
         }
@@ -335,16 +594,17 @@ public:
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    get_next_work(WorkTileInfo const& current_work) const {
         if constexpr (IsProducerWarp) {
             // thread 0 already has the right tile_idx, just need to broadcast to the rest of warp 0
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
+            WorkTileInfo work_info = tile_idx_to_work_tile(new_tile_idx, current_work);
             flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
             if (threadIdx.x % NumProducerThreads == 0) {
                 *tile_count_smem = current_work.tile_idx;
             }
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
-            return {new_tile_idx};
+            return work_info;
         } else {
             flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             int tile_idx = *tile_count_smem;
@@ -355,7 +615,10 @@ public:
 
 };
 
-template<int kBlock, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp, bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
+template<typename SeqlenInfo_t, typename TileShape_MNK, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+         bool Split=false, bool PackGQA=false,
+         bool Is_causal=false, bool Is_local=false, bool AppendKV=false,
+         bool WarpSpecialized=true>
 class VarlenDynamicPersistentTileScheduler {
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
@@ -363,6 +626,9 @@ class VarlenDynamicPersistentTileScheduler {
 
 public:
     using SharedStorage = int4;
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
 protected:
     SharedStorage* const work_info_smem;
@@ -372,15 +638,32 @@ public:
     // Device side kernel params
     struct Params {
         int num_head, num_batch;
-        int const qhead_per_khead;
-        int const seqlen;
+        cutlass::FastDivmod qhead_per_khead_divmod;
+        int const seqlen; // Max seqlen
         cutlass::FastDivmod head_divmod;
-        cutlass::FastDivmod nsplits_divmod;
+        cutlass::FastDivmod nsplits_divmod; // Static num splits divisor
+        int const num_splits; // Static num splits
         int* const tile_count_semaphore;
-        int const* const cu_seqlens;
-        int const* const seqused;
-        // int* const num_m_blocks_ptr;
-        int const* const num_splits_dynamic_ptr;
+        // Sequence length info (needed for tile_idx_to_work_tile and SeqlenInfo)
+        int const* const cu_seqlens_q = nullptr;
+        int const* const cu_seqlens_k = nullptr;
+        int const* const cu_seqlens_k_new = nullptr;
+        int const* const seqused_q = nullptr;
+        int const* const seqused_k = nullptr;
+        int const* const leftpad_k = nullptr;
+        int const* const seqlens_rotary = nullptr;
+        // Shape info (needed for SeqlenInfo)
+        ShapeQKV const shape_Q;
+        ShapeQKV const shape_K;
+        ShapeQKV const shape_K_new;
+        // Paged attention table (needed for SeqlenInfo)
+        int const* const ptr_pagetable = nullptr;
+        ShapePageTable const shape_pagetable;
+        // Dynamic splits for Varlen
+        int const* const num_splits_dynamic_ptr = nullptr;
+        // Window sizes for local/causal attention (needed for BlockMN_t)
+        int const window_size_left;
+        int const window_size_right;
     };
 
     static Params
@@ -390,13 +673,22 @@ public:
         assert(args.tile_count_semaphore != nullptr);
         assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
+        int const num_splits_val = !Split ? 1 : args.num_splits;
         return {args.num_head, args.num_batch,
-                args.qhead_per_khead, args.seqlen,
+                cutlass::FastDivmod(args.qhead_per_khead),
+                args.seqlen,
                 cutlass::FastDivmod(args.num_head),
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
-                args.tile_count_semaphore, args.cu_seqlens, args.seqused,
-                // args.num_m_blocks_ptr,
-                args.num_splits_dynamic_ptr};
+                cutlass::FastDivmod(num_splits_val),
+                num_splits_val,
+                args.tile_count_semaphore,
+                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.shape_Q, args.shape_K, args.shape_K_new,
+                args.ptr_pagetable,
+                args.shape_pagetable,
+                args.num_splits_dynamic_ptr,
+                args.window_size_left, args.window_size_right
+               };
     }
 
     static dim3
@@ -406,61 +698,108 @@ public:
 
     struct WorkTileInfo {
         int tile_idx, block, bidh, bidb;
-
-        CUTLASS_DEVICE
-        bool
-        is_valid(Params const& params) const {
-            // if (blockIdx.x >= 0 && (threadIdx.x == 128 || threadIdx.x == 0)) { printf("blockIdx.x = %d, threadIdx.x = %d, checking valid, bidb = %d, params.num_batch = %d\n", blockIdx.x, threadIdx.x, bidb, params.num_batch); }
-            return bidb < params.num_batch;
-        }
-
-        CUTLASS_DEVICE
-        cute::tuple<int32_t, int32_t, int32_t, int32_t>
-        get_block_coord(Params const& params) const {
-            if constexpr (!Split) {
-                return {block, bidh, bidb, 0 /*split_idx*/};
-            } else {
-                // the top 8 bits of bidh store num_splits and the next 8 bits store split_idx
-                // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
-                uint32_t bidh_packed = reinterpret_cast<uint32_t const&>(bidh);
-                uint32_t bidh_actual_u = bidh_packed & 0x0000FFFF;
-                int bidh_actual = reinterpret_cast<int&>(bidh_actual_u);
-                // Use the top 16 bits of split_idx to store num_splits and the next 16 bits to store split_idx
-                uint32_t split_idx_u = ((bidh_packed & 0x00FF0000) >> 16) + ((bidh_packed & 0xFF000000) >> 8);
-                int split_idx = reinterpret_cast<int&>(split_idx_u);
-                // int bidh_actual = params.nsplits_divmod.divmod(split_idx, bidh);
-                // if (threadIdx.x == 128) {
-                //     printf("blockIdx.x = %d, bidb = %d, bidh = %d, bidh_actual = %d, split_idx = %d\n", blockIdx.x, bidb, bidh, bidh_actual, split_idx);
-                // }
-                return {block, bidh_actual, bidb, split_idx};
-            }
-        }
     };
 
+    Params const& params;
+
     CUTLASS_DEVICE
-    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler) : work_info_smem(smem_scheduler) {};
+    bool
+    is_valid(WorkTileInfo const& work_tile) const {
+        // if (blockIdx.x >= 0 && (threadIdx.x == 128 || threadIdx.x == 0)) { printf("blockIdx.x = %d, threadIdx.x = %d, checking valid, bidb = %d, params.num_batch = %d\n", blockIdx.x, threadIdx.x, work_tile.bidb, params.num_batch); }
+        return work_tile.bidb >= 0 && work_tile.bidb < params.num_batch;
+    }
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    get_block_coord(WorkTileInfo const& work_tile) const {
+        int m_block = work_tile.block;
+        int bidh_in = work_tile.bidh; // This might be packed
+        int bidb = work_tile.bidb;
+        int peer_id = 0;
+        int num_peers = 1;
+        int bidh_actual = bidh_in;
+
+        if constexpr (Split) {
+            // the top 8 bits of bidh store num_splits and the next 8 bits store split_idx
+            // reinterpret_cast to uint32_t to make sure we're not doing sign extension when we shift
+            uint32_t bidh_packed = reinterpret_cast<uint32_t const&>(bidh_in);
+            uint32_t bidh_actual_u = bidh_packed & 0x0000FFFF;
+            bidh_actual = reinterpret_cast<int&>(bidh_actual_u);
+            // Use the top 16 bits of split_idx to store num_splits and the next 16 bits to store split_idx
+            // Extract split_idx (lower 8 bits of upper 16) and num_splits (upper 8 bits of upper 16)
+            uint32_t split_idx_u = (bidh_packed >> 16) & 0xFF;
+            uint32_t num_peers_u = (bidh_packed >> 24) & 0xFF;
+            peer_id = reinterpret_cast<int&>(split_idx_u);
+            num_peers = reinterpret_cast<int&>(num_peers_u);
+        }
+
+        SeqlenInfo_t seqlen_info {
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, peer_id & 0xFFFF /* actual peer id*/, num_peers,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+
+        if constexpr (AppendKV) {
+            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
+                seqlen_info, m_block, bidb, peer_id & 0xFFFF /* actual peer id*/, num_peers,
+                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            return {m_block, bidh_actual, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
+                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
+        } else {
+            return {m_block, bidh_actual, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
+        }
+    }
+
+     CUTLASS_DEVICE
+    SeqlenInfo_t
+    get_seqlen_info(WorkTileInfo const& work_tile) const {
+        // Extract bidb needed for SeqlenInfo
+        int bidb = work_tile.bidb;
+
+        return SeqlenInfo_t {
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+    }
+
+
+    CUTLASS_DEVICE
+    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : work_info_smem(smem_scheduler), params(params) {};
 
     CUTLASS_DEVICE
     WorkTileInfo
-    tile_idx_to_work_tile(Params const& params, int next_tile_idx, WorkTileInfo const& current_work) const {
+    tile_idx_to_work_tile(int next_tile_idx, WorkTileInfo const& current_work) const {
         int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
         auto get_num_m_blocks = [&] (int bidb_start) {
             int batch_idx = lane + bidb_start;
-            int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead);
-            if (seqlen > kBlock) {
-                if (params.seqused) {
-                    seqlen = batch_idx < params.num_batch ? params.seqused[batch_idx] : 0;
-                } else if (params.cu_seqlens) {
-                    int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens[batch_idx] : 0;
+            int seqlen = params.seqlen * (!PackGQA ? 1 : params.qhead_per_khead_divmod.divisor);
+            if (seqlen > get<0>(TileShape_MNK{})) {
+                if (params.seqused_q) {
+                    seqlen = batch_idx < params.num_batch ? params.seqused_q[batch_idx] : 0;
+                } else if (params.cu_seqlens_q) {
+                    int cur_cu_seqlen = batch_idx <= params.num_batch ? params.cu_seqlens_q[batch_idx] : 0;
                     int next_cu_seqlen = __shfl_down_sync(0xffffffff, cur_cu_seqlen, 1);
                     seqlen = next_cu_seqlen - cur_cu_seqlen;
                 } else {
                     seqlen = params.seqlen;
                 }
-                if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+                if constexpr (PackGQA) { seqlen *= params.qhead_per_khead_divmod.divisor; }
             }
             return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
-                ? cute::ceil_div(seqlen, kBlock) : 0;
+                ? cute::ceil_div(seqlen, get<0>(TileShape_MNK{})) : 0;
                 // ? params.num_m_blocks_ptr[batch_idx] : 0;
         };
 
@@ -544,16 +883,16 @@ public:
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_initial_work(Params const& params) const {
+    get_initial_work() const {
         if constexpr (IsProducerWarp) {
-            WorkTileInfo work_info = tile_idx_to_work_tile(params, int(blockIdx.x), {0, 0, 0, 0});
+            WorkTileInfo work_info = tile_idx_to_work_tile(int(blockIdx.x), {0, 0, 0, 0});
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);
             }
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier1 /*id*/);  // TileCountSmemFull
             return work_info;
         } else {
-            return get_next_work<false>(params, {0, 0, 0, 0});
+            return get_next_work<false>({0, 0, 0, 0});
         }
     }
 
@@ -565,7 +904,7 @@ public:
 
     CUTLASS_DEVICE
     void
-    prefetch_next_work(Params const& params, WorkTileInfo& current_work) const {
+    prefetch_next_work(WorkTileInfo& current_work) const {
         if (threadIdx.x % NumProducerThreads == 0) {
             current_work.tile_idx = atomicAdd(params.tile_count_semaphore, 1) + int(gridDim.x);
         }
@@ -574,12 +913,12 @@ public:
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
-    get_next_work(Params const& params, WorkTileInfo const& current_work) const {
+    get_next_work(WorkTileInfo const& current_work) const {
         if constexpr (IsProducerWarp) {
             // thread 0 has the next tile_idx, just need to broadcast to the rest of warp 0
             int new_tile_idx = __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
             WorkTileInfo work_info = {__shfl_sync(0xffffffff, current_work.tile_idx, 1 /*lane*/), current_work.block, current_work.bidh, current_work.bidb};
-            work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
+            work_info = tile_idx_to_work_tile(new_tile_idx, work_info);
             flash::named_barrier_sync(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
             if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
                 *work_info_smem = make_int4(work_info.tile_idx, work_info.block, work_info.bidh, work_info.bidb);

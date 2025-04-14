@@ -66,21 +66,16 @@ struct BlockCoord<true>: public BlockCoord<false> {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template<typename SeqlenInfo_t, typename TileShape_MNK, bool Varlen=false, bool Split=false, bool PackGQA=false, int kBlock=128, bool AppendKV=false, bool Is_causal=false, bool Is_local=false>
-class SingleTileScheduler {
-
-public:
-    using SharedStorage = int;
+template<typename SeqlenInfo_t, typename TileShape_MNK, bool Varlen=false, bool Split=false, bool PackGQA=false, bool AppendKV=false, bool Is_causal=false, bool Is_local=false>
+struct TileSchedulerCommon {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
-    // Device side kernel params
     struct Params {
         int const num_blocks, num_head, num_batch, num_splits;
         cutlass::FastDivmod qhead_per_khead;
         int const seqlen;
-        cutlass::FastDivmod nsplits_divmod;
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
         int const* const cu_seqlens_k_new = nullptr;
@@ -98,6 +93,11 @@ public:
         int const window_size_right;
     };
 
+    Params const& params;
+
+    CUTLASS_DEVICE
+    TileSchedulerCommon(Params const& params) : params(params) { }
+
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         assert(!Split || !Varlen || args.num_splits_dynamic_ptr != nullptr);
@@ -105,7 +105,6 @@ public:
         return {args.num_blocks, args.num_head, args.num_batch, !Split ? 1 : args.num_splits,
                 cutlass::FastDivmod(args.qhead_per_khead),
                 args.seqlen,
-                cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.shape_Q, args.shape_K, args.shape_K_new,
@@ -114,13 +113,66 @@ public:
                 args.num_splits_dynamic_ptr,
                 args.window_size_left, args.window_size_right};
     }
+    CUTLASS_DEVICE
+    SeqlenInfo_t 
+    create_seqlen_info(int bidb) {
+        return {
+            bidb,
+            get<0>(params.shape_Q),
+            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
+            get<0>(params.shape_K_new),
+            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
+            params.seqused_q, params.seqused_k, params.leftpad_k,
+            params.seqlens_rotary
+        };
+    };
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    create_block_coord_split(SeqlenInfo_t const& seqlen_info, int m_block, int bidh, int bidb, int peer_id, int num_peers) {
+        // Calculate n_block_min/max based on causality and local window
+        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
+            seqlen_info, m_block, bidb, peer_id, num_peers,
+            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        
+        if constexpr (AppendKV) {
+            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
+                seqlen_info, m_block, bidb, peer_id, num_peers,
+                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers, 
+                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
+        } else {
+            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
+        }
+    };
+};
+
+template<typename SeqlenInfo_t, typename TileShape_MNK, bool Varlen=false, bool Split=false, bool PackGQA=false, bool AppendKV=false, bool Is_causal=false, bool Is_local=false>
+class SingleTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, AppendKV, Is_causal, Is_local> {
+
+public:
+    using SharedStorage = int;
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, AppendKV, Is_causal, Is_local>;
+
+    struct Params: public Super::Params {
+        cutlass::FastDivmod nsplits_divmod;
+    };
+
+    using Super::create_seqlen_info;
+    using Super::create_block_coord_split;
+
+    Params const& params;
+
+    static Params
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        return {Super::to_underlying_arguments(args), cutlass::FastDivmod(!Split ? 1 : args.num_splits)};
+    }
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
         return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
 
-    Params const& params;
     struct WorkTileInfo {
         BlockCoord<AppendKV> block_coord;
         SeqlenInfo_t seqlen_info;
@@ -145,7 +197,7 @@ public:
     }
 
     CUTLASS_DEVICE
-    SingleTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : params(params) { }
+    SingleTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : Super(params), params(params) { }
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
@@ -157,15 +209,7 @@ public:
         int peer_id = 0;
         int num_peers = 1;
 
-        SeqlenInfo_t seqlen_info{
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
+        SeqlenInfo_t seqlen_info = create_seqlen_info(bidb);
 
         bool is_valid_tile = true;
         if constexpr (Split) {
@@ -177,7 +221,7 @@ public:
                 ? params.seqused_q[bidb]
                 : (params.cu_seqlens_q ? params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb] : params.seqlen);
             if constexpr (PackGQA) { seqlen_q_ *= params.qhead_per_khead_divmod.divisor; }
-            is_valid_tile = m_block * kBlock < seqlen_q_;
+            is_valid_tile = m_block * size<0>(TileShape_MNK{}) < seqlen_q_;
 
             if constexpr (Split) {
                 int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[bidb] : num_peers;
@@ -185,28 +229,12 @@ public:
                 num_peers = num_splits_dynamic;
             }
         }
-        if (!is_valid_tile) { bidb = -1; }
+        if (!is_valid_tile) return {BlockCoord<AppendKV>{}, seqlen_info};
 
-        // Calculate n_block_min/max based on causality and local window
-        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, peer_id & 0xFFFF /* Get actual peer_id */, num_peers,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-        
-        if constexpr (AppendKV) {
-            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
-                seqlen_info, m_block, bidb, peer_id & 0xFFFF /* Get actual peer_id */, num_peers,
-                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-            return {
-                {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers, 
-                 get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)},
-                seqlen_info
-            };
-        } else {
-            return {
-                {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers},
-                seqlen_info
-            };
-        }
+        return {
+            create_block_coord_split(seqlen_info, m_block, bidh, bidb, peer_id, num_peers),
+            seqlen_info
+        };
     }
 
     CUTLASS_DEVICE
@@ -230,66 +258,43 @@ public:
 ///////////////////////////////////////////////////////////////////////////////
 
 template<typename SeqlenInfo_t,typename TileShape_MNK, bool Split=false, bool Is_causal=false, bool Is_local=false, bool Varlen=false, bool AppendKV=false, bool PackGQA=false>
-class StaticPersistentTileScheduler {
+class StaticPersistentTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, AppendKV, Is_causal, Is_local> {
 
 public:
-
     using SharedStorage = int;
-    static constexpr int kBlockM = get<0>(TileShape_MNK{});
-    static constexpr int kBlockN = get<1>(TileShape_MNK{});
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, AppendKV, Is_causal, Is_local>;
 
     // Device side kernel params
-    struct Params {
+    struct Params: public Super::Params {
         int total_blocks;
         cutlass::FastDivmod m_block_divmod, head_divmod;
         cutlass::FastDivmod nsplits_divmod;
-        int num_splits; // Static number of splits
-        cutlass::FastDivmod qhead_per_khead_divmod;
-        ShapeQKV shape_Q;
-        ShapeQKV shape_K;
-        ShapeQKV shape_K_new;
-        int const* cu_seqlens_q = nullptr; // Assuming null for non-varlen static
-        int const* cu_seqlens_k = nullptr;
-        int const* cu_seqlens_k_new = nullptr;
-        int const* seqused_q = nullptr;
-        int const* seqused_k = nullptr;
-        int const* leftpad_k = nullptr;
-        int const* seqlens_rotary = nullptr;
-        int const* ptr_pagetable = nullptr;
-        int window_size_left;
-        int window_size_right;
-        // Params specific to this scheduler
-        int num_m_blocks; // Needed for BlockMN_t
     };
+
+    Params const& params;
+
+    using Super::create_seqlen_info;
+    using Super::create_block_coord_split;
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
         int num_splits_val = !Split ? 1 : args.num_splits;
-        return {args.num_blocks * args.num_head * args.num_batch * num_splits_val,
+        return { Super::to_underlying_arguments(args),
+                 args.num_blocks * args.num_head * args.num_batch * num_splits_val,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head * num_splits_val),
-                cutlass::FastDivmod(num_splits_val),
-                num_splits_val,
-                cutlass::FastDivmod(args.qhead_per_khead),
-                args.shape_Q, args.shape_K, args.shape_K_new,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_pagetable,
-                args.window_size_left, args.window_size_right,
-                args.num_blocks
+                cutlass::FastDivmod(num_splits_val)
                };
     }
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(num_sm)};
+        // This scheduler assumes that the grid shape is fixed and known at compile time.
+        return {uint32_t(num_sm), 1u, 1u}; // Persistent kernel uses SM count as grid dim
     }
 
     struct WorkTileInfo {
         int tile_idx;
     };
-
-    Params const& params;
 
     CUTLASS_DEVICE
     bool
@@ -306,56 +311,27 @@ public:
         int num_peers = 1;
         if constexpr (Split) {
             num_peers = params.nsplits_divmod.divisor;
-            bidh = params.nsplits_divmod.divmod(peer_id, bidh);
+            if constexpr (Varlen) {
+                 int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[bidb] : num_peers;
+                 if (peer_id >= num_splits_dynamic) return {}; // Invalid tile for this split
+                 num_peers = num_splits_dynamic;
+            }
         }
 
-        SeqlenInfo_t seqlen_info{
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
-
-        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, peer_id, num_peers,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-
-        if constexpr (AppendKV) {
-            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
-                seqlen_info, m_block, bidb, peer_id, num_peers,
-                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
-                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
-        } else {
-            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
-        }
+        SeqlenInfo_t seqlen_info = create_seqlen_info(bidb);
+        return create_block_coord_split(seqlen_info, m_block, bidh, bidb, peer_id, num_peers);
     }
 
     CUTLASS_DEVICE
     SeqlenInfo_t
     get_seqlen_info(WorkTileInfo const& work_tile) const {
-         // Recompute block coord parts needed for SeqlenInfo
-        int m_block, bidh, bidb;
         bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, work_tile.tile_idx));
-        // No need for split info here as SeqlenInfo is per batch item (bidb)
-
-        return SeqlenInfo_t {
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
+        return create_seqlen_info(bidb);
     }
 
-
     CUTLASS_DEVICE
-    StaticPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : params(params) {};
+    StaticPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params)
+        : Super(params), params(params) {}
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
@@ -383,7 +359,7 @@ public:
 };
 
 template<typename SeqlenInfo_t, typename TileShape_MNK, int NumMmaThreads, int NumProducerThreads, bool Split, bool PackGQA, bool Is_causal, bool Is_local, bool AppendKV, bool WarpSpecialized>
-class DynamicPersistentTileScheduler {
+class DynamicPersistentTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local> {
 
     // This scheduler targets the causal (or local) case where each tile takes different
     // amount of time. We use longest-processing-time-first scheduling:
@@ -395,50 +371,33 @@ class DynamicPersistentTileScheduler {
     // size of K & V and the L2 cache size.
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
-    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
+    static constexpr int NumThreads = NumMmaThreads; // Assuming non-warp-specialized usage for now
 
-public:
-    using SharedStorage = int;
-    static constexpr int kBlockM = get<0>(TileShape_MNK{});
-    static constexpr int kBlockN = get<1>(TileShape_MNK{});
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
 
 protected:
     SharedStorage* const tile_count_smem;
 
 public:
 
-    // Device side kernel params
-    struct Params {
+    struct Params : public Super::Params {
         int const total_blocks;
         cutlass::FastDivmod const m_block_divmod, head_divmod;
         cutlass::FastDivmod const l2_minor_divmod, l2_major_divmod;
         cutlass::FastDivmod const l2_minor_residual_divmod;
         int const num_hb_quotient;
         int* const tile_count_semaphore;
-        int const num_splits; // Static number of splits
-        cutlass::FastDivmod qhead_per_khead_divmod;
-        ShapeQKV shape_Q;
-        ShapeQKV shape_K;
-        ShapeQKV shape_K_new;
-        int const* cu_seqlens_q = nullptr; // Assuming null for non-varlen dynamic
-        int const* cu_seqlens_k = nullptr;
-        int const* cu_seqlens_k_new = nullptr;
-        int const* seqused_q = nullptr;
-        int const* seqused_k = nullptr;
-        int const* leftpad_k = nullptr;
-        int const* seqlens_rotary = nullptr;
-        int const* ptr_pagetable = nullptr;
-        int window_size_left;
-        int window_size_right;
         // Params needed for L2 swizzling calculation
         int const seqlen_k;
         int const headdim;
         int const headdim_v;
         int const element_size;
-        // Num M blocks
-        int num_m_blocks;
     };
+
+    Params const& params;
+
+    using Super::create_seqlen_info;
+    using Super::create_block_coord_split;
 
     static Params
     to_underlying_arguments(TileSchedulerArguments const& args) {
@@ -455,22 +414,15 @@ public:
         int const num_splits_val = !Split ? 1 : args.num_splits;
         // printf("num_split_blocks = %d, num_head = %d, num_batch = %d, swizzle = %d, PackGQA = %d, qhead_per_khead = %d, num_hb_remainder = %d\n", num_split_blocks, args.num_head, args.num_batch, swizzle, int(PackGQA), args.qhead_per_khead, num_hb_remainder);
         assert(args.tile_count_semaphore != nullptr);
-        return {num_split_blocks * args.num_head * args.num_batch,
+        return {Super::to_underlying_arguments(args),
+                num_split_blocks * args.num_head * args.num_batch,
                 cutlass::FastDivmod(args.num_blocks), cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(swizzle), cutlass::FastDivmod(swizzle * num_split_blocks),
                 // don't divide by 0
                 cutlass::FastDivmod(num_hb_remainder > 0 ? num_hb_remainder : 1),
                 (args.num_head * args.num_batch) / swizzle,
                 args.tile_count_semaphore,
-                num_splits_val,
-                cutlass::FastDivmod(args.qhead_per_khead),
-                args.shape_Q, args.shape_K, args.shape_K_new,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_pagetable,
-                args.window_size_left, args.window_size_right,
-                args.seqlen_k, args.headdim, args.headdim_v, args.element_size,
-                args.num_blocks
+                args.seqlen_k, args.headdim, args.headdim_v, args.element_size
                };
     }
 
@@ -482,8 +434,6 @@ public:
     struct WorkTileInfo {
         int tile_idx;
     };
-
-    Params const& params;
 
     CUTLASS_DEVICE
     bool
@@ -514,35 +464,13 @@ public:
         // Longest-processing-time-first means we process m_blocks in reverse order
         m_block = params.m_block_divmod.divisor - 1 - m_block;
 
-        SeqlenInfo_t seqlen_info{
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
-
-        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, peer_id, num_peers,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-
-        if constexpr (AppendKV) {
-            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
-                seqlen_info, m_block, bidb, peer_id, num_peers,
-                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
-                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
-        } else {
-            return {m_block, bidh, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
-        }
+        return create_block_coord_split(seqlen_info, m_block, bidh, bidb, peer_id, num_peers);
     }
+
 
     CUTLASS_DEVICE
     SeqlenInfo_t
     get_seqlen_info(WorkTileInfo const& work_tile) const {
-         // Recompute block coord parts needed for SeqlenInfo
         int m_block, bidh, bidb;
         int l2_mod, bidhb, bidhb_residual;
         bidhb = params.l2_major_divmod.divmod(l2_mod, work_tile.tile_idx);
@@ -553,20 +481,14 @@ public:
         }
         bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
 
-        return SeqlenInfo_t{
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
+        return create_seqlen_info(bidb);
     }
 
-
     CUTLASS_DEVICE
-    DynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : tile_count_smem(smem_scheduler), params(params) {};
+    DynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params)
+        : Super(params), params(params), tile_count_smem(smem_scheduler) {
+    }
+
 
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
@@ -619,51 +541,24 @@ template<typename SeqlenInfo_t, typename TileShape_MNK, int NumMmaThreads=2 * cu
          bool Split=false, bool PackGQA=false,
          bool Is_causal=false, bool Is_local=false, bool AppendKV=false,
          bool WarpSpecialized=true>
-class VarlenDynamicPersistentTileScheduler {
+class VarlenDynamicPersistentTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local> {
 
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
     static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
-public:
-    using SharedStorage = int4;
-    static constexpr int kBlockM = get<0>(TileShape_MNK{});
-    static constexpr int kBlockN = get<1>(TileShape_MNK{});
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
-
 protected:
     SharedStorage* const work_info_smem;
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
+
 
 public:
 
     // Device side kernel params
-    struct Params {
-        int num_head, num_batch;
-        cutlass::FastDivmod qhead_per_khead_divmod;
-        int const seqlen; // Max seqlen
+    struct Params: public Super::Params {
         cutlass::FastDivmod head_divmod;
         cutlass::FastDivmod nsplits_divmod; // Static num splits divisor
-        int const num_splits; // Static num splits
         int* const tile_count_semaphore;
-        // Sequence length info (needed for tile_idx_to_work_tile and SeqlenInfo)
-        int const* const cu_seqlens_q = nullptr;
-        int const* const cu_seqlens_k = nullptr;
-        int const* const cu_seqlens_k_new = nullptr;
-        int const* const seqused_q = nullptr;
-        int const* const seqused_k = nullptr;
-        int const* const leftpad_k = nullptr;
-        int const* const seqlens_rotary = nullptr;
-        // Shape info (needed for SeqlenInfo)
-        ShapeQKV const shape_Q;
-        ShapeQKV const shape_K;
-        ShapeQKV const shape_K_new;
-        // Paged attention table (needed for SeqlenInfo)
-        int const* const ptr_pagetable = nullptr;
-        ShapePageTable const shape_pagetable;
-        // Dynamic splits for Varlen
-        int const* const num_splits_dynamic_ptr = nullptr;
-        // Window sizes for local/causal attention (needed for BlockMN_t)
-        int const window_size_left;
-        int const window_size_right;
+
     };
 
     static Params
@@ -674,20 +569,10 @@ public:
         assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         int const num_splits_val = !Split ? 1 : args.num_splits;
-        return {args.num_head, args.num_batch,
-                cutlass::FastDivmod(args.qhead_per_khead),
-                args.seqlen,
+        return {Super::to_underlying_arguments(args),
                 cutlass::FastDivmod(args.num_head),
                 cutlass::FastDivmod(num_splits_val),
-                num_splits_val,
-                args.tile_count_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.shape_Q, args.shape_K, args.shape_K_new,
-                args.ptr_pagetable,
-                args.shape_pagetable,
-                args.num_splits_dynamic_ptr,
-                args.window_size_left, args.window_size_right
+                args.tile_count_semaphore
                };
     }
 
@@ -733,46 +618,14 @@ public:
             num_peers = reinterpret_cast<int&>(num_peers_u);
         }
 
-        SeqlenInfo_t seqlen_info {
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
-
-        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, peer_id & 0xFFFF /* actual peer id*/, num_peers,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-
-        if constexpr (AppendKV) {
-            auto n_block_min_max_new = BlockMN_t::get_n_block_k_new_min_max(
-                seqlen_info, m_block, bidb, peer_id & 0xFFFF /* actual peer id*/, num_peers,
-                params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-            return {m_block, bidh_actual, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers,
-                    get<0>(n_block_min_max_new), get<1>(n_block_min_max_new)};
-        } else {
-            return {m_block, bidh_actual, bidb, get<0>(n_block_min_max), get<1>(n_block_min_max), peer_id, num_peers};
-        }
+        SeqlenInfo_t seqlen_info = create_seqlen_info(bidb);
+        return Super::create_block_coord(seqlen_info, m_block, bidh_actual, bidb, peer_id, num_peers);
     }
 
      CUTLASS_DEVICE
     SeqlenInfo_t
     get_seqlen_info(WorkTileInfo const& work_tile) const {
-        // Extract bidb needed for SeqlenInfo
-        int bidb = work_tile.bidb;
-
-        return SeqlenInfo_t {
-            bidb,
-            get<0>(params.shape_Q),
-            !params.ptr_pagetable ? size<0>(params.shape_K) : size<0>(params.shape_K) * size<1>(params.shape_pagetable),
-            get<0>(params.shape_K_new),
-            params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_k_new,
-            params.seqused_q, params.seqused_k, params.leftpad_k,
-            params.seqlens_rotary
-        };
+        return create_seqlen_info(work_tile.bidb);
     }
 
 

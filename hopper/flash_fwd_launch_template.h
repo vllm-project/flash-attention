@@ -65,7 +65,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             flash::DynamicPersistentTileScheduler<SeqlenInfo_t, TileShape_MNK, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Is_causal, Is_local, AppendKV, Arch >= 90 /*WarpSpecialized*/>
         >
     >;
-    using SchedulerSingleTile = flash::SingleTileScheduler<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, kBlockM, AppendKV, Is_causal, Is_local>;
+    using SchedulerSingleTile = flash::SingleTileScheduler<SeqlenInfo_t, TileShape_MNK, Varlen, Split, PackGQA, AppendKV, Is_causal, Is_local>;
     // If Split then we probably don't have enough work for PersistentScheduler to be useful.
     // However, if Varlen (e.g., during decode where we have max_seqlens), using PersistentScheduler is better
     // since we'll avoid launching a bunch of thread blocks that immediately exit.

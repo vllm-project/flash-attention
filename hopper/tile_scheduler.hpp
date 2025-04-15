@@ -11,6 +11,7 @@
 #include "block.h"
 #include "utils.h"
 #include "seqlen.h"
+#include "streamk.h"
 
 namespace flash {
 
@@ -42,6 +43,8 @@ struct TileSchedulerArguments {
     int const* const num_splits_dynamic_ptr = nullptr;
     int const window_size_left = -1;
     int const window_size_right = 0;
+    int const* const sm_work_tile_ind_ptr = nullptr;
+    StreamKWorkTile const* const work_tiles_ptr = nullptr;
 };
 
 template<bool AppendKV>
@@ -74,7 +77,7 @@ struct TileSchedulerCommon {
 
     struct Params {
         int const num_blocks, num_head, num_batch, num_splits;
-        cutlass::FastDivmod qhead_per_khead;
+        cutlass::FastDivmod qhead_per_khead_divmod;
         int const seqlen;
         int const* const cu_seqlens_q = nullptr;
         int const* const cu_seqlens_k = nullptr;
@@ -115,7 +118,7 @@ struct TileSchedulerCommon {
     }
     CUTLASS_DEVICE
     SeqlenInfo_t 
-    create_seqlen_info(int bidb) {
+    create_seqlen_info(int bidb) const {
         return {
             bidb,
             get<0>(params.shape_Q),
@@ -129,7 +132,7 @@ struct TileSchedulerCommon {
 
     CUTLASS_DEVICE
     BlockCoord<AppendKV>
-    create_block_coord_split(SeqlenInfo_t const& seqlen_info, int m_block, int bidh, int bidb, int peer_id, int num_peers) {
+    create_block_coord_split(SeqlenInfo_t const& seqlen_info, int m_block, int bidh, int bidb, int peer_id, int num_peers) const {
         // Calculate n_block_min/max based on causality and local window
         auto n_block_min_max = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, peer_id, num_peers,
@@ -325,7 +328,8 @@ public:
     CUTLASS_DEVICE
     SeqlenInfo_t
     get_seqlen_info(WorkTileInfo const& work_tile) const {
-        bidb = params.head_divmod.divmod(bidh, params.m_block_divmod.divmod(m_block, work_tile.tile_idx));
+        int bidb = params.head_divmod.divmod(
+            work_tile.bidh, params.m_block_divmod.divmod(work_tile.m_block, work_tile.tile_idx));
         return create_seqlen_info(bidb);
     }
 
@@ -373,6 +377,7 @@ class DynamicPersistentTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, T
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
     static constexpr int NumThreads = NumMmaThreads; // Assuming non-warp-specialized usage for now
 
+    using SharedStorage = int;
     using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
 
 protected:
@@ -463,6 +468,7 @@ public:
         }
         // Longest-processing-time-first means we process m_blocks in reverse order
         m_block = params.m_block_divmod.divisor - 1 - m_block;
+        SeqlenInfo_t seqlen_info = create_seqlen_info(bidb);
 
         return create_block_coord_split(seqlen_info, m_block, bidh, bidb, peer_id, num_peers);
     }
@@ -546,12 +552,13 @@ class VarlenDynamicPersistentTileScheduler: public TileSchedulerCommon<SeqlenInf
     static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
     static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
 
-protected:
-    SharedStorage* const work_info_smem;
-    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
-
-
 public:
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
+    using SharedStorage = int4;
+
+    using Super::create_seqlen_info;
+    using Super::create_block_coord_split;
+
 
     // Device side kernel params
     struct Params: public Super::Params {
@@ -585,8 +592,11 @@ public:
         int tile_idx, block, bidh, bidb;
     };
 
+protected:
+    SharedStorage* const work_info_smem;
     Params const& params;
 
+public:
     CUTLASS_DEVICE
     bool
     is_valid(WorkTileInfo const& work_tile) const {
@@ -619,7 +629,7 @@ public:
         }
 
         SeqlenInfo_t seqlen_info = create_seqlen_info(bidb);
-        return Super::create_block_coord(seqlen_info, m_block, bidh_actual, bidb, peer_id, num_peers);
+        return create_block_coord_split(seqlen_info, m_block, bidh_actual, bidb, peer_id, num_peers);
     }
 
      CUTLASS_DEVICE
@@ -630,7 +640,7 @@ public:
 
 
     CUTLASS_DEVICE
-    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : work_info_smem(smem_scheduler), params(params) {};
+    VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : Super(params), work_info_smem(smem_scheduler), params(params) {};
 
     CUTLASS_DEVICE
     WorkTileInfo
@@ -783,6 +793,130 @@ public:
             int4 work_info = *work_info_smem;
             flash::named_barrier_arrive(NumThreads, cutlass::arch::ReservedNamedBarriers::StreamkBarrier0 /*id*/);  // TileCountSmemEmpty
             return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w};
+        }
+    }
+
+};
+
+
+template<typename SeqlenInfo_t, typename TileShape_MNK, int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
+         bool Split=false, bool PackGQA=false,
+         bool Is_causal=false, bool Is_local=false, bool AppendKV=false,
+         bool WarpSpecialized=true>
+class StreamKPersistentTileScheduler: public TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local> {
+
+    static_assert(WarpSpecialized || NumProducerThreads == NumMmaThreads);
+    static constexpr int NumThreads = WarpSpecialized ? NumMmaThreads + NumProducerThreads : NumMmaThreads;
+
+public:
+    using SharedStorage = int;
+    using Super = TileSchedulerCommon<SeqlenInfo_t, TileShape_MNK, /*Varlen=*/false, Split, PackGQA, AppendKV, Is_causal, Is_local>;
+
+    using Super::create_seqlen_info;
+    using Super::create_block_coord_split;
+
+    // Device side kernel params
+    struct Params: public Super::Params {
+        StreamKWorkTile const* const work_tiles_ptr;
+        int const* const sm_work_tile_ind_ptr;
+    };
+
+    static Params
+    to_underlying_arguments(TileSchedulerArguments const& args) {
+        // If Split, for the purpose of scheduling, we pretend that instead there are
+        // (args.num_splits * args.num_head) number of heads.
+        assert(args.tile_count_semaphore != nullptr);
+        assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
+        assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
+        int const num_splits_val = !Split ? 1 : args.num_splits;
+        return {Super::to_underlying_arguments(args),
+                args.work_tiles_ptr,
+                args.sm_work_tile_ind_ptr
+               };
+    }
+
+    static dim3
+    get_grid_shape(Params const& params, int num_sm) {
+        return {uint32_t(num_sm)};
+    }
+
+    struct WorkTileInfo {
+        int tile_idx;
+        StreamKWorkTile work_tile;
+    };
+
+    Params const& params;
+    int const sm_idx;
+    int const work_tiles_start_idx;
+    int const work_tiles_end_idx;
+
+    CUTLASS_DEVICE
+    bool
+    is_valid(WorkTileInfo const& work_tile) const {
+        // if (blockIdx.x >= 0 && (threadIdx.x == 128 || threadIdx.x == 0)) { printf("blockIdx.x = %d, threadIdx.x = %d, checking valid, bidb = %d, params.num_batch = %d\n", blockIdx.x, threadIdx.x, work_tile.bidb, params.num_batch); }
+        return work_tile.tile_idx < work_tiles_end_idx;
+    }
+
+    CUTLASS_DEVICE
+    BlockCoord<AppendKV>
+    get_block_coord(WorkTileInfo const& work_tile) const {
+        SeqlenInfo_t seqlen_info = create_seqlen_info(work_tile.bidb);
+        if constexpr(AppendKV) {
+            return {
+                seqlen_info,
+                work_tile.work_tile.m_block,
+                work_tile.work_tile.bidh,
+                work_tile.work_tile.bidb,
+                work_tile.work_tile.peer_id,
+                work_tile.work_tile.num_peers,
+                0, 0 // TODO support appendKV
+            };
+        } else {
+            return {
+                seqlen_info,
+                work_tile.work_tile.m_block,
+                work_tile.work_tile.bidh,
+                work_tile.work_tile.bidb,
+                work_tile.work_tile.peer_id,
+                work_tile.work_tile.num_peers
+            };  
+        }
+    }
+
+     CUTLASS_DEVICE
+    SeqlenInfo_t
+    get_seqlen_info(WorkTileInfo const& work_tile) const {
+        return create_seqlen_info(work_tile.bidb);
+    }
+
+
+    CUTLASS_DEVICE
+    StreamKPersistentTileScheduler(SharedStorage* const smem_scheduler, Params const& params) : Super(params), params(params), 
+        sm_idx(blockIdx.x), work_tiles_start_idx(params.sm_work_tile_ind_ptr[blockIdx.x]), work_tiles_end_idx(params.sm_work_tile_ind_ptr[blockIdx.x + 1]) {};
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_initial_work() const {
+        return {work_tiles_start_idx, params.work_tiles_ptr[work_tiles_start_idx]};
+    }
+
+    CUTLASS_DEVICE
+    void
+    init_consumer() const {}
+
+    CUTLASS_DEVICE
+    void
+    prefetch_next_work(WorkTileInfo& current_work) const {}
+
+    template<bool IsProducerWarp=false>
+    CUTLASS_DEVICE
+    WorkTileInfo
+    get_next_work(WorkTileInfo const& current_work) const {
+        if (current_work.tile_idx + 1 < work_tiles_end_idx) {
+            return {current_work.tile_idx + 1, params.work_tiles_ptr[current_work.tile_idx + 1]};
+        } else {
+            return {work_tiles_start_idx + 1, StreamKWorkTile{}};
         }
     }
 

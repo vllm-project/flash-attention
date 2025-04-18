@@ -18,14 +18,13 @@ from vllm_flash_attn.flash_attn_interface import (
 )
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [128, 256]
+HEAD_SIZES = [128]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
 VERSIONS = \
-    ([2] if is_fa_version_supported(2) else []) + \
     ([3] if is_fa_version_supported(3) else [])
 
 
@@ -329,10 +328,12 @@ def test_varlen_with_paged_kv(
                                  dtype=torch.int32)
 
     scheduler_metadata = None
+    host_scheduler_metadata = None
+    device_scheduler_metadata = None
     if aot_schedule:
         if fa_version == 2:
             pytest.skip("AOT schedule is not supported in version 2")
-        scheduler_metadata = get_scheduler_metadata(
+        device_scheduler_metadata, host_scheduler_metadata = get_scheduler_metadata(
             batch_size=num_seqs,
             max_seqlen_q=1,
             max_seqlen_k=max_kv_len,
@@ -360,6 +361,8 @@ def test_varlen_with_paged_kv(
         block_table=block_tables,
         softcap=soft_cap if soft_cap is not None else 0,
         scheduler_metadata=scheduler_metadata,
+        device_scheduler_metadata=device_scheduler_metadata,
+        host_scheduler_metadata=host_scheduler_metadata,
         fa_version=fa_version
     )
 

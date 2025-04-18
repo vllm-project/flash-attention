@@ -15,6 +15,7 @@
 #include "tile_size.h"
 #include "heuristics.h"
 #include "cuda_check.h"
+#include "streamk.h"
 
 // Copied from https://github.com/pytorch/pytorch/commit/7931eee5c5ebcdf468bff4d308510b03355cd909
 // This is so that we can pass in torch.dtype as a parameter to the function.
@@ -503,7 +504,7 @@ inline int round_up_headdimv(int head_size) {
 }
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
-at::Tensor
+std::tuple<at::Tensor, at::Tensor>
 mha_fwd_get_scheduler_metadata(
         int batch_size,
         int max_seqlen_q,
@@ -582,11 +583,15 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    bool const use_dynamic_split = params.b <= 992;
-    params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
+    bool const use_stream_k = params.b <= 992;
+    params.num_splits_dynamic_ptr = !use_stream_k ? nullptr : reinterpret_cast<int*>(1);
+
+    assert(use_stream_k && (num_splits <= 0 || num_splits == 2));
+    num_splits = use_stream_k ? 2 : num_splits;
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
@@ -598,29 +603,43 @@ mha_fwd_get_scheduler_metadata(
 
     auto opts = seqused_k.options();
     // This needs to be set after get_num_splits
-    at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
-    bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
-    if (scheduler_needs_semaphore || use_dynamic_split) {
-        tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
-        if (scheduler_needs_semaphore) {
-            if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-            params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-        } else {
-            params.tile_count_semaphore = nullptr;
-        }
-        params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    at::Tensor device_metadata;  // Contains the semaphore and optionally num_splits_dynamic
+    at::Tensor host_metadata;
+
+    bool const scheduler_needs_semaphore = (params.arch >= 90 || params.num_splits > 1) && !use_stream_k;
+
+    if (scheduler_needs_semaphore) {
+        device_metadata = torch::empty({1}, opts.dtype(torch::kInt32));
+    } else {
+        std::tie(device_metadata, host_metadata) = streamk_schedule(
+            params.arch, params.num_sm, params.b, cu_seqlens_q_, seqused_k, params.seqlen_q, params.seqlen_k, 
+            params.h, params.h_k, params.d, params.dv, params.is_causal, params.is_local,
+            params.is_e4m3 ? 1 : 2, false /*v_colmajor*/, true /*pagedkv*/, params.pagedkv_tma,
+            params.softcap, params.seqlen_knew > 0
+        );
     }
 
-    if (params.num_splits_dynamic_ptr) {
-        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
-        auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
-        int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
-        int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto stream = at::cuda::getCurrentCUDAStream().stream();
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
-        CHECK_CUDA_KERNEL_LAUNCH();
-    }
-    return tile_count_semaphore;
+    // if (scheduler_needs_semaphore || use_stream_k) {
+    //     tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_stream_k) * params.b}, opts.dtype(torch::kInt32));
+    //     if (scheduler_needs_semaphore) {
+    //         if (!use_stream_k) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
+    //         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
+    //     } else {
+    //         params.tile_count_semaphore = nullptr;
+    //     }
+    //     params.num_splits_dynamic_ptr = use_stream_k ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
+    // }
+
+    // if (params.num_splits_dynamic_ptr) {
+    //     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    //     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
+    //     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
+    //     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
+    //     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    //     prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+    //     CHECK_CUDA_KERNEL_LAUNCH();
+    // }
+    return {device_metadata, host_metadata};
 }
 
 // b: batch_size
@@ -663,6 +682,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
+        std::optional<const at::Tensor> &device_scheduler_metadata_,
+        std::optional<const at::Tensor> &host_scheduler_metadata_,
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin
@@ -942,6 +963,26 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+
+    // Assume streamk scheduling
+    if (host_scheduler_metadata_) {
+        auto host_metadata_ptr = reinterpret_cast<StreamKSchedulerDescisions const*>(host_scheduler_metadata_->data_ptr<uint8_t>());
+        params.num_splits = host_metadata_ptr->max_num_peers;
+        params.num_combine_blocks = host_metadata_ptr->num_combine_blocks;
+        params.pack_gqa = host_metadata_ptr->pack_gqa;
+        params.use_one_mma_wg = host_metadata_ptr->use_one_mma_wg;
+        
+        int num_work_tiles = host_metadata_ptr->num_work_tiles;
+        assert(device_scheduler_metadata_.has_value());
+        auto device_metadata_ptr = device_scheduler_metadata_->data_ptr<uint8_t>();
+
+        auto [offsets, total_size] = get_device_metadata_offsets_and_size(
+            params.num_sm, num_work_tiles, params.num_combine_blocks);
+
+        params.work_tiles_ptr = reinterpret_cast<StreamKWorkTile*>(device_metadata_ptr);
+        params.sm_work_tile_ind_ptr = reinterpret_cast<int*>(device_metadata_ptr + offsets.work_tiles_ind_ptr_offset);
+        params.combine_tiles_ptr = reinterpret_cast<StreamKCombineTile*>(device_metadata_ptr + offsets.combine_tiles_offset);
+    }
 
     // This needs to be set after get_num_splits
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic

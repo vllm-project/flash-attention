@@ -15,6 +15,7 @@
 #include "cutlass/arch/grid_dependency_control.h"
 
 #include "seqlen.h"
+#include "streamk.h"
 #include "utils.h"
 
 namespace flash {
@@ -22,7 +23,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MK_, int kLogMaxSplits_, int kNThreads, int AlignmentLSE_,
-          bool Is_even_K, bool Varlen, class Element, class ElementPartial, class ArchTag_>
+          bool Is_even_K, bool Varlen, class Element, class ElementPartial, class ArchTag_, bool StreamK = false>
 class FlashAttnFwdCombine {
 
 public:
@@ -146,6 +147,9 @@ public:
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+
+        StreamKCombineTile const* const streamk_combine_tiles_ptr = nullptr;
+        int streamk_m_block_size = 0;
     };
 
     // Kernel entry point API
@@ -165,6 +169,9 @@ public:
         int const* const seqused = nullptr;
         int const* const num_splits_dynamic_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+
+        StreamKCombineTile const* const streamk_combine_tiles_ptr = nullptr;
+        int streamk_m_block_size = 0;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -187,7 +194,9 @@ public:
             args.cu_seqlens,
             args.seqused,
             args.num_splits_dynamic_ptr,
-            args.semaphore_to_reset
+            args.semaphore_to_reset,
+            args.streamk_combine_tiles_ptr,
+            args.streamk_m_block_size
         };
     }
 
@@ -201,10 +210,16 @@ public:
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
 
         int const thread_idx = threadIdx.x;
-        int const m_block = blockIdx.x;
+        int m_block = blockIdx.x;
         int const k_block = blockIdx.y;
-        int const batch = blockIdx.z;
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        int batch = blockIdx.z;
+        int num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+
+        if constexpr(StreamK) {
+            auto tile = params.streamk_combine_tiles_ptr[blockIdx.x];
+            batch = tile.bidb;
+            num_splits = tile.num_peers;
+        }
 
         if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
             cutlass::arch::wait_on_dependent_grids();
@@ -214,9 +229,24 @@ public:
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
+
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
         if constexpr (Varlen) {
             if (m_block * kBlockM >= max_idx) { return; }
+        }
+
+        // TODO(Lucas) This is very hacky, we should really write this kernel in a way that that more naturally
+        // supports StreamK
+        if constexpr(StreamK) {
+            auto tile = params.streamk_combine_tiles_ptr[blockIdx.x];
+            // m_block is encdoded as (seqlen, num_head): (1, seqlen), 
+            //  i.e. ind2crd(m_block, (seqlen,  num_head)) -> (mi, head)
+            int mi = tile.m_block * params.streamk_m_block_size + blockIdx.z * kBlockM;
+            int bidh = tile.bidh;
+            m_block = mi + bidh * seqlen;
+            // dont allow bleeding across heads since in streamk different heads can have a different number
+            // of peers
+            max_idx = seqlen + bidh * seqlen;
         }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);

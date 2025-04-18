@@ -7,6 +7,8 @@
 #include <cuda.h>
 #include <vector>
 
+#include "streamk.h"
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
@@ -158,6 +160,14 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    // Streamk stuff
+    int * __restrict__ sm_work_tile_ind_ptr = nullptr;
+    StreamKWorkTile * __restrict__ work_tiles_ptr = nullptr;
+    StreamKCombineTile * __restrict__ combine_tiles_ptr = nullptr;
+    int num_combine_blocks = 0;
+    int streamk_m_block_size = 0;
+    bool use_one_mma_wg = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

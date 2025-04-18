@@ -828,7 +828,6 @@ public:
         assert(args.tile_count_semaphore != nullptr);
         assert(args.num_head < (1 << 16));  // We use the top 16 bits to store num_splits & split_idx
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
-        int const num_splits_val = !Split ? 1 : args.num_splits;
         return {Super::to_underlying_arguments(args),
                 args.work_tiles_ptr,
                 args.sm_work_tile_ind_ptr
@@ -860,23 +859,25 @@ public:
     CUTLASS_DEVICE
     BlockCoord<AppendKV>
     get_block_coord(WorkTileInfo const& work_tile) const {
-        SeqlenInfo_t seqlen_info = create_seqlen_info(work_tile.bidb);
+        SeqlenInfo_t seqlen_info = create_seqlen_info(work_tile.work_tile.bidb);
         if constexpr(AppendKV) {
             return {
-                seqlen_info,
                 work_tile.work_tile.m_block,
                 work_tile.work_tile.bidh,
                 work_tile.work_tile.bidb,
+                work_tile.work_tile.n_block_start,
+                work_tile.work_tile.n_block_start + work_tile.work_tile.n_blocks,
                 work_tile.work_tile.peer_id,
                 work_tile.work_tile.num_peers,
                 0, 0 // TODO support appendKV
             };
         } else {
             return {
-                seqlen_info,
                 work_tile.work_tile.m_block,
                 work_tile.work_tile.bidh,
                 work_tile.work_tile.bidb,
+                work_tile.work_tile.n_block_start,
+                work_tile.work_tile.n_block_start + work_tile.work_tile.n_blocks,
                 work_tile.work_tile.peer_id,
                 work_tile.work_tile.num_peers
             };  
@@ -886,7 +887,7 @@ public:
      CUTLASS_DEVICE
     SeqlenInfo_t
     get_seqlen_info(WorkTileInfo const& work_tile) const {
-        return create_seqlen_info(work_tile.bidb);
+        return create_seqlen_info(work_tile.work_tile.bidb);
     }
 
 

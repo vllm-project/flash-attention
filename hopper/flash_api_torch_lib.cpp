@@ -49,6 +49,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
+        std::optional<const at::Tensor> &device_scheduler_metadata_,
+        std::optional<const at::Tensor> &host_scheduler_metadata_,
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin
@@ -116,6 +118,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    float    softcap,"
             "    bool     is_rotary_interleaved,"
             "    Tensor?  scheduler_metadata,"
+            "    Tensor?  device_scheduler_metadata,"
+            "    Tensor?  host_scheduler_metadata,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
             "    int      sm_margin) -> Tensor[]");

@@ -21,6 +21,7 @@
 #include "mainloop_fwd_sm90_tma_gmma_ws.hpp"
 #include "mainloop_fwd_sm80.hpp"
 #include "epilogue_fwd.hpp"
+#include "heuristics.h"
 
 using namespace cute;
 

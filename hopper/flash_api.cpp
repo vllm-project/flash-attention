@@ -432,8 +432,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    bool use_one_mma_wg = params.seqlen_q * (!params.pack_gqa ? 1 : params.h / params.h_k) <= 64;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
@@ -590,10 +589,11 @@ mha_fwd_get_scheduler_metadata(
     num_splits = use_stream_k ? 2 : num_splits;
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split
+    params.pack_gqa = params.num_splits > 1;
 
     bool is_varlen = true;
 
@@ -619,27 +619,16 @@ mha_fwd_get_scheduler_metadata(
         );
     }
 
-    // if (scheduler_needs_semaphore || use_stream_k) {
-    //     tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_stream_k) * params.b}, opts.dtype(torch::kInt32));
-    //     if (scheduler_needs_semaphore) {
-    //         if (!use_stream_k) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-    //         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-    //     } else {
-    //         params.tile_count_semaphore = nullptr;
-    //     }
-    //     params.num_splits_dynamic_ptr = use_stream_k ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
-    // }
-
-    // if (params.num_splits_dynamic_ptr) {
-    //     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
-    //     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
-    //     int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
-    //     int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-    //     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    //     prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
-    //     CHECK_CUDA_KERNEL_LAUNCH();
-    // }
-    return {device_metadata, host_metadata};
+    if (params.num_splits_dynamic_ptr) {
+        auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
+        auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
+        int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
+        int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        CHECK_CUDA_KERNEL_LAUNCH();
+    }
+    return tile_count_semaphore;
 }
 
 // b: batch_size
@@ -747,7 +736,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     int const max_num_pages_per_seq = !paged_KV ? 0 : page_table.size(1);
     int const num_pages = !paged_KV ? 0 : k.size(0);
     int const page_size = !paged_KV ? 1 : k.size(1);
-    int const seqlen_k = !is_varlen_k ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
+    int const seqlen_k = !max_seqlen_k_.has_value() ? (!paged_KV ? k.size(1) : max_num_pages_per_seq * page_size) : max_seqlen_k_.value();
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
@@ -960,9 +949,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split
+    params.pack_gqa = params.num_splits > 1;
 
     // Assume streamk scheduling
     if (host_scheduler_metadata_) {

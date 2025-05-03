@@ -43,8 +43,10 @@ struct TileSchedulerArguments {
     int const* const num_splits_dynamic_ptr = nullptr;
     int const window_size_left = -1;
     int const window_size_right = 0;
+    // StreamK specific
     int const* const sm_work_tile_ind_ptr = nullptr;
     StreamKWorkTile const* const work_tiles_ptr = nullptr;
+    int grid_size = 0;
 };
 
 template<bool AppendKV>
@@ -819,6 +821,7 @@ public:
     struct Params: public Super::Params {
         StreamKWorkTile const* const work_tiles_ptr;
         int const* const sm_work_tile_ind_ptr;
+        int grid_size;
     };
 
     static Params
@@ -830,13 +833,14 @@ public:
         assert(!Split || args.num_splits < (1 << 8)); // We use the top 8 bits to store num_splits
         return {Super::to_underlying_arguments(args),
                 args.work_tiles_ptr,
-                args.sm_work_tile_ind_ptr
+                args.sm_work_tile_ind_ptr,
+                args.grid_size
                };
     }
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(num_sm)};
+        return {uint32_t(params.grid_size)};
     }
 
     struct WorkTileInfo {

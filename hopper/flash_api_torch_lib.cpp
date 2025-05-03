@@ -57,7 +57,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
-at::Tensor
+std::tuple<at::Tensor, at::Tensor>
 mha_fwd_get_scheduler_metadata(
         int batch_size,
         int max_seqlen_q,
@@ -148,7 +148,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     has_softcap,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
-            "    int      sm_margin) -> Tensor");
+            "    int      sm_margin) -> (Tensor, Tensor)");
    ops.impl("get_scheduler_metadata", torch::kCUDA, 
         make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }

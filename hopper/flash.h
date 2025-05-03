@@ -151,6 +151,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     int num_splits;  // For split-KV version
     bool pack_gqa;
+    bool use_one_mma_wg;
 
     int * __restrict__ tile_count_semaphore;
     // int * __restrict__ num_m_blocks_ptr;
@@ -165,9 +166,7 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ sm_work_tile_ind_ptr = nullptr;
     StreamKWorkTile * __restrict__ work_tiles_ptr = nullptr;
     StreamKCombineTile * __restrict__ combine_tiles_ptr = nullptr;
-    int num_combine_blocks = 0;
-    int streamk_m_block_size = 0;
-    bool use_one_mma_wg = false;
+    StreamKSchedulerDescisions const* host_scheduler_metadata_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

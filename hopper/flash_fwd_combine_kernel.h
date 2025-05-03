@@ -231,22 +231,30 @@ public:
         int const seqlen = seqlen_info.seqlen;
 
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
-        if constexpr (Varlen) {
-            if (m_block * kBlockM >= max_idx) { return; }
-        }
 
         // TODO(Lucas) This is very hacky, we should really write this kernel in a way that that more naturally
         // supports StreamK
         if constexpr(StreamK) {
             auto tile = params.streamk_combine_tiles_ptr[blockIdx.x];
             // m_block is encdoded as (seqlen, num_head): (1, seqlen), 
-            //  i.e. ind2crd(m_block, (seqlen,  num_head)) -> (mi, head)
+            //  i.e. ind2crd(m_block, (seqlen, num_head)) -> (mi, head)
             int mi = tile.m_block * params.streamk_m_block_size + blockIdx.z * kBlockM;
             int bidh = tile.bidh;
             m_block = mi + bidh * seqlen;
             // dont allow bleeding across heads since in streamk different heads can have a different number
             // of peers
             max_idx = seqlen + bidh * seqlen;
+        }
+
+        // For StreamK we don't always start at kBlockM boundaries, so m_block
+        // encodes the offset instead of the block number
+        auto get_m_block_offset = [&](int m_block) {
+            if constexpr (StreamK) return m_block;
+            else return m_block * kBlockM;
+        };
+
+        if constexpr (Varlen) {
+            if (get_m_block_offset(m_block) >= max_idx) { return; }
         }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
@@ -270,7 +278,7 @@ public:
         #pragma unroll
         for (int m = 0; m < size<2>(tLSEcLSE); ++m) {
             int mi = int(get<1>(tLSEcLSE(_0{}, _0{}, m)));
-            int idx = m_block * kBlockM + mi;
+            int idx = get_m_block_offset(m_block) + mi;
             if (idx < max_idx) {
                 int m_idx, bidh;
                 if constexpr (!Varlen) {
@@ -314,7 +322,7 @@ public:
         #pragma unroll
         for (int m = 0; m < size<1>(tOcO); ++m) {
             int mi = get<0>(tOcO(_0{}, m, _0{}));
-            int idx = m_block * kBlockM + mi;
+            int idx = get_m_block_offset(m_block) + mi;
             if constexpr (!Varlen) {
                 tObidh(m) = params.seqlen_divmod.divmod(tOmidx(m), idx);
             } else {
@@ -424,7 +432,7 @@ public:
             for (int m = 0; m < size<2>(ts2rrLSE); ++m) {
                 if (get<0>(ts2rcLSE(_0{}, _0{}, m)) == 0) {  // Only the thread responsible for s=0 writes to gmem
                     int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
-                    int idx = m_block * kBlockM + mi;
+                    int idx = get_m_block_offset(m_block) + mi;
                     if (idx < max_idx) {
                         int m_idx, bidh;
                         if constexpr (!Varlen) {

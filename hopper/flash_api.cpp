@@ -408,53 +408,6 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     return params.page_size % kBlockN == 0 && params.seqlen_q * (params.h / params.h_k) > kBlockM;
 }
 
-inline bool get_pack_gqa(Flash_fwd_params const& params) {
-    // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
-    // Has little effect on speed.
-    if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
-    #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    return false;
-    #else
-    // params.page_table must already be set
-    if (params.h == params.h_k) { return false; }
-    // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
-    int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
-    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
-    #endif
-}
-
-inline int get_num_splits(Flash_fwd_params const& params) {
-    #ifdef FLASHATTENTION_DISABLE_SPLIT
-    return 1;
-    #else
-    // Always enable PackGQA for Split
-    // params.page_table must already be set
-    // This needs to match the kernel configs
-    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
-    // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
-    // has not been set here. It's OK though because we might just underestimate kBlockN a bit
-    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
-    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
-    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
-    // If is_local, we're not going to load all of seqlen_k
-    int const seqlen_k_loaded = !params.is_local
-        ? params.seqlen_k
-        : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
-    int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
-    int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
-    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
-    // Always enable PackGQA for Split
-    // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
-    // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
-    // that batch = 1.
-    int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
-    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
-    #endif
-}
-
 inline int get_max_headdim() {
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     return 256;
@@ -532,7 +485,8 @@ mha_fwd_get_scheduler_metadata(
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
                 "FlashAttention only supports fp16, bf16, and fp8_e4m3 data type");
-    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(num_heads % num_heads_k == 0 && num_heads_k > 1, 
+        "Number of heads in key/value must divide number of heads in query");
 
     // Reset the parameters
     Flash_fwd_params params{};
@@ -585,15 +539,8 @@ mha_fwd_get_scheduler_metadata(
     bool const use_stream_k = params.b <= 992;
     params.num_splits_dynamic_ptr = !use_stream_k ? nullptr : reinterpret_cast<int*>(1);
 
-    assert(use_stream_k && (num_splits <= 0 || num_splits == 2));
-    num_splits = use_stream_k ? 2 : num_splits;
-
     params.pagedkv_tma = get_pagedkv_tma(params);
-    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split
-    params.pack_gqa = params.num_splits > 1;
+    determine_pack_gqa_splits_and_mma_wgs(params, num_splits, pack_gqa_, use_stream_k);
 
     bool is_varlen = true;
 
@@ -617,6 +564,7 @@ mha_fwd_get_scheduler_metadata(
             params.is_e4m3 ? 1 : 2, false /*v_colmajor*/, true /*pagedkv*/, params.pagedkv_tma,
             params.softcap, params.seqlen_knew > 0
         );
+        return {host_metadata, device_metadata};
     }
 
     if (params.num_splits_dynamic_ptr) {
@@ -628,7 +576,7 @@ mha_fwd_get_scheduler_metadata(
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
-    return tile_count_semaphore;
+    return {host_metadata, device_metadata};
 }
 
 // b: batch_size
@@ -944,33 +892,28 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
-    bool const use_dynamic_split = is_varlen && params.b <= 992;
+    bool const use_stream_k = device_scheduler_metadata_ && host_scheduler_metadata_;
+    bool const use_dynamic_split = is_varlen && params.b <= 992 && !use_stream_k;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
-
-    params.pagedkv_tma = get_pagedkv_tma(params);
-    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split
-    params.pack_gqa = params.num_splits > 1;
+    determine_pack_gqa_splits_and_mma_wgs(params, num_splits, pack_gqa_, use_stream_k);
 
     // Assume streamk scheduling
-    if (host_scheduler_metadata_) {
+    if (use_stream_k) {
         auto host_metadata_ptr = reinterpret_cast<StreamKSchedulerDescisions const*>(host_scheduler_metadata_->data_ptr<uint8_t>());
+        params.host_scheduler_metadata_ptr = host_metadata_ptr;
         params.num_splits = host_metadata_ptr->max_num_peers;
-        params.num_combine_blocks = host_metadata_ptr->num_combine_blocks;
         params.pack_gqa = host_metadata_ptr->pack_gqa;
         params.use_one_mma_wg = host_metadata_ptr->use_one_mma_wg;
-        
+
         int num_work_tiles = host_metadata_ptr->num_work_tiles;
         assert(device_scheduler_metadata_.has_value());
         auto device_metadata_ptr = device_scheduler_metadata_->data_ptr<uint8_t>();
 
         auto [offsets, total_size] = get_device_metadata_offsets_and_size(
-            params.num_sm, num_work_tiles, params.num_combine_blocks);
+            params.num_sm, num_work_tiles, host_metadata_ptr->num_combine_blocks);
 
-        params.work_tiles_ptr = reinterpret_cast<StreamKWorkTile*>(device_metadata_ptr);
+        params.work_tiles_ptr = reinterpret_cast<StreamKWorkTile*>(device_metadata_ptr + offsets.work_tiles_offset);
         params.sm_work_tile_ind_ptr = reinterpret_cast<int*>(device_metadata_ptr + offsets.work_tiles_ind_ptr_offset);
         params.combine_tiles_ptr = reinterpret_cast<StreamKCombineTile*>(device_metadata_ptr + offsets.combine_tiles_offset);
     }

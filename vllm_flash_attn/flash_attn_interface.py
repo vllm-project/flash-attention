@@ -138,8 +138,8 @@ def flash_attn_varlen_func(
     out=None,
     # FA3 Only
     scheduler_metadata=None,
-    device_scheduler_metadata=None,
-    host_scheduler_metadata=None,
+    scheduler_metadata_device=None,
+    scheduler_metadata_host=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
@@ -271,6 +271,8 @@ def flash_attn_varlen_func(
             softcap,
             True,             # rotary_interleaved
             scheduler_metadata,
+            scheduler_metadata_device,
+            scheduler_metadata_host,
             0,                # num_splits
             None,             # pack_gqa
             0,                # sm_margin
@@ -304,6 +306,8 @@ def flash_attn_with_kvcache(
     out=None,
     # FA3 Only
     scheduler_metadata=None,
+    scheduler_metadata_device=None,
+    scheduler_metadata_host=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
@@ -457,6 +461,8 @@ def flash_attn_with_kvcache(
             softcap,
             rotary_interleaved,  # rotary_interleaved
             scheduler_metadata,
+            scheduler_metadata_device,
+            scheduler_metadata_host,
             num_splits,          # num_splits
             None,                # pack_gqa
             0,                   # sm_margin

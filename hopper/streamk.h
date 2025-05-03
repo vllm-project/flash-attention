@@ -4,17 +4,28 @@
 #include <torch/nn/functional.h>
 
 #include "cute/container/alignment.hpp"
-#include "flash.h"
 #include "tile_size.h"
 
 struct CUTE_ALIGNAS(16) StreamKSchedulerDescisions {
     int  num_combine_blocks;
     int  num_work_tiles;
     int  max_num_peers;
+    int  grid_size;
+    int  m_block_size;
     bool pack_gqa;
     bool use_one_mma_wg;
+
+    void print() const {
+        printf("StreamKSchedulerDescisions:\n");
+        printf("  num_combine_blocks: %d\n", num_combine_blocks);
+        printf("  num_work_tiles: %d\n", num_work_tiles);
+        printf("  max_num_peers: %d\n", max_num_peers);
+        printf("  pack_gqa: %d\n", pack_gqa);
+        printf("  use_one_mma_wg: %d\n", use_one_mma_wg);
+    }
 };
 
+// Make sure this fits into 128bits
 struct CUTE_ALIGNAS(16) StreamKWorkTile {
     int      m_block = -1;
     int      n_block_start = 0;
@@ -23,6 +34,17 @@ struct CUTE_ALIGNAS(16) StreamKWorkTile {
     uint16_t bidh = 0;     // Max num heads is 65535
     uint8_t  peer_id = 0;   // Max 255 peers
     uint8_t  num_peers = 0; // Max 255 peers
+
+    void print() const {
+        printf("StreamKWorkTile:\n");
+        printf("  m_block: %d\n", m_block);
+        printf("  n_block_start: %d\n", n_block_start);
+        printf("  n_blocks: %d\n", n_blocks);
+        printf("  bidb: %d\n", bidb);
+        printf("  bidh: %d\n", bidh);
+        printf("  peer_id: %d\n", peer_id);
+        printf("  num_peers: %d\n", num_peers);
+    }
 };
 
 struct CUTE_ALIGNAS(8) StreamKCombineTile {
@@ -30,9 +52,18 @@ struct CUTE_ALIGNAS(8) StreamKCombineTile {
     uint16_t const bidh;
     uint16_t const bidb;
     uint16_t const num_peers; // Number of peers / num_splits
+
+    void print() const {
+        printf("StreamKCombineTile:\n");
+        printf("  m_block: %d\n", m_block);
+        printf("  bidh: %d\n", bidh);
+        printf("  bidb: %d\n", bidb);
+        printf("  num_peers: %d\n", num_peers);
+    }
 };
 
-struct StreamKMetadataByteOffsets {    int const work_tiles_offset;
+struct StreamKMetadataByteOffsets {    
+    int const work_tiles_offset;
     int const combine_tiles_offset;
     int const work_tiles_ind_ptr_offset;
 };
@@ -49,7 +80,7 @@ inline std::tuple<StreamKMetadataByteOffsets, int> get_device_metadata_offsets_a
     int work_tiles_offset = 0;
     int combine_tiles_offset = work_tiles_offset + round_up_to_16(num_work_tiles * sizeof(StreamKWorkTile));
     int work_tiles_ind_ptr_offset = combine_tiles_offset + round_up_to_16(num_combine_tiles * sizeof(StreamKCombineTile));
-    int total_size = work_tiles_ind_ptr_offset + round_up_to_16(num_sms * sizeof(int));
+    int total_size = work_tiles_ind_ptr_offset + round_up_to_16((num_sms + 1) * sizeof(int));
 
     StreamKMetadataByteOffsets metadata_offsets{
         work_tiles_offset,
@@ -60,7 +91,7 @@ inline std::tuple<StreamKMetadataByteOffsets, int> get_device_metadata_offsets_a
     return std::make_tuple(metadata_offsets, total_size);
 }
 
-inline std::tuple<torch::Tensor, torch::Tensor> streamk_schedule(
+std::tuple<torch::Tensor, torch::Tensor> streamk_schedule(
     int arch,
     int num_sms,
     int batch_size,
@@ -80,251 +111,4 @@ inline std::tuple<torch::Tensor, torch::Tensor> streamk_schedule(
     bool paged_kv_non_TMA, 
     bool softcap,
     bool append_kv
-) {
-    assert (is_local == false && "StreamK + Local attention not supported yet");
-
-    std::optional<const at::Tensor> cu_seqlens_q_cpu;
-    if (cu_seqlens_q) {
-        cu_seqlens_q_cpu.emplace(cu_seqlens_q->cpu());
-    }
-    auto seqused_k_cpu = seqused_k.cpu();
-
-    auto get_tile_sizes = [&](bool use_one_mma_wg) -> std::tuple<int, int> {
-        if (arch == 90) {
-            auto ts = tile_size_fwd_sm90(headdim, headdim_v, is_causal, is_local, element_size, v_colmajor, paged_kv_non_TMA, softcap);
-            return std::make_tuple(std::get<0>(ts), std::get<1>(ts));
-        } else if (arch < 90) {
-            auto ts = tile_size_fwd_sm8x(headdim, headdim_v, is_causal, is_local, element_size, paged_kv, /* varlen_and_split */ true, softcap, append_kv);
-            return std::make_tuple(std::get<0>(ts), std::get<1>(ts));
-        } else {
-            assert(false && "Unsupported architecture");
-            return std::make_tuple(0, 0);
-        }
-    };
-
-    auto get_seqlen_k = [&](int bidb) {
-        return seqused_k_cpu.accessor<int32_t, 1>()[bidb];
-    };
-
-
-    auto get_seqlen_q = [&](int bidb) {
-        if (cu_seqlens_q_cpu.has_value()) {
-            auto cu_seqlens_q = cu_seqlens_q_cpu.value().accessor<int32_t, 1>();
-            return cu_seqlens_q[bidb + 1] - cu_seqlens_q[bidb];
-        } else {
-            return seqlen_q;
-        }
-    };
-
-    auto get_num_n_tiles = [&](int m_tile, int seqlen_k, int seqlen_q, int block_m, int block_n) {
-        int m_tile_k_end = std::max(
-            (seqlen_k - seqlen_q) + (m_tile + 1) * block_m,
-            seqlen_k
-        );
-        return cutlass::ceil_div(m_tile_k_end, block_n);
-    };
-
-    auto tile_sizes = get_tile_sizes(false);
-    auto tile_sizes_one_mma_wg = get_tile_sizes(true);
-
-    auto compute_tiles = [&, get_num_n_tiles = get_num_n_tiles](
-        int num_heads,
-        int num_heads_k,
-        int seqlen_q, 
-        int seqlen_k,
-        bool causal,
-        bool pack_gqa,
-        bool one_mma_wg
-    ) {
-        int block_m = one_mma_wg ? std::get<0>(tile_sizes_one_mma_wg) : std::get<0>(tile_sizes);
-        int block_n = one_mma_wg ? std::get<1>(tile_sizes_one_mma_wg) : std::get<1>(tile_sizes);
-
-        seqlen_q *= pack_gqa ? num_heads / num_heads_k : 1;
-        num_heads = pack_gqa ? num_heads_k : num_heads;
-        int m_tiles = cutlass::ceil_div(seqlen_q, block_m);
-        int tiles_total = 0;
-        if (causal) {
-            tiles_total += m_tiles * cutlass::ceil_div(seqlen_k, block_n);
-        } else {
-            int block_m = one_mma_wg ? std::get<0>(tile_sizes_one_mma_wg) : std::get<0>(tile_sizes);
-            int block_n = one_mma_wg ? std::get<1>(tile_sizes_one_mma_wg) : std::get<1>(tile_sizes);    
-
-            for (int m_tile = 0; m_tile < m_tiles; m_tile++) {
-                tiles_total += get_num_n_tiles(
-                    m_tile, seqlen_k, seqlen_q, block_m, block_n);
-            }
-        }
-
-        return tiles_total * num_heads;
-    };
-
-    bool pack_gqa = false;
-
-    // Determine if we should pack GQA by determining the the amount of
-    // available work that would benefit from packing GQA
-    // Assume not `use_one_mma_wg` for now, we determine this later
-    if (num_heads > num_heads_k) {
-        assert (num_heads % num_heads_k == 0);
-
-        int total_tiles_pack_gqa = 0;
-        int total_tiles_no_pack_gqa = 0;
-
-        for (int bidb = 0; bidb < batch_size; ++bidb) {
-            int seqlen_k = get_seqlen_k(bidb);
-            int seqlen_q = get_seqlen_q(bidb);
-
-            total_tiles_pack_gqa += compute_tiles(
-                num_heads, num_heads_k, seqlen_q, seqlen_k, is_causal, true, false);
-            total_tiles_no_pack_gqa += compute_tiles(
-                num_heads, num_heads_k, seqlen_q, seqlen_k, is_causal, false, false);
-        }
-
-        if (total_tiles_pack_gqa < (total_tiles_no_pack_gqa * 1.1f)) {
-            pack_gqa = true;
-        }
-    }
-
-    bool use_one_mma_wg = false;
-    // Determine the amount of work that would benefit from using one MMA
-    // workgroup
-
-    int total_tiles = 0;
-    int total_tiles_one_mma_wg = 0;
-
-    for (int bidb = 0; bidb < batch_size; ++bidb) {
-        int seqlen_k = get_seqlen_k(bidb);
-        int seqlen_q = get_seqlen_q(bidb);
-
-        total_tiles += compute_tiles(
-            num_heads, num_heads_k, seqlen_q, seqlen_k, is_causal, pack_gqa, false);
-        total_tiles_one_mma_wg += compute_tiles(
-            num_heads, num_heads_k, seqlen_q, seqlen_k, is_causal, pack_gqa, true);
-    }
-    
-    // if using one_mma_wg only increases the number of tiles by 50% or less
-    // then we should use it (since it performs each tile computes 1/2 as much)
-    // TODO(lucas): 50% is a guesstimate, we should do a more thorough analysis
-    if (total_tiles_one_mma_wg < (total_tiles * 1.5f)) {
-        use_one_mma_wg = true;
-    }
-
-    tile_sizes = use_one_mma_wg ? tile_sizes_one_mma_wg : tile_sizes;
-    total_tiles = use_one_mma_wg ? total_tiles_one_mma_wg : total_tiles;
-
-    int block_m = std::get<0>(tile_sizes);
-    int block_n = std::get<1>(tile_sizes);
-
-    int target_tiles_per_sm = cutlass::ceil_div(total_tiles, num_sms);
-
-    std::vector<StreamKWorkTile> work_tiles;
-    work_tiles.reserve(1024);
-    std::vector<int> work_tiles_ind_ptr;
-    work_tiles_ind_ptr.reserve(num_sms + 1);
-    work_tiles_ind_ptr.push_back(0);
-    std::vector<StreamKCombineTile> combine_tiles;
-    combine_tiles.reserve(1024);
-
-    int min_tiles = 2;
-    int max_num_peers = 0;
-
-    int current_tile = 0;
-    int sm_target_tiles_remaining = target_tiles_per_sm;
-    int num_combine_tiles = 0;
-
-    for (int bidb = 0; bidb < batch_size; ++bidb) {
-        for (int bidh = 0; bidh < num_heads; ++bidh) {
-            int seqlen_k = get_seqlen_k(bidb);
-            int seqlen_q = get_seqlen_q(bidb);
-            int m_tiles = cutlass::ceil_div(seqlen_q, block_m);
-
-            for (int m_tile = 0; m_tile < m_tiles; m_tile++) {
-                int n_tiles = get_num_n_tiles(
-                    m_tile, seqlen_k, seqlen_q, block_m, block_n);
-
-                int m_tile_start_idx = current_tile;
-                int curr_n_tile_start = 0;
-                int curr_n_tiles_remaining = n_tiles;
-                int num_peers = 0;
-
-                while (curr_n_tiles_remaining > 0) {
-                    int n_tile = std::min(curr_n_tiles_remaining, sm_target_tiles_remaining);
-
-                    // if we would leave a residual tile that is less than the minimum tiles
-                    // then we should just take the rest of the tiles
-                    if (curr_n_tiles_remaining - n_tile < min_tiles) {
-                        n_tile = curr_n_tiles_remaining;
-                    }
-
-                    curr_n_tiles_remaining -= n_tile;
-                    sm_target_tiles_remaining -= n_tile;
-
-                    work_tiles.emplace_back(StreamKWorkTile{
-                        /* m_block:       */ m_tile,
-                        /* n_block_start: */ curr_n_tile_start,
-                        /* n_blocks:      */ uint16_t(n_tile),
-                        /* bidb:          */ uint16_t(bidb),
-                        /* bidh:          */ uint16_t(bidh),
-                        /* peer_id:       */ uint8_t(num_peers),
-                        /* num_peers:     */ 0
-                    });
-
-                    current_tile += 1;
-                    num_peers += 1;
-                    curr_n_tile_start += n_tile;
-
-                    if (sm_target_tiles_remaining <= 0) {
-                        work_tiles_ind_ptr.push_back(current_tile);
-                        sm_target_tiles_remaining = target_tiles_per_sm;
-                    }
-                }
-
-                if (num_peers > 1) {
-                    combine_tiles.emplace_back(StreamKCombineTile{
-                        /* m_block:   */ m_tile,
-                        /* bidh:      */ uint16_t(bidh),
-                        /* bidb:      */ uint16_t(bidb),
-                        /* num_peers: */ uint16_t(num_peers)
-                    });
-                }
-
-                if (num_peers > max_num_peers) {
-                    max_num_peers = num_peers;
-                }
-
-                for (int i = m_tile_start_idx; i < current_tile; ++i) {
-                    work_tiles[i].num_peers = num_peers;
-                }
-            }
-        }
-    }
-
-    auto [metadata_offsets, metadata_size] = get_device_metadata_offsets_and_size(
-        num_sms,
-        work_tiles.size(),
-        num_combine_tiles
-    );
-
-    auto device_metadata = torch::empty(
-        {int(work_tiles.size())},
-        torch::TensorOptions().dtype(torch::kByte).device(torch::kCPU)
-    );
-
-    uint8_t *device_metadata_ptr = device_metadata.data_ptr<uint8_t>();
-    std::memcpy(device_metadata_ptr + metadata_offsets.work_tiles_offset, work_tiles.data(), work_tiles.size() * sizeof(StreamKWorkTile));
-    std::memcpy(device_metadata_ptr + metadata_offsets.work_tiles_ind_ptr_offset, work_tiles_ind_ptr.data(), work_tiles_ind_ptr.size() * sizeof(int));
-    std::memcpy(device_metadata_ptr + metadata_offsets.combine_tiles_offset, combine_tiles.data(), combine_tiles.size() * sizeof(StreamKCombineTile));
-
-    auto host_metadata = torch::empty(
-        {sizeof(StreamKSchedulerDescisions)},
-        torch::TensorOptions().dtype(torch::kByte).device(torch::kCPU)
-    );
-
-    auto host_metadata_ptr = reinterpret_cast<StreamKSchedulerDescisions*>(host_metadata.data_ptr<uint8_t>());
-    host_metadata_ptr->num_combine_blocks = num_combine_tiles;
-    host_metadata_ptr->max_num_peers = max_num_peers;
-    host_metadata_ptr->pack_gqa = pack_gqa;
-    host_metadata_ptr->use_one_mma_wg = use_one_mma_wg;
-    host_metadata_ptr->num_work_tiles = work_tiles.size();
-
-    return {device_metadata, host_metadata};
-}
+);

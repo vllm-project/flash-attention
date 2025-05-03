@@ -36,7 +36,7 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         static_cast<float*>(params.softmax_lse_ptr),
         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
         params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.tile_count_semaphore,
-        params.combine_tiles_ptr, params.streamk_m_block_size
+        params.combine_tiles_ptr, params.host_scheduler_metadata_ptr->m_block_size
     };
 
     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
@@ -45,8 +45,8 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
     dim3 grid_m(num_blocks_m, num_blocks_k, params.b);
 
     if constexpr(StreamK) {
-        grid_m.x = params.num_combine_blocks;
-        grid_m.z = cute::ceil_div(params.streamk_m_block_size, kBlockM);
+        grid_m.x = params.host_scheduler_metadata_ptr->num_combine_blocks;
+        grid_m.z = cute::ceil_div(params.host_scheduler_metadata_ptr->m_block_size, kBlockM);
     }
 
     auto kernel = cutlass::device_kernel<CombineKernel>;

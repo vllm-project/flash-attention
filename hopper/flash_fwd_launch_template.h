@@ -163,7 +163,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.page_table, 
         {params.kv_batch_idx ? params.b_k : params.b, !params.page_table ? 0 : params.seqlen_k / params.page_size}, // shape_page_table
         params.num_splits_dynamic_ptr,
-        params.window_size_left, params.window_size_right
+        params.window_size_left, params.window_size_right,
+        params.sm_work_tile_ind_ptr,
+        params.work_tiles_ptr,
+        params.host_scheduler_metadata_ptr->grid_size
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {
@@ -214,7 +217,7 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                BOOL_SWITCH(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k) <= 64 || params.use_one_mma_wg, Use_one_mma_wg, [&] {
+                BOOL_SWITCH(params.use_one_mma_wg, Use_one_mma_wg, [&] {
                     // Only needed here to decide if we should use cluster
                     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Use_one_mma_wg)) : 128;
 

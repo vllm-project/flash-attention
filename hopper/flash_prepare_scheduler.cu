@@ -9,6 +9,7 @@
 #include "cutlass/arch/grid_dependency_control.h"
 
 #include "flash.h"
+#include "streamk.h"
 
 namespace flash {
 

@@ -226,6 +226,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         SOURCES
             hopper/flash_fwd_combine.cu
             hopper/flash_prepare_scheduler.cu
+            hopper/streamk.cu
             hopper/flash_api.cpp
             hopper/flash_api_torch_lib.cpp
             ${FA3_GEN_SRCS}
@@ -244,11 +245,15 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_DISABLE_BACKWARD
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI
-        # FLASHATTENTION_DISABLE_SOFTCAP
+        FLASHATTENTION_DISABLE_SOFTCAP
         FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
+        FLASHATTENTION_DISABLE_HDIM64
+        FLASHATTENTION_DISABLE_HDIM96
+        FLASHATTENTION_DISABLE_HDIM192
+        FLASHATTENTION_DISABLE_HDIM256
     )
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")

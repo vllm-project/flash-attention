@@ -23,7 +23,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+template <typename SeqlenInfo_t_, int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
         bool PackGQA_, bool Split_>
 struct CollectiveMainloopFwdSm80 {
@@ -44,7 +44,6 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
-    static constexpr bool Transpose_V = Is_FP8;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -54,8 +53,6 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
 
     using MMA_Atom_Arch = std::conditional_t<
         ArchTag::kMinComputeCapability >= 80,
@@ -204,15 +201,10 @@ struct CollectiveMainloopFwdSm80 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         int const window_size_left = -1, window_size_right = -1;
         float const softcap_val;
-        int const num_splits;
         int const* const kv_batch_idx = nullptr;
-        int const* const cu_seqlens_q = nullptr;
-        int const* const cu_seqlens_k = nullptr;
-        int const* const cu_seqlens_k_new = nullptr;
-        int const* const seqused_q = nullptr;
-        int const* const seqused_k = nullptr;
-        int const* const leftpad_k = nullptr;
-        int const* const seqlens_rotary = nullptr;
+        bool const is_varlen_knew = false;
+        bool const is_varlen_q = false;
+        bool const is_varlen_k = false;
     };
 
     // Device side kernel params
@@ -249,16 +241,14 @@ struct CollectiveMainloopFwdSm80 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
         int const window_size_left, window_size_right;
-        int const num_splits;
         int const* const kv_batch_idx = nullptr;
-        int const* const cu_seqlens_q = nullptr;
-        int const* const cu_seqlens_k = nullptr;
-        int const* const cu_seqlens_k_new = nullptr;
-        int const* const seqused_q = nullptr;
-        int const* const seqused_k = nullptr;
-        int const* const leftpad_k = nullptr;
-        int const* const seqlens_rotary = nullptr;
+        bool const is_varlen_knew = false;
+        bool const is_varlen_q = false;
+        bool const is_varlen_k = false;
     };
+
+    using SeqlenInfo_t = SeqlenInfo_t_;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static Params
     to_underlying_arguments(Arguments const& args) {
@@ -294,10 +284,9 @@ struct CollectiveMainloopFwdSm80 {
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.window_size_left, args.window_size_right,
-                !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.is_varlen_knew, args.is_varlen_q, args.is_varlen_k
+        };
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -307,7 +296,8 @@ struct CollectiveMainloopFwdSm80 {
         Softmax& softmax,
         int const thread_idx,
         SeqlenInfo_t const& seqlen_info,
-        cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+        // (m_block, bidh, bidb, n_block_min, n_block_max)
+        BlockCoord<AppendKV> const& block_coord,
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
@@ -315,16 +305,13 @@ struct CollectiveMainloopFwdSm80 {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int const m_block = get<0>(block_coord);
-        int const bidh = get<1>(block_coord);
-        int const bidb = get<2>(block_coord);
-        int const split_idx = get<3>(block_coord);
+        int const m_block = block_coord.m_block;
+        int const bidh = block_coord.bidh;
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto n_block_min_max = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-        int const n_block_min = get<0>(n_block_min_max);
-        int const n_block_max = get<1>(n_block_min_max);
+        int const bidb = block_coord.bidb;
+        int const n_block_min = block_coord.n_block_min;
+        int const n_block_max = block_coord.n_block_max;
+
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -335,8 +322,8 @@ struct CollectiveMainloopFwdSm80 {
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
         Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
 
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_q = Varlen && params.is_varlen_q;
+        bool const is_varlen_k = Varlen && params.is_varlen_k;
 
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
@@ -659,14 +646,14 @@ struct CollectiveMainloopFwdSm80 {
                  int const thread_idx,
                  SharedStorage &shared_storage,
                  SeqlenInfo_t const& seqlen_info,
-                 cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
+                 BlockCoord<true> const& block_coord
     ) {
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto n_block_new_min_max = BlockMN_t::get_n_block_k_new_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
-        int const n_block_new_min = get<0>(n_block_new_min_max);
-        int const n_block_new_max = get<1>(n_block_new_min_max);
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const n_block_new_min = block_coord.n_block_new_min;
+        int const n_block_new_max = block_coord.n_block_new_max;
+        bool const is_varlen_k_new = Varlen && params.is_varlen_knew;
+
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
@@ -675,7 +662,6 @@ struct CollectiveMainloopFwdSm80 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
-        bool const is_varlen_k_new = Varlen && params.cu_seqlens_k_new;
         Tensor mKnew = make_tensor(make_gmem_ptr(params.ptr_K_new), params.shape_K_new, params.stride_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
         Tensor mVnew = make_tensor(make_gmem_ptr(params.ptr_V_new), params.shape_K_new, params.stride_V_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
 

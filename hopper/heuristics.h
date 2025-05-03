@@ -63,3 +63,69 @@ inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks
     }
     return 1;
 }
+
+inline bool get_pack_gqa(Flash_fwd_params const& params) {
+    // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
+    // Has little effect on speed.
+    if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    return false;
+    #else
+    // params.page_table must already be set
+    if (params.h == params.h_k) { return false; }
+    // This needs to match the kernel configs
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
+    return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
+    #endif
+}
+
+inline int get_num_splits(Flash_fwd_params const& params) {
+    #ifdef FLASHATTENTION_DISABLE_SPLIT
+    return 1;
+    #else
+    // Always enable PackGQA for Split
+    // params.page_table must already be set
+    // This needs to match the kernel configs
+    bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
+
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, params.use_one_mma_wg);
+    // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
+    // has not been set here. It's OK though because we might just underestimate kBlockN a bit
+    auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
+    int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
+    int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
+    int seqlen_q_packgqa = params.seqlen_q * (params.h / params.h_k);
+    // If is_local, we're not going to load all of seqlen_k
+    int const seqlen_k_loaded = !params.is_local
+        ? params.seqlen_k
+        : std::max(0, std::min(params.seqlen_k, params.window_size_right + params.window_size_left + 1 + kBlockM));
+    int const num_n_blocks = (seqlen_k_loaded + kBlockN - 1) / kBlockN;
+    int const num_m_blocks = (seqlen_q_packgqa + kBlockM - 1) / kBlockM;
+    int const size_one_kv_head = params.seqlen_k * (params.d + params.dv) * (params.is_e4m3 ? 1 : 2);
+    // Always enable PackGQA for Split
+    // If varlen, we use dynamic split, so this heuristic just needs to get an upper bound on num_splits.
+    // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
+    // that batch = 1.
+    int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
+    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
+    #endif
+}
+
+
+inline void determine_pack_gqa_splits_and_mma_wgs(
+    Flash_fwd_params &params, 
+    int num_splits,
+    std::optional<bool> const& pack_gqa,
+    bool use_stream_k = false
+) {
+    assert(use_stream_k && (num_splits <= 0 || num_splits == 2));
+    num_splits = use_stream_k ? 2 : num_splits;
+
+    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
+    params.use_one_mma_wg = use_one_mma_wg(params);
+    params.pack_gqa = pack_gqa.has_value() ? pack_gqa.value() : get_pack_gqa(params);
+    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // Always enable PackGQA for Split
+    params.pack_gqa = params.num_splits > 1;
+}

@@ -303,7 +303,9 @@ public:
             __syncthreads();
         }
 
-        TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
+        TileScheduler scheduler(
+            reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler),
+            params.scheduler);
 
         if (warp_group_idx == 0) {  // Producer
             cutlass::arch::warpgroup_reg_dealloc<LoadRegisterRequirement>();
@@ -325,20 +327,13 @@ public:
             cutlass::arch::wait_on_dependent_grids();
 
             // Load Q, K, V
-            for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler) : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                 work_tile_info.is_valid(params.scheduler);
-                 work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info)) {
+            for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_initial_work</*IsProducerWarp=*/true>() : scheduler.template get_initial_work</*IsProducerWarp=*/false>();
+                 scheduler.is_valid(work_tile_info);
+                 work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0 ? scheduler.template get_next_work</*IsProducerWarp=*/true>(work_tile_info) : scheduler.template get_next_work</*IsProducerWarp=*/false>(work_tile_info)) {
 
-                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                SeqlenInfo_t seqlen_info{
-                    get<2>(block_coord) /*bidb*/,
-                    get<0>(params.mainloop.shape_Q),
-                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
-                    get<0>(params.mainloop.shape_K_new),
-                    params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
-                    params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
-                };
+                auto block_coord = scheduler.get_block_coord(work_tile_info);
+                auto seqlen_info = scheduler.get_seqlen_info(work_tile_info);
+
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new,
@@ -349,8 +344,8 @@ public:
                         // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
                     }
                 }
-                auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
-                    scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                auto scheduler_prefetch = [&scheduler, &work_tile_info]() {
+                    scheduler.prefetch_next_work(work_tile_info);
                 };
                 // pipeline_vt won't be used if we don't need to transpose V.
                 mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
@@ -373,21 +368,13 @@ public:
 
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
-            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                 work_tile_info.is_valid(params.scheduler);
+            for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>();
+                 scheduler.is_valid(work_tile_info);
                  // get_next_work will be called before the epilogue
                  ) {
-                auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                int const bidb = get<2>(block_coord);
-                SeqlenInfo_t seqlen_info{
-                    bidb,
-                    get<0>(params.mainloop.shape_Q),
-                    !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
-                    get<0>(params.mainloop.shape_K_new),
-                    params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
-                    params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
-                };
+                auto block_coord = scheduler.get_block_coord(work_tile_info);
+                auto seqlen_info = scheduler.get_seqlen_info(work_tile_info);
+
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.store_kv_new(
                         params.mainloop, pipeline_k_new, pipeline_v_new, smem_pipe_read_new,
@@ -407,11 +394,11 @@ public:
                 // If there's tanh softcap, the scaling will be done before tanh.
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 if constexpr (Is_FP8 && !Has_softcap) {
-                    int const bidh = get<1>(block_coord);
+                    int const bidh = block_coord.bidh;
+                    int const bidb = block_coord.bidb;
                     int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
                     float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
-                    float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
-                    softmax_scale_log2 *= q_descale * k_descale;
+                    softmax_scale_log2 = params.mainloop.softmax_scale_log2 * q_descale;
                 }
                 flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
                 // Attention output (GEMM-II) accumulator.
@@ -433,9 +420,9 @@ public:
                     }
                 }
                 // Do this here before the epilogue so that the next tile is ready to go.
-                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info);
+                work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/false>(work_tile_info);
                 if constexpr (Split && Varlen) {
-                    if (!work_tile_info.is_valid(params.scheduler)) {  // Last tile
+                    if (!scheduler.is_valid(work_tile_info)) {  // Last tile
                         cutlass::arch::launch_dependent_grids();
                     }
                 }

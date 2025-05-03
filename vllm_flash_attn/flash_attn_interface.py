@@ -22,6 +22,7 @@ try:
     FA3_UNAVAILABLE_REASON = None
     FA3_AVAILABLE = True
 except ImportError as e:
+    raise e
     FA3_UNAVAILABLE_REASON = str(e)
     FA3_AVAILABLE = False
 
@@ -94,7 +95,7 @@ def get_scheduler_metadata(
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
-    scheduler_metadata = torch.ops._vllm_fa3_C.get_scheduler_metadata(
+    return torch.ops._vllm_fa3_C.get_scheduler_metadata(
         batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
         qkv_dtype,
         cache_seqlens,
@@ -112,8 +113,6 @@ def get_scheduler_metadata(
         pack_gqa,
         sm_margin,
     )
-
-    return scheduler_metadata
 
 
 def flash_attn_varlen_func(
@@ -139,6 +138,8 @@ def flash_attn_varlen_func(
     out=None,
     # FA3 Only
     scheduler_metadata=None,
+    scheduler_metadata_device=None,
+    scheduler_metadata_host=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
@@ -270,6 +271,8 @@ def flash_attn_varlen_func(
             softcap,
             True,             # rotary_interleaved
             scheduler_metadata,
+            scheduler_metadata_device,
+            scheduler_metadata_host,
             0,                # num_splits
             None,             # pack_gqa
             0,                # sm_margin
@@ -303,6 +306,8 @@ def flash_attn_with_kvcache(
     out=None,
     # FA3 Only
     scheduler_metadata=None,
+    scheduler_metadata_device=None,
+    scheduler_metadata_host=None,
     q_descale=None,
     k_descale=None,
     v_descale=None,
@@ -456,6 +461,8 @@ def flash_attn_with_kvcache(
             softcap,
             rotary_interleaved,  # rotary_interleaved
             scheduler_metadata,
+            scheduler_metadata_device,
+            scheduler_metadata_host,
             num_splits,          # num_splits
             None,                # pack_gqa
             0,                   # sm_margin

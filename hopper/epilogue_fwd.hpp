@@ -217,18 +217,16 @@ struct CollectiveEpilogueFwd {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
+          BlockCoord<false> const& block_coord
           ) {
 
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        int num_splits = get<4>(params.shape_O_packed);
-        if constexpr (Split && Varlen) {
-            uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(split_idx) >> 16; // first 16 bits are for num_splits
-            int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
-            num_splits = num_splits_dynamic > 0 ? num_splits_dynamic : num_splits;
-            split_idx &= 0x0000FFFF;  // Only use the lower 16 bits of split_idx
-        }
-        bool const is_split = !Split ? false : (!Varlen ? true : num_splits > 1);
+        int const m_block = block_coord.m_block;
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const peer_id = block_coord.peer_id;
+        int const num_peers = block_coord.num_peers;
+
+        bool const is_split = !Split ? false : (!Varlen ? true : num_peers > 1);
 
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.tensors.epilogue.smem_o.data()), SmemLayoutO{});
         // Tensor sO_pi = cute::as_position_independent_swizzle_tensor(sO);
@@ -292,7 +290,7 @@ struct CollectiveEpilogueFwd {
 
         Tensor mLSE = make_tensor(make_gmem_ptr((!is_split ? params.ptr_LSE : params.ptr_LSE_partial) + offset_o * get<0>(!is_split ? params.stride_LSE : params.stride_LSE_partial)),
                                   params.shape_LSE_packed,
-                                  !is_split ? params.stride_LSE_packed : params.stride_LSE_partial_packed)(_, bidh, !is_varlen ? bidb : 0, !is_split ? 0 : split_idx);
+                                  !is_split ? params.stride_LSE_packed : params.stride_LSE_partial_packed)(_, bidh, !is_varlen ? bidb : 0, !is_split ? 0 : peer_id);
         // if (thread_idx == 0) { printf("Before LSE write, m_block: %d, bidh: %d, bidb: %d, split_idx: %d, offset_o: %d, seqlen_o: %d\n", m_block, bidh, bidb, split_idx, offset_o, seqlen_o); print(mLSE); printf("\n"); }
         if (!LargeHeadDimV || warp_group_idx == 0) {
             if constexpr (!PackGQA) {
@@ -308,7 +306,7 @@ struct CollectiveEpilogueFwd {
 
         // Step 3: Write O from smem -> gmem
         if constexpr (Use_TMA_O) {
-            Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, split_idx);
+            Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, peer_id);
             Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
             auto block_tma_O = params.tma_store_O.get_slice(_0{});
             Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
@@ -361,7 +359,7 @@ struct CollectiveEpilogueFwd {
                     PackGQA_t::store_O(mO, tOrO, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
                 }
             } else {
-                Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset_o * get<0>(params.stride_O_partial)), params.shape_O_packed, params.stride_O_partial_packed)(_, _, bidh, !is_varlen ? bidb : 0, split_idx);
+                Tensor mOpartial = make_tensor(make_gmem_ptr(params.ptr_O_partial + offset_o * get<0>(params.stride_O_partial)), params.shape_O_packed, params.stride_O_partial_packed)(_, _, bidh, !is_varlen ? bidb : 0, peer_id);
                 Tensor gOpartial = local_tile(mOpartial, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
                 // We already arrived on barrier_O earlier if !Use_smem
                 if constexpr (Use_smem) {
@@ -410,18 +408,17 @@ struct CollectiveEpilogueFwd {
     store_zero(
          Params const& params,
          int thread_idx,
-         cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
+         BlockCoord<false> const& block_coord
          ) {
+        int const m_block = block_coord.m_block;
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const peer_id = block_coord.peer_id;
+        int const num_peers = block_coord.num_peers;
+
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        int num_splits = get<4>(params.shape_O_packed);
-        if constexpr (Split && Varlen) {
-            uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(split_idx) >> 16; // first 16 bits are for num_splits
-            int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
-            num_splits = num_splits_dynamic > 0 ? num_splits_dynamic : num_splits;
-            split_idx &= 0x0000FFFF;  // Only use the lower 16 bits of split_idx
-        }
-        bool const is_split = !Split ? false : (!Varlen ? true : num_splits > 1);
+
+        bool const is_split = !Split ? false : (!Varlen ? true : num_peers > 1);
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused};
         bool const is_varlen = Varlen && params.cu_seqlens;
@@ -430,7 +427,7 @@ struct CollectiveEpilogueFwd {
         int qhead_per_khead = !PackGQA ? 1 : params.qhead_per_khead_divmod.divisor;
         Tensor mLSE = make_tensor(make_gmem_ptr((!is_split ? params.ptr_LSE : params.ptr_LSE_partial) + offset_o * get<0>(!is_split ? params.stride_LSE : params.stride_LSE_partial)),
                                   params.shape_LSE_packed,
-                                  !is_split ? params.stride_LSE_packed : params.stride_LSE_partial_packed)(_, bidh, !is_varlen ? bidb : 0, !is_split ? 0 : split_idx);
+                                  !is_split ? params.stride_LSE_packed : params.stride_LSE_partial_packed)(_, bidh, !is_varlen ? bidb : 0, !is_split ? 0 : peer_id);
         Tensor gLSE = local_tile(mLSE, Shape<Int<kBlockM>>{}, make_coord(m_block));
 
         static_assert(kBlockM <= NumEpilogueThreads);

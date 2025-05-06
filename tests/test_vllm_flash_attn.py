@@ -4,6 +4,7 @@
 #
 
 import math
+import random
 from typing import List, Optional, Tuple
 
 import pytest
@@ -15,6 +16,13 @@ from vllm_flash_attn.flash_attn_interface import (
     flash_attn_with_kvcache,
     get_scheduler_metadata,
     is_fa_version_supported,
+    tree_attention,
+)
+
+from vllm_flash_attn.utils.tree import (
+    create_tree_mask,
+    generate_q_and_block_kvcache,
+    treeify_output,
 )
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
@@ -522,3 +530,234 @@ def test_sparse_attention_varlen(
         f"{torch.max(torch.abs(out - ref_out))}"
     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(lse - ref_lse))}"
+
+
+@pytest.mark.parametrize("num_seqs", [1])
+@pytest.mark.parametrize("seq_len", [300])
+@pytest.mark.parametrize("num_heads", [16])
+def test_tree_masking_no_block_table(num_seqs, seq_len, num_heads):
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    head_size = 128
+    dtype=torch.float16
+    query = torch.randn(seq_len, num_heads, head_size, dtype=dtype)
+    key = torch.randn(seq_len, num_heads, head_size, dtype=dtype)
+    value = torch.randn_like(key)
+    cu_seqlens_q = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, seq_len], dtype=torch.int32)
+    mask = torch.tensor([
+        0b100000,
+        0b010000,
+        0b001000,
+        0b100100,
+        0b001010,
+        0b100001,
+        ], dtype=torch.uint64)
+    mask_lens = torch.tensor([0, 6], dtype=torch.int32)
+    scale = head_size**-0.5
+    soft_cap = None
+
+    output, lse = tree_attention(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+        tree_mask=mask,
+        tree_mask_lens=mask_lens,
+        softmax_scale=scale,
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+    )
+
+    q_s1 = torch.cat((query[:seq_len-5], query[seq_len-3:seq_len-2]))
+    k_s1 = torch.cat((key[:seq_len-5], key[seq_len-3:seq_len-2]))
+    v_s1 = torch.cat((value[:seq_len-5], value[seq_len-3:seq_len-2]))
+    cu_seqlens_q_s1 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+    cu_seqlens_k_s1 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+
+    ref_output_s1, ref_lse = flash_attn_varlen_func(
+        q=q_s1,
+        k=k_s1,
+        v=v_s1,
+        cu_seqlens_q=cu_seqlens_q_s1,
+        cu_seqlens_k=cu_seqlens_k_s1,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+        softmax_scale=scale,
+        window_size=(-1, -1),
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+        causal=True,
+    )
+
+    output_s1 = torch.cat((output[:seq_len-5], output[seq_len-3:seq_len-2]))
+    torch.testing.assert_close(output_s1, ref_output_s1, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output_s1 - ref_output_s1))}"
+    
+    q_s2 = torch.cat((query[:seq_len-5], query[seq_len-1:]))
+    k_s2 = torch.cat((key[:seq_len-5], key[seq_len-1:]))
+    v_s2 = torch.cat((value[:seq_len-5], value[seq_len-1:]))
+    cu_seqlens_q_s2 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+    cu_seqlens_k_s2 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+
+    ref_output_s2, ref_lse = flash_attn_varlen_func(
+        q=q_s2,
+        k=k_s2,
+        v=v_s2,
+        cu_seqlens_q=cu_seqlens_q_s2,
+        cu_seqlens_k=cu_seqlens_k_s2,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+        softmax_scale=scale,
+        window_size=(-1, -1),
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+        causal=True,
+    )    
+
+    output_s2 = torch.cat((output[:seq_len-5], output[seq_len-1:]))
+    torch.testing.assert_close(output_s2, ref_output_s2, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output_s2 - ref_output_s2))}"
+
+    q_s3 = torch.cat((query[:seq_len-6], query[seq_len-5:seq_len-4]))
+    k_s3 = torch.cat((key[:seq_len-6], key[seq_len-5:seq_len-4]))
+    v_s3 = torch.cat((value[:seq_len-6], value[seq_len-5:seq_len-4]))
+    cu_seqlens_q_s3 = torch.tensor([0, seq_len-5], dtype=torch.int32)
+    cu_seqlens_k_s3 = torch.tensor([0, seq_len-5], dtype=torch.int32)
+
+    ref_output_s3, ref_lse = flash_attn_varlen_func(
+        q=q_s3,
+        k=k_s3,
+        v=v_s3,
+        cu_seqlens_q=cu_seqlens_q_s3,
+        cu_seqlens_k=cu_seqlens_k_s3,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+        softmax_scale=scale,
+        window_size=(-1, -1),
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+        causal=True,
+    )    
+
+    output_s3 = torch.cat((output[:seq_len-6], output[seq_len-5:seq_len-4]))
+    torch.testing.assert_close(output_s3, ref_output_s3, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output_s3 - ref_output_s3))}"
+
+
+    q_s4 = torch.cat((query[:seq_len-6], query[seq_len-4:seq_len-3], query[seq_len-2:seq_len-1]))
+    k_s4 = torch.cat((key[:seq_len-6], key[seq_len-4:seq_len-3], key[seq_len-2:seq_len-1]))
+    v_s4 = torch.cat((value[:seq_len-6], value[seq_len-4:seq_len-3], value[seq_len-2:seq_len-1]))
+    cu_seqlens_q_s4 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+    cu_seqlens_k_s4 = torch.tensor([0, seq_len-4], dtype=torch.int32)
+
+    ref_output_s4, ref_lse = flash_attn_varlen_func(
+        q=q_s4,
+        k=k_s4,
+        v=v_s4,
+        cu_seqlens_q=cu_seqlens_q_s4,
+        cu_seqlens_k=cu_seqlens_k_s4,
+        max_seqlen_q=seq_len,
+        max_seqlen_k=seq_len,
+        softmax_scale=scale,
+        window_size=(-1, -1),
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+        causal=True,
+    )    
+
+    output_s4 = torch.cat((output[:seq_len-6], output[seq_len-4:seq_len-3], output[seq_len-2:seq_len-1]))
+    torch.testing.assert_close(output_s4, ref_output_s4, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output_s4 - ref_output_s4))}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 256])
+# @pytest.mark.parametrize(
+#     "seqlen_q,seqlen_k",
+#     [
+#         (1, 239),
+#         (3, 799),
+#         (127, 512),
+#         (127, 513),
+#         (113, 203),
+#         (128, 217),
+#         (113, 211),
+#         (108, 256),
+#         (256, 512),
+#         (1023, 1024),
+#     ],
+# )
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(7,239), (1023, 1024)])
+@pytest.mark.parametrize("swap_sq_sk", [False, True])
+# TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
+@pytest.mark.parametrize("paged_kv_block_size", [16, 256])
+def test_paged_tree_attention(seqlen_q, seqlen_k, swap_sq_sk, d, paged_kv_block_size, dtype):
+    device = "cuda"
+    # set seed
+    torch.random.manual_seed(0)
+    if swap_sq_sk:
+        seqlen_q, seqlen_k = seqlen_k, seqlen_q
+    batch_size = 8
+    nheads = 9
+    q_seqlens = [seqlen_q+random.randint(0, 20) for _ in range(batch_size)]
+    k_seqlens = [seqlen_k+random.randint(0, 20) for _ in range(batch_size)]
+    speclens = [(random.randint(1, 8), random.randint(2, 3)) for _ in range(batch_size)]
+    (
+        q_spec_tree,
+        q_seqlens_tree,
+        q_spec_batch,
+        q_seqlens_batch,
+        tree_block_table,
+        k_spec_tree,
+        v_spec_tree,
+        k_seqlens_tree,
+        batch_block_table,
+        k_spec_batch,
+        v_spec_batch,
+        k_seqlens_batch,
+    ) = generate_q_and_block_kvcache(q_seqlens, k_seqlens, speclens, paged_kv_block_size, nheads, d, device, dtype)
+    tree_mask = create_tree_mask(speclens, device)
+    tree_mask_lens = torch.tensor([0] + [i*j for i,j in speclens], dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens_q_tree = torch.tensor([0] + q_seqlens_tree, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+    seqused_k_tree = torch.tensor(k_seqlens_tree, dtype=torch.int32)
+    cu_seqlens_q_batch = torch.tensor([0] + q_seqlens_batch, dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+    seqused_k_batch = torch.tensor(k_seqlens_batch, dtype=torch.int32)
+
+    out = tree_attention(
+        q_spec_tree,
+        k_spec_tree,
+        v_spec_tree,
+        max(q_seqlens_tree),
+        cu_seqlens_q_tree,
+        max(k_seqlens_tree),
+        tree_mask,
+        tree_mask_lens,
+        seqused_k=seqused_k_tree,
+        block_table=tree_block_table,
+    )
+
+    ref_output = flash_attn_varlen_func(
+        q_spec_batch,
+        k_spec_batch,
+        v_spec_batch,
+        max(q_seqlens_batch),
+        cu_seqlens_q_batch,
+        max(k_seqlens_batch),
+        seqused_k=seqused_k_batch,
+        causal=True,
+        block_table=batch_block_table,
+    )
+
+    ref_output_tree = treeify_output(ref_output, q_seqlens, speclens)
+    torch.testing.assert_close(out, ref_output_tree, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(out - ref_output_tree))}"
+

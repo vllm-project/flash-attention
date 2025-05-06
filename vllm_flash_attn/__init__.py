@@ -8,5 +8,6 @@ from .flash_attn_interface import (
     sparse_attn_func,
     sparse_attn_varlen_func,
     is_fa_version_supported,
-    fa_version_unsupported_reason
+    fa_version_unsupported_reason,
+    tree_attention
 )

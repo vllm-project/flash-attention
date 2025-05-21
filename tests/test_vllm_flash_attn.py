@@ -2,6 +2,10 @@
 # This file is copied verbatim from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/tests/kernels/test_flash_attn.py
 #
+# How do I run or build flash attention for this test? I get the following error when trying to run the test_varlen_with_paged_kv.
+# FAILED tests/test_vllm_flash_attn.py::test_varlen_with_paged_kv[True-2-False-32768-None-dtype0-None-16-128-num_heads0-seq_lens0] - AttributeError: '_OpNamespace' '_vllm_fa2_C' object has no attribute 'varlen_fwd'
+# FAILED tests/test_vllm_flash_attn.py::test_varlen_with_paged_kv[False-2-False-32768-None-dtype0-None-16-128-num_heads0-seq_lens0] - AttributeError: '_OpNamespace' '_vllm_fa2_C' object has no attribute 'varlen_fwd'
+# 
 
 import math
 from typing import List, Optional, Tuple

@@ -153,6 +153,25 @@ struct Softmax {
         return scores_scale;
     };
 
+    __forceinline__ __device__ TensorT finalize_aux(TensorT const& tSrSAux, float const final_scale=1.f) {
+        SumOp<float> sum_op;
+        quad_allreduce_(row_sum, row_sum, sum_op);
+        TensorT scores_scale;
+        #pragma unroll
+        for (int mi = 0; mi < size(row_sum); ++mi) {
+            float sum = row_sum(mi) + exp2f(tSrSAux(mi) - row_max(mi));
+            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            scores_scale(mi) = inv_sum * final_scale;
+            // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
+            if constexpr (Max_offset != 0) {
+                static constexpr float sum_scale = 1.f / float(1 << Max_offset);
+                sum *= sum_scale;
+            }
+            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+        }
+        return scores_scale;
+    };
+
     template<typename Tensor1>
     __forceinline__ __device__ void rescale_o(Tensor1 &acc_o, TensorT const &scores_scale) {
         // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))

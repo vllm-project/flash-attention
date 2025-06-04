@@ -1096,13 +1096,16 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         using TensorT = typename Softmax::TensorT;
+        using LayoutT = typename TensorT::layout_type;
         auto finalize_dispatch = [&](TensorT& scores_scale, float const v_descale) {
-            if (params.ptr_S_aux && split_idx == 0) {
+            if (params.ptr_S_aux && (!Split || split_idx == 0)) {
                 Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
                 Tensor tSrS_aux = make_tensor_like(scores_scale);
+                static_assert(is_static<decltype(layout(tSrS_aux))>::value);
+                static_assert(size(tSrS_aux) == size(LayoutT{}));
                 if constexpr(!PackGQA) {
                     #pragma unroll
-                    for(int mi = 0; mi < size(scores_scale); ++mi) {
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
                         tSrS_aux(mi) = static_cast<float>(sS_aux(bidh));
                     }
                 } else {
@@ -1110,10 +1113,11 @@ struct CollectiveMainloopFwdSm90 {
                     auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
                     Tensor tScS = thread_mma_qk.partition_C(cS);
                     Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+                    static_assert(size<0>(tScS_rowcol) == size(tSrS_aux));
                     int const qhead_per_khead = params.qhead_per_khead_divmod.divisor;
                     #pragma unroll
-                    for(int mi = 0; mi < size(scores_scale); ++mi) {
-                        int row = m_block * kBlockM + get<0>(tScS_rowcol(thread_idx, _0{}));
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
+                        int row = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
                         int bidh_mi = (row % qhead_per_khead) + bidh_kv * qhead_per_khead;
                         tSrS_aux(mi) = static_cast<float>(sS_aux(bidh_mi));
                     }

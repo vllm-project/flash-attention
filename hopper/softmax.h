@@ -159,7 +159,8 @@ struct Softmax {
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
-            float sum = row_sum(mi) + exp2f(tSrSAux(mi) - row_max(mi));
+            const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
+            float sum = row_sum(mi) + exp2f(float(M_LOG2E) * tSrSAux(mi) - max_scaled);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.

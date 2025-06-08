@@ -43,10 +43,11 @@ def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:
     if torch.cuda.get_device_capability(device)[0] < 8 \
         or torch.cuda.get_device_capability(device)[0] >= 10 \
         or torch.cuda.get_device_capability(device) == (8, 6) \
+        or torch.cuda.get_device_capability(device) == (8, 7) \
         or torch.cuda.get_device_capability(device) == (8, 9):
         return False, \
             "FA3 is only supported on devices with compute capability >= 8" \
-            " excluding 8.6 and 8.9 and Blackwell archs (>=10)"
+            " excluding 8.6, 8.7 and 8.9 and Blackwell archs (>=10)"
     return True, None
 
 def is_fa_version_supported(fa_version: int, device = None) -> bool:

@@ -268,7 +268,7 @@ public:
             // do actual work is. If the grid is more then 50% sparse, we linearize the M
             // and batch. If the grid is more than 50% dense, we use the standard scheduling
             // algorithm since its more efficient at calculating the block coordinates.
-            // NOTE: in valen case args.seqlen_q is the max seqlen_q across all batches
+            // NOTE: in varlen case args.seqlen_q is the max seqlen_q across all batches
             // if the density is over 50% we use the standard scheduling algo
             return cute::ceil_div(args.total_q, args.seqlen_q) >= cute::ceil_div(args.b, 2) ? 
                 SchedulingAlgo::STANDARD : 
@@ -290,7 +290,6 @@ public:
 
             switch (choose_scheduling_algo(args)) {
             case SchedulingAlgo::STANDARD: {
-                printf("Using standard scheduling algo for varlen!!!!!!!\n");
                 unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
                 unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};

@@ -258,13 +258,13 @@ public:
         CUTE_DEVICE StaticVarlenTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
 
         static SchedulingAlgo choose_scheduling_algo(SchedulerArguments const& args) {
-            // Choose the scheduling algorithm based on the max_seqlen_q and num_heads
+            // Choose the scheduling algorithm based on how dense the grid of tiles that
+            // do actual work is. If the grid is more then 50% sparse, we linearize the M
+            // and batch. If the grid is more than 50% dense, we use the standard scheduling
+            // algorithm since its more efficient at calculating the block coordinates.
             // NOTE: in valen case args.seqlen_q is the max seqlen_q across all batches
-            // If max_seqlen_q * num_heads is small enough (pure decode/spec-decode), 
-            //  we can use the standard scheduling since this grid of tiles that do
-            //  actual work is not that sparse and we the standard scheduling algo is
-            //  more efficient at computing the block coordinates.
-            return args.seqlen_q * args.num_heads <= kBlockM * 4 ? 
+            // if the density is over 50% we use the standard scheduling algo
+            return cute::ceil_div(args.total_q, args.seqlen_q) >= cute::ceil_div(args.b, 2) ? 
                 SchedulingAlgo::STANDARD : 
                 SchedulingAlgo::LINEARIZE_M_BATCH;
         }

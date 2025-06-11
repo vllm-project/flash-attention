@@ -269,8 +269,10 @@ public:
             // and batch. If the grid is more than 50% dense, we use the standard scheduling
             // algorithm since its more efficient at calculating the block coordinates.
             // NOTE: in varlen case args.seqlen_q is the max seqlen_q across all batches
-            // if the density is over 50% we use the standard scheduling algo
-            return cute::ceil_div(args.total_q, args.seqlen_q) >= cute::ceil_div(args.b, 2) ? 
+            // use lower bound to estimate when the density is more than 50%
+            int lower_bound_on_non_empty_tiles = cute::ceil_div(args.total_q, kBlockM);
+            int grid_size = args.b * cute::ceil_div(args.seqlen_q, kBlockM);
+            return 2 * lower_bound_on_non_empty_tiles >= grid_size ? 
                 SchedulingAlgo::STANDARD : 
                 SchedulingAlgo::LINEARIZE_M_AND_BATCH;
         }

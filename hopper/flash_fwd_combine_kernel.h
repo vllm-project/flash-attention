@@ -308,7 +308,7 @@ public:
             return {num_blocks_m, num_blocks_k, 1};
         }
 
-        CUTE_DEVICE BlockCoord get_block_coord_linear_m_batch(Params const& params) {
+        CUTE_DEVICE BlockCoord get_block_coord_linearized_m_and_batch(Params const& params) {
             int num_heads = params.num_heads;
             int curr_tile_id = blockIdx.x;
 
@@ -381,7 +381,7 @@ public:
                 case SchedulingAlgo::STANDARD:
                     return get_block_coord_standard(params);
                 case SchedulingAlgo::LINEARIZE_M_AND_BATCH:
-                    return get_block_coord_linear_m_batch(params);
+                    return get_block_coord_linearized_m_and_batch(params);
             }
             return {0, 0, 0};  // Should never reach here
         }

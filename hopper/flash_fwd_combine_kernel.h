@@ -126,10 +126,6 @@ public:
         int block_m;
         int block_k;
         int bidb;
-
-        CUTE_DEVICE bool is_valid() const {
-            return bidb >= 0;
-        }
     };
 
     struct SharedStorage : cute::aligned_struct<128> {
@@ -143,7 +139,7 @@ public:
 
     // Device side arguments
     struct Arguments {
-        int batch_size;
+        int b;
         ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
@@ -161,8 +157,8 @@ public:
     };
 
     // Kernel entry point API
-    struct Params {
-        int batch_size;
+    struct CollectiveParams {
+        int b;
         ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
@@ -182,11 +178,11 @@ public:
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
     static
-    Params
+    CollectiveParams
     to_underlying_arguments(Arguments const& args) {
         assert(get<1>(args.shape_LSE_partial) <= kMaxSplits);
         return {
-            args.batch_size,
+            args.b,
             args.ptr_O_partial,
             args.shape_O_partial,
             args.stride_O_partial,
@@ -211,9 +207,14 @@ public:
         int total_q;
         int num_heads;
         int dv;
+        int const* cu_seqlens_q;
+        int const* seqused_q;
     };
 
     struct StaticTileScheduler {
+        struct Params {};
+        static Params to_underlying_arguments(SchedulerArguments const& args) { return {}; }
+
         SharedStorage& shared_storage;
         CUTE_DEVICE StaticTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
 
@@ -240,11 +241,59 @@ public:
         // batch element can have a different number of m_blocks. 
         //
 
+        enum SchedulingAlgo {
+            STANDARD,           // Same as StaticTileScheduler
+            LINEARIZE_M_BATCH,  // Linearize the M and batch dimensions into a single tile index
+        };
+
+        struct Params {
+            int b;
+            int num_heads;
+            int const* const cu_seqlens_q;
+            int const* const seqused_q;
+            SchedulingAlgo algo;
+        };
+
         SharedStorage& shared_storage;
         CUTE_DEVICE StaticVarlenTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
 
+        static SchedulingAlgo choose_scheduling_algo(SchedulerArguments const& args) {
+            // Choose the scheduling algorithm based on the max_seqlen_q and num_heads
+            // NOTE: in valen case args.seqlen_q is the max seqlen_q across all batches
+            // If max_seqlen_q * num_heads is small enough (pure decode/spec-decode), 
+            //  we can use the standard scheduling since this grid of tiles that do
+            //  actual work is not that sparse and we the standard scheduling algo is
+            //  more efficient at computing the block coordinates.
+            return args.seqlen_q * args.num_heads <= kBlockM * 4 ? 
+                SchedulingAlgo::STANDARD : 
+                SchedulingAlgo::LINEARIZE_M_BATCH;
+        }
+
+        static Params to_underlying_arguments(SchedulerArguments const& args) { 
+            return {
+                args.b,
+                args.num_heads,
+                args.cu_seqlens_q,
+                args.seqused_q,
+                choose_scheduling_algo(args)
+            }; 
+        }
+
         static dim3 get_grid_shape(SchedulerArguments const& args) {
             unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
+
+            switch (choose_scheduling_algo(args)) {
+            case SchedulingAlgo::STANDARD: {
+                unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
+                unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
+                return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
+            }
+            case SchedulingAlgo::LINEARIZE_M_BATCH: {
+                // rough worst case upper bound on the number of blocks required 
+                //  (assuming each batch has an additional partial block)
+                unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
+                return {num_blocks_m, num_blocks_k, 1};
+            }}
 
             // rough worst case upper bound on the number of blocks required 
             //  (assuming each batch has an additional partial block)
@@ -252,8 +301,8 @@ public:
             return {num_blocks_m, num_blocks_k, 1};
         }
 
-        CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
-            int num_heads = get<2>(params.shape_LSE_partial);
+        CUTE_DEVICE BlockCoord get_block_coord_linear_m_batch(Params const& params) {
+            int num_heads = params.num_heads;
             int curr_tile_id = blockIdx.x;
 
             // Scan through the batches find the batch that contains the current
@@ -275,8 +324,8 @@ public:
                     group_end_bidb += cutlass::NumThreadsPerWarp;
 
                     auto get_num_m_blocks = [&](int bidb) {
-                        if (bidb >= params.batch_size) return 0;
-                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens, params.seqused};
+                        if (bidb >= params.b) return 0;
+                        flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
                         return cute::ceil_div(seqlen_info.seqlen * num_heads, Int<kBlockM>{}());
                     };
 
@@ -288,7 +337,7 @@ public:
                     
                     group_start_tile_id = group_end_tile_id;
                     group_end_tile_id += group_total_num_tiles;
-                } while (curr_tile_id >= group_end_tile_id && group_end_bidb < params.batch_size);
+                } while (curr_tile_id >= group_end_tile_id && group_end_bidb < params.b);
                 
                 int local_batch_end_tile_id = group_start_tile_id + local_num_m_blocks_cumulative;
                 // Find the last batch idx in the group where `local_batch_end_tile_id <= curr_tile_id`
@@ -300,23 +349,34 @@ public:
                 
                 int bidb = group_start_bidb + batch_idx_in_group;
                 int block_m = curr_tile_id - batch_m_start_tile_id;
-
-                if (threadIdx.x == 0) {
-                    if (bidb >= params.batch_size || block_m >= batch_num_m_blocks) {
-                        shared_storage.block_coord =  {-1, -1, -1}; // invalid block
-                    } else {
-                        // NOTE(lucas): not sure why this causes a block_k unused warning
-                        //  just inlined `blockIdx.y` to suppress the warning
-                        // int block_k = blockIdx.y;
-                        // shared_storage.block_coord = {block_m, block_k, bidb};
-                        shared_storage.block_coord = {
-                            block_m, static_cast<int>(blockIdx.y), bidb};
-                    }
-                }
+                // NOTE(lucas): not sure why this causes a block_k unused warning
+                //  just inlined `blockIdx.y` to suppress the warning
+                // int block_k = blockIdx.y;
+                // shared_storage.block_coord = {block_m, block_k, bidb};
+                BlockCoord block_coord{block_m, static_cast<int>(blockIdx.y), bidb};
+                if (threadIdx.x == 0) { shared_storage.block_coord = block_coord; }
             }
 
             __syncthreads();
             return shared_storage.block_coord;
+        }
+
+
+        CUTE_DEVICE BlockCoord get_block_coord_standard(Params const& params) {
+            int block_m = blockIdx.x;
+            int block_k = blockIdx.y;
+            int bidb = blockIdx.z;
+            return {block_m, block_k, bidb};
+        }
+
+        CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
+            switch (params.algo) {
+                case SchedulingAlgo::STANDARD:
+                    return get_block_coord_standard(params);
+                case SchedulingAlgo::LINEARIZE_M_BATCH:
+                    return get_block_coord_linear_m_batch(params);
+            }
+            return {0, 0, 0};  // Should never reach here
         }
     };
 
@@ -326,9 +386,17 @@ public:
         StaticTileScheduler
     >;
 
+    using SchedulerParams = typename TileScheduler::Params;
+
+    struct Params {
+        CollectiveParams params;
+        SchedulerParams scheduler_params;
+    };
+
     CUTLASS_DEVICE
     void
-    operator()(Params const& params, char* smem_buf) {
+    operator()(Params const& kernel_params, char* smem_buf) {
+        CollectiveParams const& params = kernel_params.params;
 
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
         TileScheduler tile_scheduler{shared_storage};
@@ -339,7 +407,7 @@ public:
 
         int const thread_idx = threadIdx.x;
 
-        BlockCoord block_coord = tile_scheduler.get_block_coord(params);
+        BlockCoord block_coord = tile_scheduler.get_block_coord(kernel_params.scheduler_params);
 
         int const m_block = block_coord.block_m;
         int const k_block = block_coord.block_k;
@@ -350,15 +418,18 @@ public:
             *params.semaphore_to_reset = 0;
         }
 
-        if (!block_coord.is_valid()) { return; }
-
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
-        if (num_splits <= 1) { return; }
-
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
+
+        bool block_coord_valid = 
+            block_coord.block_m < cute::ceil_div(max_idx, Int<kBlockM>{}) &&
+            block_coord.bidb < params.b;
+        if (!block_coord_valid) { return; }
+
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        if (num_splits <= 1) { return; }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
 

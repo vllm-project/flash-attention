@@ -39,8 +39,17 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.tile_count_semaphore
     };
 
-    typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
-    dim3 grid_m = CombineKernel::TileScheduler::get_grid_shape({params.b, params.seqlen_q, params.total_q, params.h, params.dv});
+    typename CombineKernel::SchedulerArguments scheduler_args  {
+        params.b, params.seqlen_q, params.total_q, params.h, params.dv,
+        params.cu_seqlens_q, params.seqused_q
+    };
+
+    typename CombineKernel::Params kernel_params = {
+        CombineKernel::to_underlying_arguments(args),
+        CombineKernel::TileScheduler::to_underlying_arguments(scheduler_args)
+    };
+
+    dim3 grid_m = CombineKernel::TileScheduler::get_grid_shape(scheduler_args);
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;
     if (smem_size >= 48 * 1024) {

@@ -220,7 +220,7 @@ public:
         static dim3 get_grid_shape(SchedulerArguments const& args) {
             unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
             unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
-            return {num_blocks_m, num_blocks_k, args.b};
+            return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
         }
 
         CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
@@ -232,6 +232,14 @@ public:
     };
 
     struct StaticVarlenTileScheduler {
+        //
+        // For varlen we flatten the tiled M dimension and batch dimension into 
+        // a linear tile index. The grid is then a 2D grid of (tile_id, k_block)
+        // we then map the linear tile id to (m_block, bidb) in the 
+        // get_block_coord function. This mapping is non-trivial since each
+        // batch element can have a different number of m_blocks. 
+        //
+
         SharedStorage& shared_storage;
         CUTE_DEVICE StaticVarlenTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
 
@@ -246,20 +254,22 @@ public:
 
         CUTE_DEVICE BlockCoord get_block_coord(Params const& params) {
             int num_heads = get<2>(params.shape_LSE_partial);
-            int linear_block_m = blockIdx.x;
+            int curr_tile_id = blockIdx.x;
 
-            // Compute on the first warp of the block
+            // Scan through the batches find the batch that contains the current
+            // tile_id. Compute using only the first warp of the block.
             if (threadIdx.x < 32) {
+                // We compute linearized tile index start and ends for each batch
+                // in groups of 32 in parallel
                 int group_start_bidb = -(cutlass::NumThreadsPerWarp);
                 int group_end_bidb = 0;
-                int group_end_m_block = 0;
-                int group_start_m_block = 0;
+                int group_end_tile_id = 0;
+                int group_start_tile_id = 0;
+                int group_total_num_tiles = 0;
 
-                int m_blocks_in_group = 0;
-                int num_m_blocks_cumulative = 0;
-                int num_m_blocks = 0;
+                int local_num_m_blocks = 0;
+                int local_num_m_blocks_cumulative = 0;
 
-                // Scan through the batches to find the first batch that past this linearized m_block
                 do {
                     group_start_bidb += cutlass::NumThreadsPerWarp;
                     group_end_bidb += cutlass::NumThreadsPerWarp;
@@ -271,30 +281,36 @@ public:
                     };
 
                     // Cumulative number of blocks for the next 31 batches
-                    num_m_blocks = get_num_m_blocks(group_start_bidb + threadIdx.x);
-                    num_m_blocks_cumulative = warp_prefix_sum(num_m_blocks);
+                    local_num_m_blocks = get_num_m_blocks(group_start_bidb + threadIdx.x);
+                    local_num_m_blocks_cumulative = warp_prefix_sum(local_num_m_blocks);
                     // Total number of blocks for the next 32 batches
-                    m_blocks_in_group = __shfl_sync(0xffffffff, num_m_blocks_cumulative, cutlass::NumThreadsPerWarp - 1);
+                    group_total_num_tiles = warp_shfl_get_last(local_num_m_blocks_cumulative);
                     
-                    group_start_m_block = group_end_m_block;
-                    group_end_m_block += m_blocks_in_group;
-                } while (linear_block_m >= group_end_m_block && group_end_bidb < params.batch_size);
-
-                int batch_idx_in_group = __popc(__ballot_sync(0xffffffff, group_start_m_block + num_m_blocks_cumulative <= linear_block_m));
-                num_m_blocks = __shfl_sync(0xffffffff, num_m_blocks, batch_idx_in_group);
-                int bidb = group_start_bidb + batch_idx_in_group;
-
-               
-                int batch_m_start = batch_idx_in_group == 0 ? 0 : __shfl_sync(0xffffffff, num_m_blocks_cumulative, batch_idx_in_group - 1);
+                    group_start_tile_id = group_end_tile_id;
+                    group_end_tile_id += group_total_num_tiles;
+                } while (curr_tile_id >= group_end_tile_id && group_end_bidb < params.batch_size);
                 
-                int block_m = linear_block_m - batch_m_start - group_start_m_block;
-                int block_k = blockIdx.y;
+                int local_batch_end_tile_id = group_start_tile_id + local_num_m_blocks_cumulative;
+                // Find the last batch idx in the group where `local_batch_end_tile_id <= curr_tile_id`
+                // these values below are now common to all threads in the warp
+                int batch_idx_in_group = warp_last_true_laneid(local_batch_end_tile_id <= curr_tile_id);
+                int batch_num_m_blocks = warp_shfl_get(local_num_m_blocks, batch_idx_in_group);
+                int batch_m_start_tile_id = group_start_tile_id + (batch_idx_in_group > 0 ? 
+                    warp_shfl_get(local_num_m_blocks_cumulative, batch_idx_in_group - 1) : 0);
+                
+                int bidb = group_start_bidb + batch_idx_in_group;
+                int block_m = curr_tile_id - batch_m_start_tile_id;
 
                 if (threadIdx.x == 0) {
-                    if (bidb >= params.batch_size || block_m >= num_m_blocks) {
-                        shared_storage.block_coord =  {-1, -1, -1};
+                    if (bidb >= params.batch_size || block_m >= batch_num_m_blocks) {
+                        shared_storage.block_coord =  {-1, -1, -1}; // invalid block
                     } else {
-                        shared_storage.block_coord = {block_m, block_k, bidb};
+                        // NOTE(lucas): not sure why this causes a block_k unused warning
+                        //  just inlined `blockIdx.y` to suppress the warning
+                        // int block_k = blockIdx.y;
+                        // shared_storage.block_coord = {block_m, block_k, bidb};
+                        shared_storage.block_coord = {
+                            block_m, static_cast<int>(blockIdx.y), bidb};
                     }
                 }
             }

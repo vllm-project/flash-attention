@@ -234,11 +234,11 @@ public:
 
     struct StaticVarlenTileScheduler {
         //
-        // For varlen we have too Scheduling algos:
+        // For varlen we have two Scheduling algos:
         //  1) STANDARD, same as StaticTileScheduler
-        //  2) LINEARIZE_M_AND_BATCH, this to flattens the tiled M dimension and
-        //     batch dimension into  a linear tile index. The grid is then a
-        //     2D grid of (tile_id, k_block) we then map the linear tile id
+        //  2) LINEARIZE_M_AND_BATCH, this flattens the tiled M dimension and
+        //     batch dimension into a linear tile index. The grid is then a
+        //     2D grid of (tile_id, k_block). We then map the linear tile id
         //     to (m_block, bidb) in the get_block_coord function. This mapping
         //     is non-trivial since each batch element can have a different
         //     number of m_blocks. This has overhead when computing the block

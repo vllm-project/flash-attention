@@ -352,13 +352,13 @@ public:
 
         if (!block_coord.is_valid()) { return; }
 
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
+        if (num_splits <= 1) { return; }
+
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
-
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[batch] : get<1>(params.shape_LSE_partial);
-        if (num_splits <= 1) { return; }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
 

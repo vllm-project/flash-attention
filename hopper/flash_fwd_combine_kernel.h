@@ -234,16 +234,22 @@ public:
 
     struct StaticVarlenTileScheduler {
         //
-        // For varlen we flatten the tiled M dimension and batch dimension into 
-        // a linear tile index. The grid is then a 2D grid of (tile_id, k_block)
-        // we then map the linear tile id to (m_block, bidb) in the 
-        // get_block_coord function. This mapping is non-trivial since each
-        // batch element can have a different number of m_blocks. 
+        // For varlen we have too Scheduling algos:
+        //  1) STANDARD, same as StaticTileScheduler
+        //  2) LINEARIZE_M_AND_BATCH, this to flattens the tiled M dimension and
+        //     batch dimension into  a linear tile index. The grid is then a
+        //     2D grid of (tile_id, k_block) we then map the linear tile id
+        //     to (m_block, bidb) in the get_block_coord function. This mapping
+        //     is non-trivial since each batch element can have a different
+        //     number of m_blocks. This has overhead when computing the block
+        //     coordinates, but it is more efficient when prefills and decodes
+        //     are mixed since in that case the STANDARD scheduling algo will
+        //     have a lot of empty (no work) blocks in the grid.
         //
 
         enum SchedulingAlgo {
             STANDARD,           // Same as StaticTileScheduler
-            LINEARIZE_M_BATCH,  // Linearize the M and batch dimensions into a single tile index
+            LINEARIZE_M_AND_BATCH,  // Linearize the M and batch dimensions into a single tile index
         };
 
         struct Params {
@@ -266,7 +272,7 @@ public:
             // if the density is over 50% we use the standard scheduling algo
             return cute::ceil_div(args.total_q, args.seqlen_q) >= cute::ceil_div(args.b, 2) ? 
                 SchedulingAlgo::STANDARD : 
-                SchedulingAlgo::LINEARIZE_M_BATCH;
+                SchedulingAlgo::LINEARIZE_M_AND_BATCH;
         }
 
         static Params to_underlying_arguments(SchedulerArguments const& args) { 
@@ -284,11 +290,12 @@ public:
 
             switch (choose_scheduling_algo(args)) {
             case SchedulingAlgo::STANDARD: {
+                printf("Using standard scheduling algo for varlen!!!!!!!\n");
                 unsigned int num_blocks_k = cute::ceil_div(args.dv, kBlockK);
                 unsigned int num_blocks_m = cute::ceil_div(args.seqlen_q * args.num_heads, kBlockM);
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
             }
-            case SchedulingAlgo::LINEARIZE_M_BATCH: {
+            case SchedulingAlgo::LINEARIZE_M_AND_BATCH: {
                 // rough worst case upper bound on the number of blocks required 
                 //  (assuming each batch has an additional partial block)
                 unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
@@ -373,7 +380,7 @@ public:
             switch (params.algo) {
                 case SchedulingAlgo::STANDARD:
                     return get_block_coord_standard(params);
-                case SchedulingAlgo::LINEARIZE_M_BATCH:
+                case SchedulingAlgo::LINEARIZE_M_AND_BATCH:
                     return get_block_coord_linear_m_batch(params);
             }
             return {0, 0, 0};  // Should never reach here

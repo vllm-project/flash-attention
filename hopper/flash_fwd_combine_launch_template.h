@@ -17,12 +17,12 @@
 
 using namespace cute;
 
-template <int Arch, int kBlockM, int kBlockK, int kLogMaxSplits, bool IsEvenK, bool Varlen, typename Element, typename ElementPartial>
+template <int Arch, int kBlockM, int kBlockK, int kLogMaxSplits, bool IsEvenK, bool Varlen, bool StreamK, typename Element, typename ElementPartial>
 void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl) {
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kBlockK>>;
     using CombineKernel = flash::FlashAttnFwdCombine<TileShape_MK, kLogMaxSplits, 256 /*kNThreads*/, 1 /*AlignmentLSE*/,
-                                                     IsEvenK, Varlen, Element, ElementPartial, ArchTag>;
+                                                     IsEvenK, Varlen, Element, ElementPartial, ArchTag, StreamK>;
 
     typename CombineKernel::Arguments args {
         static_cast<ElementPartial const*>(params.oaccum_ptr),
@@ -35,13 +35,20 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         {params.o_row_stride, _1{}, params.o_head_stride, !Varlen ? params.o_batch_stride : 0},  // stride_O
         static_cast<float*>(params.softmax_lse_ptr),
         {_1{}, !Varlen ? params.seqlen_q : params.total_q, !Varlen ? params.h * params.seqlen_q : 0},  // stride_LSE
-        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.tile_count_semaphore
+        params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.tile_count_semaphore,
+        params.combine_tiles_ptr, params.host_scheduler_metadata_ptr->m_block_size
     };
 
     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
     int num_blocks_k = cute::ceil_div(params.dv, kBlockK);
     int num_blocks_m = cute::ceil_div(params.seqlen_q * params.h, kBlockM);
     dim3 grid_m(num_blocks_m, num_blocks_k, params.b);
+
+    if constexpr(StreamK) {
+        grid_m.x = params.host_scheduler_metadata_ptr->num_combine_blocks;
+        grid_m.z = cute::ceil_div(params.host_scheduler_metadata_ptr->m_block_size, kBlockM);
+    }
+
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
@@ -60,21 +67,23 @@ void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool en
     static constexpr int kBlockM = kBlockK % 128 == 0 ? 8 : (kBlockK % 64 == 0 ? 16 : 32);
     ARCH_SWITCH(params.arch, Arch, [&] {
         BOOL_SWITCH(params.cu_seqlens_q || params.seqused_q, Varlen, [&] {
-            if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
-                if (params.num_splits <= 16) {
-                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream, enable_pdl);
-                    return;
+            BOOL_SWITCH(params.combine_tiles_ptr, StreamK, [&] {
+                if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
+                    if (params.num_splits <= 16) {
+                        run_flash_fwd_combine<Arch, kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, StreamK, T, Tpartial>(params, stream, enable_pdl);
+                        return;
+                    }
                 }
-            }
-            if (params.num_splits <= 32) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 5, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream, enable_pdl);
-            } else if (params.num_splits <= 64) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 6, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream, enable_pdl);
-            } else if (params.num_splits <= 128) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 7, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream, enable_pdl);
-            } else {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 8, false /*IsEvenK*/, Varlen, T, Tpartial>(params, stream, enable_pdl);
-            }
+                if (params.num_splits <= 32) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 5, false /*IsEvenK*/, Varlen, StreamK, T, Tpartial>(params, stream, enable_pdl);
+                } else if (params.num_splits <= 64) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 6, false /*IsEvenK*/, Varlen, StreamK, T, Tpartial>(params, stream, enable_pdl);
+                } else if (params.num_splits <= 128) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 7, false /*IsEvenK*/, Varlen, StreamK, T, Tpartial>(params, stream, enable_pdl);
+                } else {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 8, false /*IsEvenK*/, Varlen, StreamK, T, Tpartial>(params, stream, enable_pdl);
+                }
+            });
         });
     });
 }

@@ -49,13 +49,15 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         float const softcap,
         bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
+        std::optional<const at::Tensor> &device_scheduler_metadata_,
+        std::optional<const at::Tensor> &host_scheduler_metadata_,
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
-at::Tensor
+std::tuple<at::Tensor, at::Tensor>
 mha_fwd_get_scheduler_metadata(
         int batch_size,
         int max_seqlen_q,
@@ -116,6 +118,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    float    softcap,"
             "    bool     is_rotary_interleaved,"
             "    Tensor?  scheduler_metadata,"
+            "    Tensor?  device_scheduler_metadata,"
+            "    Tensor?  host_scheduler_metadata,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
             "    int      sm_margin) -> Tensor[]");
@@ -144,7 +148,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     has_softcap,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
-            "    int      sm_margin) -> Tensor");
+            "    int      sm_margin) -> (Tensor, Tensor)");
    ops.impl("get_scheduler_metadata", torch::kCUDA, 
         make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }

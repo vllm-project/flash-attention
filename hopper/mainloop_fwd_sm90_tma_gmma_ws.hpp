@@ -28,7 +28,7 @@ namespace flash {
 
 using namespace cute;
 
-template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
+template <typename SeqlenInfo_t_, int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
 struct CollectiveMainloopFwdSm90 {
@@ -69,8 +69,8 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
-    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
+    using SeqlenInfo_t = SeqlenInfo_t_;
+    using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(!LargeHeadDimV || kHeadDimV % 256 == 0);
     static_assert(!LargeHeadDimV || kBlockM <= 64, "kBlockM must be 64 or less for large Headdim_V");
@@ -387,15 +387,10 @@ struct CollectiveMainloopFwdSm90 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         int const window_size_left = -1, window_size_right = -1;
         float const softcap_val;
-        int const num_splits;
         int const* const kv_batch_idx = nullptr;
-        int const* const cu_seqlens_q = nullptr;
-        int const* const cu_seqlens_k = nullptr;
-        int const* const cu_seqlens_k_new = nullptr;
-        int const* const seqused_q = nullptr;
-        int const* const seqused_k = nullptr;
-        int const* const leftpad_k = nullptr;
-        int const* const seqlens_rotary = nullptr;
+        bool const is_varlen_knew = false;
+        bool const is_varlen_q = false;
+        bool const is_varlen_k = false;
     };
 
     // Device side kernel params
@@ -443,15 +438,10 @@ struct CollectiveMainloopFwdSm90 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
         int const window_size_left, window_size_right;
-        int const num_splits;
         int const* const kv_batch_idx = nullptr;
-        int const* const cu_seqlens_q = nullptr;
-        int const* const cu_seqlens_k = nullptr;
-        int const* const cu_seqlens_k_new = nullptr;
-        int const* const seqused_q = nullptr;
-        int const* const seqused_k = nullptr;
-        int const* const leftpad_k = nullptr;
-        int const *const seqlens_rotary = nullptr;
+        bool const is_varlen_knew = false;
+        bool const is_varlen_q = false;
+        bool const is_varlen_k = false;
     };
 
     static Params
@@ -557,10 +547,9 @@ struct CollectiveMainloopFwdSm90 {
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.window_size_left, args.window_size_right,
-                !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.is_varlen_knew, args.is_varlen_q, args.is_varlen_k
+            };
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -592,18 +581,17 @@ struct CollectiveMainloopFwdSm90 {
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          SeqlenInfo_t const& seqlen_info,
-         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+         BlockCoord<AppendKV> const& block_coord,
          int &work_idx
          ) {
 
         // some of these are captured in lambda so can't use structured binding
-        int const m_block = get<0>(block_coord);
-        int const bidh = get<1>(block_coord);
-        int const bidb = get<2>(block_coord);
-        int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        int const m_block = block_coord.m_block;
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const n_block_min = block_coord.n_block_min;
+        int const n_block_max = block_coord.n_block_max;
+
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -645,8 +633,8 @@ struct CollectiveMainloopFwdSm90 {
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
-        bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_q = Varlen && params.is_varlen_q;
+        bool const is_varlen_k = Varlen && params.is_varlen_k;
         Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
@@ -955,22 +943,20 @@ struct CollectiveMainloopFwdSm90 {
         int const thread_idx,
         int &work_idx,
         SeqlenInfo_t const& seqlen_info,
-        cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+        BlockCoord<AppendKV> const& block_coord,
         SharedStorage& shared_storage
         ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
-        // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int const m_block = get<0>(block_coord);
-        int const bidh = get<1>(block_coord);
-        int const bidb = get<2>(block_coord);
-        int const split_idx = get<3>(block_coord);
+        int const m_block = block_coord.m_block;
+        int const bidb = block_coord.bidb;
+        int const bidh = block_coord.bidh;
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        int const n_block_min = block_coord.n_block_min;
+        int const n_block_max = block_coord.n_block_max;
+
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1357,17 +1343,16 @@ struct CollectiveMainloopFwdSm90 {
            Softmax& softmax,
            int const thread_idx,
            SeqlenInfo_t const& seqlen_info,
-           cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+           BlockCoord<AppendKV> const& block_coord,
            SharedStorage& shared_storage
            ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        int const m_block = get<0>(block_coord);
-        int const bidb = get<2>(block_coord);
-        int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        int const m_block = block_coord.m_block;
+        int const bidb = block_coord.bidb;
+        int const n_block_min = block_coord.n_block_min;
+        int const n_block_max = block_coord.n_block_max;
+
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1446,14 +1431,14 @@ struct CollectiveMainloopFwdSm90 {
          PipelineState& smem_pipe_write,
          SharedStorage &shared_storage,
          SeqlenInfo_t const& seqlen_info,
-         cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+         BlockCoord<true> const& block_coord,
          int const work_idx
          ) {
-
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const n_block_new_min = block_coord.n_block_new_min;
+        int const n_block_new_max = block_coord.n_block_new_max;
+        bool const is_varlen_k_new = Varlen && params.is_varlen_knew;
 
         if (n_block_new_max <= n_block_new_min) { return false; }
 
@@ -1474,7 +1459,6 @@ struct CollectiveMainloopFwdSm90 {
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
-        bool const is_varlen_k_new = Varlen && params.cu_seqlens_k_new;
         Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
         auto shape_Vnew = make_shape(params.headdim_v, get<0>(params.shape_K_new), get<2>(params.shape_K_new), get<3>(params.shape_K_new));
         Tensor mVnewt_TMA = params.tma_load_V_new.get_tma_tensor(shape_Vnew)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
@@ -1550,12 +1534,13 @@ struct CollectiveMainloopFwdSm90 {
                  int const thread_idx,
                  SharedStorage &shared_storage,
                  SeqlenInfo_t const& seqlen_info,
-                 cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
+                 BlockCoord<true> const& block_coord
     ) {
-        auto [m_block, bidh, bidb, split_idx] = block_coord;
-        auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
-            seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+        int const bidh = block_coord.bidh;
+        int const bidb = block_coord.bidb;
+        int const n_block_new_min = block_coord.n_block_new_min;
+        int const n_block_new_max = block_coord.n_block_new_max;
+
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier
@@ -1572,7 +1557,7 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
 
-        bool const is_varlen_k = Varlen && params.cu_seqlens_k;
+        bool const is_varlen_k = Varlen && params.is_varlen_k;
         Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V), shape_V, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);

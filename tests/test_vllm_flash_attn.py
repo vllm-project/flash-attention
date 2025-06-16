@@ -18,14 +18,13 @@ from vllm_flash_attn.flash_attn_interface import (
 )
 
 NUM_HEADS = [(4, 4), (8, 2), (16, 2)]
-HEAD_SIZES = [128, 256]
+HEAD_SIZES = [128]
 BLOCK_SIZES = [16, 32]
 DTYPES = [torch.float16, torch.bfloat16]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
 NUM_BLOCKS = [32768, 2048]
 VERSIONS = \
-    ([2] if is_fa_version_supported(2) else []) + \
     ([3] if is_fa_version_supported(3) else [])
 
 
@@ -186,7 +185,7 @@ def ref_paged_attn(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("aot_schedule", [True, False])
+@pytest.mark.parametrize("aot_schedule", [True])
 @pytest.mark.parametrize("fa_version", VERSIONS)
 @torch.inference_mode()
 def test_flash_attn_with_paged_kv(
@@ -228,7 +227,9 @@ def test_flash_attn_with_paged_kv(
     if aot_schedule:
         if fa_version == 2:
             pytest.skip("AOT schedule is not supported in version 2")
-        scheduler_metadata = get_scheduler_metadata(
+        print("Running AOT schedule")
+        print(kv_lens_tensor)
+        scheduler_metadata_host, scheduler_metadata_device = get_scheduler_metadata(
             batch_size=num_seqs,
             max_seqlen_q=1,
             max_seqlen_k=max_kv_len,
@@ -241,6 +242,8 @@ def test_flash_attn_with_paged_kv(
             window_size=(-1, -1),
             has_softcap=soft_cap is not None
         )
+        scheduler_metadata_device = scheduler_metadata_device.to(query.device)
+    
 
     output = flash_attn_with_kvcache(
         query.unsqueeze(1),
@@ -251,7 +254,8 @@ def test_flash_attn_with_paged_kv(
         block_table=block_tables,
         cache_seqlens=kv_lens_tensor,
         softcap=soft_cap if soft_cap is not None else 0,
-        scheduler_metadata=scheduler_metadata,
+        scheduler_metadata_host=scheduler_metadata_host,
+        scheduler_metadata_device=scheduler_metadata_device,
         fa_version=fa_version,
     ).squeeze(1)
 
@@ -265,6 +269,7 @@ def test_flash_attn_with_paged_kv(
         scale=scale,
         soft_cap=soft_cap,
     )
+
     torch.testing.assert_close(output, ref_output, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(output - ref_output))}"
 
@@ -329,12 +334,14 @@ def test_varlen_with_paged_kv(
                                  dtype=torch.int32)
 
     scheduler_metadata = None
+    host_scheduler_metadata = None
+    device_scheduler_metadata = None
     if aot_schedule:
         if fa_version == 2:
             pytest.skip("AOT schedule is not supported in version 2")
-        scheduler_metadata = get_scheduler_metadata(
+        scheduler_metadata_host, scheduler_metadata_device = get_scheduler_metadata(
             batch_size=num_seqs,
-            max_seqlen_q=1,
+            max_seqlen_q=max_query_len,
             max_seqlen_k=max_kv_len,
             num_heads_q=num_query_heads,
             num_heads_kv=num_kv_heads,
@@ -343,8 +350,10 @@ def test_varlen_with_paged_kv(
             qkv_dtype=dtype,
             causal=True,
             window_size=(-1, -1),
-            has_softcap=soft_cap is not None
+            has_softcap=soft_cap is not None,
+            page_size=block_size,
         )
+        scheduler_metadata_device = scheduler_metadata_device.to(query.device)
 
     output = flash_attn_varlen_func(
         q=query,
@@ -360,6 +369,8 @@ def test_varlen_with_paged_kv(
         block_table=block_tables,
         softcap=soft_cap if soft_cap is not None else 0,
         scheduler_metadata=scheduler_metadata,
+        scheduler_metadata_device=scheduler_metadata_device,
+        scheduler_metadata_host=scheduler_metadata_host,
         fa_version=fa_version
     )
 

@@ -397,7 +397,8 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
 }
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
-    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
+    // disable for local since we move k_ptr to start of sliding window by m_block
+    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
     // This needs to match the kernel configs
     auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
@@ -581,7 +582,8 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    bool const use_dynamic_split = params.b <= 992;
+    // disable dynamic split if given explicit instructions to not split
+    bool const use_dynamic_split = params.b <= 992 && num_splits != 1;
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
@@ -936,7 +938,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     // 992 = 32 * 31 is the max supported batch in prepare_varlen_num_blocks kernel
-    bool const use_dynamic_split = is_varlen && params.b <= 992;
+    bool const use_dynamic_split = is_varlen && params.b <= 992 && num_splits != 1;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 

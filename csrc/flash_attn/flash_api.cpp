@@ -533,7 +533,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               std::optional<at::Tensor> s_aux) {  // Added new parameter
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -767,6 +768,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
         softmax_lse = softmax_lse.reshape(lse_size_before).transpose(1, 2).reshape(lse_size_after);
     }
+
+    params.s_aux_ptr = s_aux.has_value() ? s_aux.value().data_ptr() : nullptr;
 
     return {out, softmax_lse};
 }

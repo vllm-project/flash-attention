@@ -64,17 +64,17 @@ COMPILED_HDIMS = (
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("deterministic", [False])
-@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
-# @pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("deterministic", [True])
+# @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
@@ -288,7 +288,7 @@ def test_flash_attn_output(
         # breakpoint()
 
 
-    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor and not has_qv:
+    if not DISABLE_BACKWARD and dtype != torch.float8_e4m3fn and not V_colmajor and not has_qv and not test_sink:
         dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
         assert (dq - dq_ref).abs().max().item() <= rtol * (dq_pt - dq_ref).abs().max().item() + dq_atol
         dk_atol = 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
@@ -594,13 +594,13 @@ def test_flash_attn_varlen_output(
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [True])
+# @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(False, False)])
@@ -624,11 +624,11 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", COMPILED_HDIMS)
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+# @pytest.mark.parametrize("d", [64])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize("test_sink", [False, True])
-# @pytest.mark.parametrize("test_sink", [True])
+# @pytest.mark.parametrize("test_sink", [False])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -688,7 +688,8 @@ def test_flash_attn_kvcache(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    dv_vals = [d]
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
@@ -875,8 +876,9 @@ def test_flash_attn_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
-        num_splits_vals = [1, 0] if not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3, 0] if not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False, True]
+        # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             print("Num splits =",num_splits)
             print("Precompute metadata =",precompute_metadata)

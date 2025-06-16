@@ -545,6 +545,7 @@ struct CollectiveMainloopFwdSm90 {
         if (!PagedKVNonTMA && args.ptr_pagetable != nullptr) {
             assert(page_size % kBlockN == 0);
             assert(!args.leftpad_k);
+            assert(!Is_local); // Since we now use leftpad_k with local, we can't use TMA with PagedKV
         }
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
@@ -612,7 +613,11 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        // Update seqlen_info using n_offset:
+        // leftpad_k -> leftpad_k + n_offset
+        // offset_k -> offset_k + n_offset
+        // seqlen_k -> seqlen_k - n_offset
+        auto [n_block_min, n_block_max, n_offset] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
@@ -665,8 +670,9 @@ struct CollectiveMainloopFwdSm90 {
 
         Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
-        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
+        // Now add n_offset to update KV gmem pointers
+        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+        Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
         auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
         Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
@@ -701,7 +707,7 @@ struct CollectiveMainloopFwdSm90 {
             params.ptr_K, params.shape_K, params.stride_K,
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod, params.blockN_per_page_size_divmod,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k, bidb_kv_idx
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k - n_offset, seqlen_info.leftpad_k + n_offset, bidb_kv_idx
         );
 
         // Set up for transposing V, only used if Transpose_V
@@ -979,7 +985,7 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        auto [n_block_min, n_block_max, n_offset] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
@@ -1060,11 +1066,14 @@ struct CollectiveMainloopFwdSm90 {
         };
 
         int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k;
+        // Compute actual seqlen_k for this mma worktile
+        int const seqlen_k = seqlen_info.seqlen_k - n_offset;
         int n_block = n_block_max - 1;
 
+        // NOTE: sink_token_length is dead code
+        // But we subtract n_offset for consistency in mask calculations
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
-            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 - n_offset /*sink_token_length*/,
             params.qhead_per_khead_divmod
         );
 
@@ -1246,6 +1255,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
+                // If local, blocking (window_size_right + window_size_left)
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
@@ -1255,6 +1265,7 @@ struct CollectiveMainloopFwdSm90 {
             }
 
             int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+            // If local, blocking (m_idx_max - m_idx_min)
             int const n_block_min_before_local_mask = !Is_local
                 ? n_block_min
                 : std::max(n_block_min,
@@ -1350,6 +1361,7 @@ struct CollectiveMainloopFwdSm90 {
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
+                // If local, blocking (window_size_right + window_size_left)
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
                 #pragma unroll 1
@@ -1358,6 +1370,7 @@ struct CollectiveMainloopFwdSm90 {
                 }
             }
             int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+            // If local, blocking (m_idx_max - m_idx_min)
             int const n_block_min_before_local_mask = !Is_local
                 ? n_block_min
                 : std::max(n_block_min,
@@ -1413,7 +1426,7 @@ struct CollectiveMainloopFwdSm90 {
         int const m_block = get<0>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
+        auto [n_block_min, n_block_max, n_offset] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier

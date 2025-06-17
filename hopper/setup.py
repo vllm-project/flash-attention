@@ -64,6 +64,26 @@ DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
+DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TRUE"
+
+# DISABLE_BACKWARD = True
+# DISABLE_SPLIT = True
+# DISABLE_PAGEDKV = True
+# DISABLE_APPENDKV = True
+# DISABLE_LOCAL = True
+# DISABLE_SOFTCAP = True
+# DISABLE_PACKGQA = True
+# DISABLE_FP16 = True
+# DISABLE_FP8 = True
+# DISABLE_VARLEN = True
+# DISABLE_CLUSTER = True
+# DISABLE_HDIM96 = True
+# DISABLE_HDIM128 = True
+# DISABLE_HDIM192 = True
+# DISABLE_HDIM256 = True
+DISABLE_SM8x = True
+
+DISABLE_HDIMDIFF = True
 
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
@@ -467,6 +487,8 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF"] if DISABLE_HDIMDIFF else [])
+        
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -480,7 +502,11 @@ if not SKIP_CUDA_BUILD:
         + ([192] if not DISABLE_HDIM192 else [])
         + ([256] if not DISABLE_HDIM256 else [])
     )
-    HEAD_DIMENSIONS_FWD = ["all", "diff"]
+    # HEAD_DIMENSIONS_FWD = ["all", "diff"]
+    HEAD_DIMENSIONS_FWD = (
+        ["all"]
+        + (["diff"] if not DISABLE_HDIMDIFF else [])
+    )
     HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
     PAGEDKV = [""] + (["_paged"] if not DISABLE_PAGEDKV else [])
@@ -512,13 +538,13 @@ if not SKIP_CUDA_BUILD:
     nvcc_flags = [
         "-O3",
         "-std=c++17",
-        "--ftemplate-backtrace-limit=0",  # To debug template code
+        # "--ftemplate-backtrace-limit=0",  # To debug template code
         "--use_fast_math",
         # "--keep",
         # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
         "--resource-usage",  # printing out number of registers
         # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
-        "-lineinfo",  # TODO: disable this for release to reduce binary size
+        # "-lineinfo",  # TODO: disable this for release to reduce binary size
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging

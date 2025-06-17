@@ -680,7 +680,14 @@ struct CollectiveMainloopFwdSm90 {
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
 
-        Tensor gQ = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
+        Tensor gQ = local_tile(
+            domain_offset(
+                cute::conditional_return<!PackGQA>(
+                    make_coord(seqlen_info.offset_q, _0{}),
+                    make_coord(make_coord(_0{}, seqlen_info.offset_q), _0{})),
+                mQ),
+            select<0, 2>(TileShape_MNK{}),
+            make_coord(m_block, _0{}));  // (M, K)
         // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
         // Now add n_offset to update KV gmem pointers
         Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)

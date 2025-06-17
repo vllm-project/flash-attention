@@ -73,15 +73,15 @@ DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TR
 # DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
-DISABLE_FP16 = True
-DISABLE_FP8 = True
+# DISABLE_FP16 = True
+# DISABLE_FP8 = True
 # DISABLE_VARLEN = True
 DISABLE_CLUSTER = True
 # DISABLE_HDIM64 = True
-DISABLE_HDIM96 = True
-DISABLE_HDIM128 = True
-DISABLE_HDIM192 = True
-DISABLE_HDIM256 = True
+# DISABLE_HDIM96 = True
+# DISABLE_HDIM128 = True
+# DISABLE_HDIM192 = True
+# DISABLE_HDIM256 = True
 DISABLE_SM8x = True
 
 DISABLE_HDIMDIFF = True
@@ -504,8 +504,17 @@ if not SKIP_CUDA_BUILD:
         + ([256] if not DISABLE_HDIM256 else [])
     )
     # HEAD_DIMENSIONS_FWD = ["all", "diff"]
+    # HEAD_DIMENSIONS_FWD = (
+    #     ["all"]
+    #     + (["diff"] if not DISABLE_HDIMDIFF else [])
+    # )
     HEAD_DIMENSIONS_FWD = (
-        ["all"]
+        []
+        + ([64] if not DISABLE_HDIM64 else [])
+        + ([96] if not DISABLE_HDIM96 else [])
+        + ([128] if not DISABLE_HDIM128 else [])
+        + ([192] if not DISABLE_HDIM192 else [])
+        + ([256] if not DISABLE_HDIM256 else [])
         + (["diff"] if not DISABLE_HDIMDIFF else [])
     )
     HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD

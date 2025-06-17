@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, class ElementSAux_, int kBlockH_=1>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -51,10 +51,11 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool AppendKV = AppendKV_;
     static constexpr bool HasQv = HasQv_;
     static constexpr bool PackGQA = PackGQA_;
+    static constexpr bool PackGQA_TMA = PackGQA && kBlockH_ > 1;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
-    static constexpr bool Use_TMA_Q = !PackGQA;
+    static constexpr bool Use_TMA_Q = !PackGQA || PackGQA_TMA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
     static_assert(Use_TMA_KV || !V_colmajor, "If not using TMA for KV, V_colmajor is not supported");
@@ -69,6 +70,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+    static constexpr int kBlockH = kBlockH_;
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
@@ -241,7 +243,12 @@ struct CollectiveMainloopFwdSm90 {
     using StrideQK = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using StrideV = std::conditional_t<!V_colmajor, StrideQK, cute::Stride<_1, int64_t, int64_t, int64_t>>;
     // ((qhead_per_khead, seqlen_q), d, nheads_kv, batch, num_splits)
-    using ShapeQPacked = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
+    // using ShapeQPacked = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
+    using ShapeQPackedTMA = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<Int<kBlockH>, int32_t>, int32_t, int32_t, int32_t>>;
+    using ShapeQPacked = std::conditional_t<PackGQA && !PackGQA_TMA,
+        cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>,
+        ShapeQPackedTMA>;
+    using ShapeQvPacked = std::conditional_t<!PackGQA, ShapeQKV, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
     using StrideQPacked = std::conditional_t<!PackGQA, StrideQK, cute::Stride<cute::Stride<int64_t, int64_t>, _1, int64_t, int64_t>>;
     using ShapePageTable = cute::Shape<int32_t, int32_t>;  // (batch, max_num_pages_per_seq)
     using StridePageTable = cute::Stride<int64_t, _1>;
@@ -251,7 +258,7 @@ struct CollectiveMainloopFwdSm90 {
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
-        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQPackedTMA{}, StrideQPacked{}),
         SmemLayoutQ{},
         TileShape_MNK{},
         ClusterShape{}));
@@ -427,7 +434,7 @@ struct CollectiveMainloopFwdSm90 {
         StrideV const stride_V_new;
         Element const* const ptr_Qv;
         StrideV const stride_Qv;
-        ShapeQPacked const shape_Qv_packed;
+        ShapeQvPacked const shape_Qv_packed;
         StrideQPacked const stride_Qv_packed;
         Element const* const ptr_rotary_cos;
         ShapeRotary const shape_rotary;
@@ -466,7 +473,21 @@ struct CollectiveMainloopFwdSm90 {
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), args.shape_Q, args.stride_Q);
+        // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
+        int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
+        auto const shape_Q_packed_tma = cute::conditional_return<!PackGQA>(
+            args.shape_Q,
+            make_shape(make_shape(Int<kBlockH>{}, get<0>(args.shape_Q)), get<1>(args.shape_Q), get<2>(args.shape_K), get<3>(args.shape_Q))
+        );
+        auto const shape_Q_packed = cute::conditional_return<PackGQA && !PackGQA_TMA>(
+            make_shape(make_shape(qhead_per_khead, get<0>(args.shape_Q)), get<1>(args.shape_Q), get<2>(args.shape_K), get<3>(args.shape_Q)),
+            shape_Q_packed_tma
+        );
+        auto const stride_Q_packed = cute::conditional_return<!PackGQA>(
+            args.stride_Q,
+            make_stride(make_stride(get<2>(args.stride_Q), get<0>(args.stride_Q)), get<1>(args.stride_Q), get<2>(args.stride_Q) * qhead_per_khead, get<3>(args.stride_Q))
+        );
+        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_packed_tma, stride_Q_packed);
         TMA_Q tma_load_Q = make_tma_copy_A_sm90(
             GmemTiledCopyQ{},
             mQ,
@@ -519,16 +540,7 @@ struct CollectiveMainloopFwdSm90 {
                 return nullptr;
             }
         }();
-        // If PackGQA, reshape Q to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size)
-        int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_Q), get<2>(args.shape_K));
-        auto const shape_Q_packed = cute::conditional_return<!PackGQA>(
-            args.shape_Q,
-            make_shape(make_shape(qhead_per_khead, get<0>(args.shape_Q)), get<1>(args.shape_Q), get<2>(args.shape_K), get<3>(args.shape_Q))
-        );
-        auto const stride_Q_packed = cute::conditional_return<!PackGQA>(
-            args.stride_Q,
-            make_stride(make_stride(get<2>(args.stride_Q), get<0>(args.stride_Q)), get<1>(args.stride_Q), get<2>(args.stride_Q) * qhead_per_khead, get<3>(args.stride_Q))
-        );
+        
         auto const shape_Qv_packed = cute::conditional_return<!PackGQA>(
             shape_Qv,
             make_shape(make_shape(qhead_per_khead, get<0>(shape_Qv)), get<1>(shape_Qv), get<2>(args.shape_K), get<3>(shape_Qv))
@@ -663,7 +675,7 @@ struct CollectiveMainloopFwdSm90 {
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);

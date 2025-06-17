@@ -71,12 +71,12 @@ DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TR
 # DISABLE_PAGEDKV = True
 # DISABLE_APPENDKV = True
 # DISABLE_LOCAL = True
-# DISABLE_SOFTCAP = True
+DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
-# DISABLE_FP16 = True
-# DISABLE_FP8 = True
+DISABLE_FP16 = True
+DISABLE_FP8 = True
 # DISABLE_VARLEN = True
-# DISABLE_CLUSTER = True
+DISABLE_CLUSTER = True
 # DISABLE_HDIM96 = True
 # DISABLE_HDIM128 = True
 # DISABLE_HDIM192 = True
@@ -538,13 +538,13 @@ if not SKIP_CUDA_BUILD:
     nvcc_flags = [
         "-O3",
         "-std=c++17",
-        # "--ftemplate-backtrace-limit=0",  # To debug template code
+        "--ftemplate-backtrace-limit=0",  # To debug template code
         "--use_fast_math",
         # "--keep",
         # "--ptxas-options=--verbose,--register-usage-level=5,--warn-on-local-memory-usage",  # printing out number of registers
         "--resource-usage",  # printing out number of registers
         # f"--split-compile={os.getenv('NVCC_THREADS', '4')}",  # split-compile is faster
-        # "-lineinfo",  # TODO: disable this for release to reduce binary size
+        "-lineinfo",  # TODO: disable this for release to reduce binary size
         "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",  # Necessary for the WGMMA shapes that we use
         "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging

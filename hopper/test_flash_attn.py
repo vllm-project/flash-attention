@@ -37,21 +37,22 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TRUE"
 
-DISABLE_BACKWARD = True
+# DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
 # DISABLE_PAGEDKV = True
 # DISABLE_APPENDKV = True
 # DISABLE_LOCAL = True
 DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
-DISABLE_FP16 = True
-DISABLE_FP8 = True
+# DISABLE_FP16 = True
+# DISABLE_FP8 = True
 # DISABLE_HDIM64 = True
-DISABLE_HDIM96 = True
-DISABLE_HDIM128 = True
-DISABLE_HDIM192 = True
-DISABLE_HDIM256 = True
+# DISABLE_HDIM96 = True
+# DISABLE_HDIM128 = True
+# DISABLE_HDIM192 = True
+# DISABLE_HDIM256 = True
 DISABLE_HDIMDIFF = True
 
 COMPILED_HDIMS = (
@@ -65,12 +66,12 @@ COMPILED_HDIMS = (
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []) + ([torch.float8_e4m3fn] if not DISABLE_FP8 else []))
+# @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mqa"])
-# @pytest.mark.parametrize("has_qv", [False, True])
+# @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF else []))
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [True])
@@ -304,7 +305,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_qv", [False, True])
+# @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF else []))
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])

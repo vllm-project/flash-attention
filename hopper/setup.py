@@ -24,11 +24,9 @@ from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 import torch
 from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
-
 # with open("../README.md", "r", encoding="utf-8") as fh:
 with open("../README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
-
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -40,49 +38,61 @@ BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
-SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD",
+                            "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
-FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI",
+                            "FALSE") == "TRUE"
 
-DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD",
+                             "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV", "FALSE") == "TRUE"
-DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV", "FALSE") == "TRUE"
+DISABLE_PAGEDKV = os.getenv("FLASH_ATTENTION_DISABLE_PAGEDKV",
+                            "FALSE") == "TRUE"
+DISABLE_APPENDKV = os.getenv("FLASH_ATTENTION_DISABLE_APPENDKV",
+                             "FALSE") == "TRUE"
 DISABLE_LOCAL = os.getenv("FLASH_ATTENTION_DISABLE_LOCAL", "FALSE") == "TRUE"
-DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP", "FALSE") == "TRUE"
-DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA", "FALSE") == "TRUE"
+DISABLE_SOFTCAP = os.getenv("FLASH_ATTENTION_DISABLE_SOFTCAP",
+                            "FALSE") == "TRUE"
+DISABLE_PACKGQA = os.getenv("FLASH_ATTENTION_DISABLE_PACKGQA",
+                            "FALSE") == "TRUE"
 DISABLE_FP16 = os.getenv("FLASH_ATTENTION_DISABLE_FP16", "FALSE") == "TRUE"
 DISABLE_FP8 = os.getenv("FLASH_ATTENTION_DISABLE_FP8", "FALSE") == "TRUE"
 DISABLE_VARLEN = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE") == "TRUE"
-DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER", "FALSE") == "TRUE"
+DISABLE_CLUSTER = os.getenv("FLASH_ATTENTION_DISABLE_CLUSTER",
+                            "FALSE") == "TRUE"
 DISABLE_HDIM64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM64", "FALSE") == "TRUE"
 DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
-DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
-DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
-DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128",
+                            "FALSE") == "TRUE"
+DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192",
+                            "FALSE") == "TRUE"
+DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256",
+                            "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
-ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
+ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR",
+                             "FALSE") == "TRUE"
 
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
-# DISABLE_BACKWARD = True
+DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
 # DISABLE_PAGEDKV = True
-# DISABLE_APPENDKV = True
+DISABLE_APPENDKV = True
 # DISABLE_LOCAL = True
 # DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
-# DISABLE_FP16 = True
-# DISABLE_FP8 = True
+DISABLE_FP16 = True
+DISABLE_FP8 = True
 # DISABLE_VARLEN = True
 # DISABLE_CLUSTER = True
 # DISABLE_HDIM64 = True
-# DISABLE_HDIM96 = True
-# DISABLE_HDIM128 = True
-# DISABLE_HDIM192 = True
-# DISABLE_HDIM256 = True
+DISABLE_HDIM96 = True
+DISABLE_HDIM128 = True
+DISABLE_HDIM192 = True
+DISABLE_HDIM256 = True
 DISABLE_SM8x = True
 
 DISABLE_HDIMDIFF64 = True
@@ -103,19 +113,22 @@ from torch.utils.cpp_extension import (
     _maybe_write,
 )
 
-def _write_ninja_file(path,
-                      cflags,
-                      post_cflags,
-                      cuda_cflags,
-                      cuda_post_cflags,
-                      cuda_dlink_post_cflags,
-                      sources,
-                      objects,
-                      ldflags,
-                      library_target,
-                      with_cuda,
-                      **kwargs,  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension
-                      ) -> None:
+
+def _write_ninja_file(
+    path,
+    cflags,
+    post_cflags,
+    cuda_cflags,
+    cuda_post_cflags,
+    cuda_dlink_post_cflags,
+    sources,
+    objects,
+    ldflags,
+    library_target,
+    with_cuda,
+    **
+    kwargs,  # kwargs (ignored) to absorb new flags in torch.utils.cpp_extension
+) -> None:
     r"""Write a ninja file that does the desired compiling and linking.
 
     `path`: Where to write this file
@@ -130,6 +143,7 @@ def _write_ninja_file(path,
                       we do no linking.
     `with_cuda`: If we should be compiling with CUDA.
     """
+
     def sanitize_flags(flags):
         if flags is None:
             return []
@@ -158,7 +172,9 @@ def _write_ninja_file(path,
         else:
             nvcc = _join_cuda_home('bin', 'nvcc')
         if "PYTORCH_NVCC" in os.environ:
-            nvcc_from_env = os.getenv("PYTORCH_NVCC")    # user can set nvcc compiler with ccache using the environment variable here
+            nvcc_from_env = os.getenv(
+                "PYTORCH_NVCC"
+            )  # user can set nvcc compiler with ccache using the environment variable here
         else:
             nvcc_from_env = nvcc
         config.append(f'nvcc_from_env = {nvcc_from_env}')
@@ -171,13 +187,26 @@ def _write_ninja_file(path,
     if with_cuda:
         flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
-        cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
-        flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
-        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
-        flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
-        cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
-        flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
-    flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
+        cuda_post_cflags_sm80 = [
+            s if s != 'arch=compute_90a,code=sm_90a' else
+            'arch=compute_80,code=sm_80' for s in cuda_post_cflags
+        ]
+        flags.append(
+            f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
+        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + [
+            '-gencode', 'arch=compute_80,code=sm_80'
+        ]
+        flags.append(
+            f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}'
+        )
+        cuda_post_cflags_sm100 = [
+            s if s != 'arch=compute_90a,code=sm_90a' else
+            'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags
+        ]
+        flags.append(
+            f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
+    flags.append(
+        f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
     flags.append(f'ldflags = {" ".join(ldflags)}')
 
     # Turn into absolute paths so we can emit them into the ninja build
@@ -192,7 +221,8 @@ def _write_ninja_file(path,
         compile_rule.append('  deps = msvc')
     else:
         compile_rule.append(
-            '  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags')
+            '  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags'
+        )
         compile_rule.append('  depfile = $out.d')
         compile_rule.append('  deps = gcc')
 
@@ -201,24 +231,32 @@ def _write_ninja_file(path,
         nvcc_gendeps = ''
         # --generate-dependencies-with-compile is not supported by ROCm
         # Nvcc flag `--generate-dependencies-with-compile` is not supported by sccache, which may increase build time.
-        if torch.version.cuda is not None and os.getenv('TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES', '0') != '1':
+        if torch.version.cuda is not None and os.getenv(
+                'TORCH_EXTENSION_SKIP_NVCC_GEN_DEPENDENCIES', '0') != '1':
             cuda_compile_rule.append('  depfile = $out.d')
             cuda_compile_rule.append('  deps = gcc')
             # Note: non-system deps with nvcc are only supported
             # on Linux so use --generate-dependencies-with-compile
             # to make this work on Windows too.
             nvcc_gendeps = '--generate-dependencies-with-compile --dependency-output $out.d'
-        cuda_compile_rule_sm80 = ['rule cuda_compile_sm80'] + cuda_compile_rule[1:] + [
+        cuda_compile_rule_sm80 = [
+            'rule cuda_compile_sm80'
+        ] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80'
         ]
-        cuda_compile_rule_sm80_sm90 = ['rule cuda_compile_sm80_sm90'] + cuda_compile_rule[1:] + [
+        cuda_compile_rule_sm80_sm90 = [
+            'rule cuda_compile_sm80_sm90'
+        ] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm80_sm90'
         ]
-        cuda_compile_rule_sm100 = ['rule cuda_compile_sm100'] + cuda_compile_rule[1:] + [
+        cuda_compile_rule_sm100 = [
+            'rule cuda_compile_sm100'
+        ] + cuda_compile_rule[1:] + [
             f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags_sm100'
         ]
         cuda_compile_rule.append(
-            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags')
+            f'  command = $nvcc_from_env {nvcc_gendeps} $cuda_cflags -c $in -o $out $cuda_post_cflags'
+        )
 
     # Emit one build rule per source to enable incremental build.
     build = []
@@ -245,7 +283,8 @@ def _write_ninja_file(path,
     if cuda_dlink_post_cflags:
         devlink_out = os.path.join(os.path.dirname(objects[0]), 'dlink.o')
         devlink_rule = ['rule cuda_devlink']
-        devlink_rule.append('  command = $nvcc $in -o $out $cuda_dlink_post_cflags')
+        devlink_rule.append(
+            '  command = $nvcc $in -o $out $cuda_dlink_post_cflags')
         devlink = [f'build {devlink_out}: cuda_devlink {" ".join(objects)}']
         objects += [devlink_out]
     else:
@@ -254,13 +293,15 @@ def _write_ninja_file(path,
     if library_target is not None:
         link_rule = ['rule link']
         if IS_WINDOWS:
-            cl_paths = subprocess.check_output(['where',
-                                                'cl']).decode(*SUBPROCESS_DECODE_ARGS).split('\r\n')
+            cl_paths = subprocess.check_output(
+                ['where', 'cl']).decode(*SUBPROCESS_DECODE_ARGS).split('\r\n')
             if len(cl_paths) >= 1:
                 cl_path = os.path.dirname(cl_paths[0]).replace(':', '$:')
             else:
                 raise RuntimeError("MSVC is required to load C++ extensions")
-            link_rule.append(f'  command = "{cl_path}/link.exe" $in /nologo $ldflags /out:$out')
+            link_rule.append(
+                f'  command = "{cl_path}/link.exe" $in /nologo $ldflags /out:$out'
+            )
         else:
             link_rule.append('  command = $cxx $in $ldflags -o $out')
 
@@ -274,9 +315,12 @@ def _write_ninja_file(path,
     blocks = [config, flags, compile_rule]
     if with_cuda:
         blocks.append(cuda_compile_rule)  # type: ignore[possibly-undefined]
-        blocks.append(cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
-        blocks.append(cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
-        blocks.append(cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
+        blocks.append(
+            cuda_compile_rule_sm80)  # type: ignore[possibly-undefined]
+        blocks.append(
+            cuda_compile_rule_sm80_sm90)  # type: ignore[possibly-undefined]
+        blocks.append(
+            cuda_compile_rule_sm100)  # type: ignore[possibly-undefined]
     blocks += [devlink_rule, link_rule, build, devlink, link, default]
     content = "\n\n".join("\n".join(b) for b in blocks)
     # Ninja requires a new lines at the end of the .ninja file
@@ -304,7 +348,8 @@ def get_platform():
 
 
 def get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"],
+                                         universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1
     bare_metal_version = parse(output[release_idx].split(",")[0])
@@ -320,8 +365,7 @@ def check_if_cuda_home_none(global_option: str) -> None:
     warnings.warn(
         f"{global_option} was requested, but nvcc was not found.  Are you sure your environment has nvcc available?  "
         "If you're installing within a container from https://hub.docker.com/r/pytorch/pytorch, "
-        "only images whose names contain 'devel' will provide nvcc."
-    )
+        "only images whose names contain 'devel' will provide nvcc.")
 
 
 # Taken from https://github.com/pytorch/pytorch/blob/master/tools/setup_helpers/env.py
@@ -350,7 +394,8 @@ def is_offline_build() -> bool:
 def get_flashattn_cache_path():
     user_home = os.getenv("FLASH_ATTENTION_HOME")
     if not user_home:
-        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv("HOMEPATH") or None
+        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or os.getenv(
+            "HOMEPATH") or None
     if not user_home:
         raise RuntimeError("Could not find user home directory")
     return os.path.join(user_home, ".flashattn")
@@ -377,8 +422,10 @@ def download_and_copy(name, src_func, dst_path, version, url_func):
     supported = {"Linux": "linux", "Darwin": "linux"}
     url = url_func(supported[system], arch, version)
     src_path = src_func(supported[system], arch, version)
-    tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
-    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    tmp_path = os.path.join(flashattn_cache_path, "nvidia",
+                            name)  # path to cache the download
+    dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia",
+                            "backend", dst_path)  # final binary path
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if download:
@@ -402,7 +449,6 @@ def nvcc_threads_args():
 NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.93"}
 exe_extension = sysconfig.get_config_var("EXE")
 
-
 cmdclass = {}
 ext_modules = []
 
@@ -418,7 +464,8 @@ if not SKIP_CUDA_BUILD:
     check_if_cuda_home_none(PACKAGE_NAME)
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
-        raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
+        raise RuntimeError(
+            "FlashAttention-3 is only supported on CUDA 12.3 and above")
 
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
@@ -426,7 +473,8 @@ if not SKIP_CUDA_BUILD:
     if bare_metal_version != Version("12.8"):
         download_and_copy(
             name="nvcc",
-            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
+            src_func=lambda system, arch, version:
+            f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",
             dst_path="bin",
             version=NVIDIA_TOOLCHAIN_VERSION["nvcc"],
             url_func=lambda system, arch, version:
@@ -434,7 +482,8 @@ if not SKIP_CUDA_BUILD:
         )
         download_and_copy(
             name="ptxas",
-            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas",
+            src_func=lambda system, arch, version:
+            f"cuda_nvcc-{system}-{arch}-{version}-archive/bin/ptxas",
             dst_path="bin",
             version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
             url_func=lambda system, arch, version:
@@ -442,14 +491,16 @@ if not SKIP_CUDA_BUILD:
         )
         download_and_copy(
             name="ptxas",
-            src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
+            src_func=lambda system, arch, version:
+            f"cuda_nvcc-{system}-{arch}-{version}-archive/nvvm/bin",
             dst_path="nvvm/bin",
             version=NVIDIA_TOOLCHAIN_VERSION["ptxas"],
             url_func=lambda system, arch, version:
             f"https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/{system}-{arch}/cuda_nvcc-{system}-{arch}-{version}-archive.tar.xz",
         )
         base_dir = os.path.dirname(__file__)
-        ctk_path_new = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", "bin")
+        ctk_path_new = os.path.join(base_dir, os.pardir, "third_party",
+                                    "nvidia", "backend", "bin")
         nvcc_path_new = os.path.join(ctk_path_new, f"nvcc{exe_extension}")
         # Need to append to path otherwise nvcc can't find cicc in nvvm/bin/cicc
         # nvcc 12.8 seems to hard-code looking for cicc in ../nvvm/bin/cicc
@@ -498,14 +549,11 @@ if not SKIP_CUDA_BUILD:
     DTYPE_FWD_SM90 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else []) + (["e4m3"] if not DISABLE_FP8 else [])
     HALF_DTYPE_FWD_SM90 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
     DTYPE_BWD = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
-    HEAD_DIMENSIONS_BWD = (
-        []
-        + ([64] if not DISABLE_HDIM64 else [])
-        + ([96] if not DISABLE_HDIM96 else [])
-        + ([128] if not DISABLE_HDIM128 else [])
-        + ([192] if not DISABLE_HDIM192 else [])
-        + ([256] if not DISABLE_HDIM256 else [])
-    )
+    HEAD_DIMENSIONS_BWD = ([] + ([64] if not DISABLE_HDIM64 else []) +
+                           ([96] if not DISABLE_HDIM96 else []) +
+                           ([128] if not DISABLE_HDIM128 else []) +
+                           ([192] if not DISABLE_HDIM192 else []) +
+                           ([256] if not DISABLE_HDIM256 else []))
     # HEAD_DIMENSIONS_FWD = ["all", "diff"]
     # HEAD_DIMENSIONS_FWD = (
     #     ["all"]
@@ -535,8 +583,12 @@ if not SKIP_CUDA_BUILD:
     SOFTCAP_ALL = [""] if DISABLE_SOFTCAP else ["_softcapall"]
     PACKGQA = [""] + (["_packgqa"] if not DISABLE_PACKGQA else [])
     # We already always hard-code PackGQA=true for Sm8x
-    sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
-                        for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_ALL)]
+    sources_fwd_sm80 = [
+        f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
+        for hdim, dtype, split, paged, softcap in itertools.product(
+            HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV,
+            SOFTCAP_ALL)
+    ]
     # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
@@ -556,11 +608,11 @@ if not SKIP_CUDA_BUILD:
     if DISABLE_BACKWARD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
-    sources = (
-        ["flash_api.cpp"]
-        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
-    )
+    sources = (["flash_api.cpp"] +
+               (sources_fwd_sm80 if not DISABLE_SM8x else []) +
+               sources_fwd_sm90 +
+               (sources_bwd_sm80 if not DISABLE_SM8x else []) +
+               sources_bwd_sm90)
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]
     sources += ["flash_prepare_scheduler.cu"]
@@ -580,12 +632,10 @@ if not SKIP_CUDA_BUILD:
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
     if get_platform() == "win_amd64":
-        nvcc_flags.extend(
-            [
-                "-D_USE_MATH_DEFINES",  # for M_LN2
-                "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
-            ]
-        )
+        nvcc_flags.extend([
+            "-D_USE_MATH_DEFINES",  # for M_LN2
+            "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
+        ])
     include_dirs = [
         Path(this_dir),
         cutlass_dir / "include",
@@ -597,16 +647,17 @@ if not SKIP_CUDA_BUILD:
             sources=sources,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"] + feature_args,
-                "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
+                "nvcc":
+                nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
-        )
-    )
+        ))
 
 
 def get_package_version():
     with open(Path(this_dir) / "__init__.py", "r") as f:
-        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
+        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(),
+                                  re.MULTILINE)
     public_version = ast.literal_eval(version_match.group(1))
     local_version = os.environ.get("FLASH_ATTN_LOCAL_VERSION")
     if local_version:
@@ -623,7 +674,8 @@ def get_wheel_url():
     torch_version_raw = parse(torch.__version__)
     # For CUDA 11, we only compile for CUDA 11.8, and for CUDA 12 we only compile for CUDA 12.2
     # to save CI time. Minor versions should be compatible.
-    torch_cuda_version = parse("11.8") if torch_cuda_version.major == 11 else parse("12.2")
+    torch_cuda_version = parse(
+        "11.8") if torch_cuda_version.major == 11 else parse("12.2")
     python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
     platform_name = get_platform()
     package_version = get_package_version()
@@ -634,7 +686,8 @@ def get_wheel_url():
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f"{PACKAGE_NAME}-{package_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
-    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}", wheel_name=wheel_filename)
+    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}",
+                                      wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
 
@@ -672,20 +725,19 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-        )
-    ),
+    packages=find_packages(exclude=(
+        "build",
+        "csrc",
+        "include",
+        "tests",
+        "dist",
+        "docs",
+        "benchmarks",
+    )),
     py_modules=["flash_attn_interface"],
     description="FlashAttention-3",
     long_description=long_description,
@@ -696,9 +748,10 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": BuildExtension}
-    if ext_modules
-    else {
+    cmdclass={
+        "bdist_wheel": CachedWheelsCommand,
+        "build_ext": BuildExtension
+    } if ext_modules else {
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.8",

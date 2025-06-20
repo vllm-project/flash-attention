@@ -692,6 +692,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
     params.total_q = total_q;
+    params.s_aux_ptr = s_aux.has_value() ? s_aux.value().data_ptr() : nullptr;
 
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
@@ -768,8 +769,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
         softmax_lse = softmax_lse.reshape(lse_size_before).transpose(1, 2).reshape(lse_size_after);
     }
-
-    params.s_aux_ptr = s_aux.has_value() ? s_aux.value().data_ptr() : nullptr;
 
     return {out, softmax_lse};
 }

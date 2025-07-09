@@ -113,6 +113,12 @@ if (NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_FA_GPU_FLAGS "--threads=${NVCC_THREADS}")
 endif ()
 
+#
+# Set nvcc fatbin compression.
+#
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND VLLM_GPU_LANG STREQUAL "CUDA")
+    list(APPEND VLLM_FA_GPU_FLAGS "-Xfatbin" "-compress-all" "-compress-mode=size")
+endif()
 
 # Other flags
 list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math)

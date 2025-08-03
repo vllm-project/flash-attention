@@ -8,7 +8,7 @@
 #include "flash.h"
 
 inline bool use_one_mma_wg(Flash_fwd_params const& params) {
-    return params.arch >= 90 && params.d == 128 && 
+    return params.arch >= 90 && (params.d == 128 || params.d == 64) && 
         params.seqlen_q * (!params.pack_gqa ? 1 : params.h / params.h_k) <= 64;
 };
 

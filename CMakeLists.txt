@@ -178,28 +178,40 @@ endif ()
 if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     # BF16 source files
     file(GLOB FA3_BF16_GEN_SRCS
-        "hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+        "hopper/instantiations/flash_fwd_hdim64_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim96_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim128_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim192_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim256_bf16*_sm90.cu")
+    # file(GLOB FA3_BF16_GEN_SRCS_
+    #     "hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
+    # list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
+    # file(GLOB FA3_BF16_GEN_SRCS_
+    #     "hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
+    # list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
     # FP16 source files
     file(GLOB FA3_FP16_GEN_SRCS
-        "hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+        "hopper/instantiations/flash_fwd_hdim64_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim96_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim128_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim192_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim256_fp16*_sm90.cu")
+    # file(GLOB FA3_FP16_GEN_SRCS_
+    #     "hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
+    # list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
+    # file(GLOB FA3_FP16_GEN_SRCS_
+    #     "hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
+    # list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
     # FP8 source files
     file(GLOB FA3_FP8_GEN_SRCS
-        "hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
-    file(GLOB FA3_FP8_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
+        "hopper/instantiations/flash_fwd_hdim64_e4m3*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim96_e4m3*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim128_e4m3*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim196_e4m3*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim256_e4m3*_sm90.cu")
+    # file(GLOB FA3_FP8_GEN_SRCS_
+    #     "hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
+    # list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
@@ -249,6 +261,10 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
+        FLASHATTENTION_DISABLE_SM8x
+        FLASHATTENTION_DISABLE_HDIMDIFF
+        CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+        CUTLASS_ENABLE_GDC_FOR_SM90
     )
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")

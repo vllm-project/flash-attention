@@ -383,6 +383,7 @@ def test_flash_attn_varlen_output(
         dv_vals = [d]
     for dv in dv_vals:
         print("dv =", dv)
+        has_qv = has_qv_ and d == 64 and dv >= 256
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.

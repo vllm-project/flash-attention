@@ -432,6 +432,12 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
+    // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, causal or local attention
+    // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
+    bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
+                                  params.is_local && 
+                                  params.d == 64 && (params.dv == params.d);
+    if (packgqa_override) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
     return false;
     #else
@@ -616,7 +622,7 @@ mha_fwd_get_scheduler_metadata(
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split
-    params.pack_gqa = params.num_splits > 1;
+    params.pack_gqa |= params.num_splits > 1;
     // printf("Num splits (metadata) = %d.\n", params.num_splits);
 
     bool is_varlen = true;

@@ -39,12 +39,12 @@ DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TRUE"
 
-# DISABLE_BACKWARD = True
+DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
 # DISABLE_PAGEDKV = True
 # DISABLE_APPENDKV = True
 # DISABLE_LOCAL = True
-DISABLE_SOFTCAP = True
+# DISABLE_SOFTCAP = True
 # DISABLE_PACKGQA = True
 # DISABLE_FP16 = True
 # DISABLE_FP8 = True
@@ -53,7 +53,7 @@ DISABLE_SOFTCAP = True
 # DISABLE_HDIM128 = True
 # DISABLE_HDIM192 = True
 # DISABLE_HDIM256 = True
-DISABLE_HDIMDIFF = True
+# DISABLE_HDIMDIFF = True
 
 COMPILED_HDIMS = (
     []
@@ -70,13 +70,13 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mqa"])
-# @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF else []))
-@pytest.mark.parametrize("has_qv", [False])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_qv_", [False] + ([True] if not DISABLE_HDIMDIFF else []))
+# @pytest.mark.parametrize("has_qv_", [True])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [True])
-# @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
@@ -91,9 +91,9 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 @pytest.mark.parametrize("d", COMPILED_HDIMS)
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("test_sink", [False, True])
-# @pytest.mark.parametrize("test_sink", [True])
+# @pytest.mark.parametrize("test_sink", [False])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -121,10 +121,14 @@ COMPILED_HDIMS = (
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype, test_sink
+        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv_, mha_type, dtype, test_sink
 ):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
+    if has_qv_ and (d != 64 or dtype == torch.float8_e4m3fn):
+        pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
+    if test_sink and has_qv_:
+        pytest.skip("Sink disabled for Qv")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -140,10 +144,11 @@ def test_flash_attn_output(
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # s_aux = torch.ones(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # print("s_aux ", s_aux)
-    if DISABLE_HDIMDIFF or dtype == torch.float8_e4m3fn:
+    if DISABLE_HDIMDIFF or (dtype == torch.float8_e4m3fn and d != 192) or test_sink:
         dv_vals = [d]
     for dv in dv_vals:
         print("dv =", dv)
+        has_qv = has_qv_ and d == 64 and dv >= 256
         q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)
         if softcap > 0.0:
             # Ensure the values of qk are at least within softcap range.
@@ -306,7 +311,7 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF else []))
-@pytest.mark.parametrize("has_qv", [False])
+@pytest.mark.parametrize("has_qv_", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
@@ -353,8 +358,12 @@ def test_flash_attn_output(
     ],
 )
 def test_flash_attn_varlen_output(
-        seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype, test_sink
+        seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv_, mha_type, dtype, test_sink
 ):
+    if has_qv_ and (d != 64 or dtype == torch.float8_e4m3fn):
+        pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
+    if test_sink and has_qv_:
+        pytest.skip("Sink disabled for Qv")
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
@@ -600,37 +609,37 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
 # @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(False, False)])
+# @pytest.mark.parametrize("causal,local", [(False, True)])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False])
 @pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
-# @pytest.mark.parametrize("rotary_interleaved", [True])
+# @pytest.mark.parametrize("rotary_interleaved", [False])
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None) else [0.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
-# @pytest.mark.parametrize("page_size", [None])
+# @pytest.mark.parametrize("page_size", [4])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
 # @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", COMPILED_HDIMS)
-# @pytest.mark.parametrize("d", [64])
+# @pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize("d", [64])
 # @pytest.mark.parametrize("d", [192])
-@pytest.mark.parametrize("test_sink", [False, True])
-# @pytest.mark.parametrize("test_sink", [False])
+# @pytest.mark.parametrize("test_sink", [False, True])
+@pytest.mark.parametrize("test_sink", [False])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -678,6 +687,8 @@ def test_flash_attn_kvcache(
     if rotary_fraction == 0.0 and has_rotary_seqlens:
         pytest.skip()
     device = "cuda"
+    print("causal: ", causal)
+    print("local: ", local)
     # set seed
     torch.random.manual_seed(0)
     batch_size = 5
@@ -690,10 +701,10 @@ def test_flash_attn_kvcache(
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [d]
+    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    # dv_vals = [d]
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn and d != 192:
         dv_vals = [d]
     for dv in dv_vals:
         print("dv =", dv)
@@ -882,11 +893,13 @@ def test_flash_attn_kvcache(
         precompute_metadata_vals = [False, True]
         # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
-            print("Num splits =",num_splits)
-            print("Precompute metadata =",precompute_metadata)
+            print("Num splits = ",num_splits)
+            print("Precompute metadata = ",precompute_metadata)
+            # print("max seqlen_q, seqlen_q ", max_seqlen_q, seqlen_q)
             if precompute_metadata:
+                # WARNING: seqlen_k is not max_seqlen_k if using page table, so we can't expect this to make sense?
                 scheduler_metadata = get_scheduler_metadata(
-                    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,
@@ -919,6 +932,7 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    # max_seqlen_k=max_seqlen_k,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,

@@ -420,7 +420,7 @@ inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
     // disable for local since we move k_ptr to start of sliding window by m_block
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
@@ -438,7 +438,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     return should_pack_gqa(params.cu_seqlens_q || params.seqused_q, params.seqlen_q, params.h / params.h_k, kBlockM);
     #endif
@@ -471,6 +471,12 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
+    // For debugging
+    // printf("num sm = %d.\n", params.num_sm);
+    // printf("bM = %d, bN = %d.\n", kBlockM, kBlockN);
+    // printf("num_n_blocks, num_m_blocks = %d, %d.\n", num_n_blocks, num_m_blocks);
+    // printf("total m blocks = %d.\n", total_mblocks);
+    // printf("seqlen_k = %d, size_one_kv_head = %d.\n", params.seqlen_k, size_one_kv_head);
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
@@ -607,11 +613,11 @@ mha_fwd_get_scheduler_metadata(
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split
     params.pack_gqa = params.num_splits > 1;
+    // printf("Num splits (metadata) = %d.\n", params.num_splits);
 
     bool is_varlen = true;
 
@@ -963,9 +969,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    // Determine if we should pack GQA before num_splits since it impacts use_one_mma_wg (in get_num_splits)
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    // printf("Num splits = %d.\n", params.num_splits);
+    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split
     params.pack_gqa |= (params.num_splits > 1);
 
@@ -997,6 +1003,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");
+        TORCH_CHECK(head_size_v >= 256, "q_v is only supported for hdim_v <= 256.");
         TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                     "q_v is only supported for fp16 and bf16 data type");
         TORCH_CHECK(params.arch == 90, "q_v is only supported for Hopper GPUs");
@@ -1115,9 +1122,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     if(s_aux_.has_value()) {
+        TORCH_CHECK(num_heads <= 64, "We only support query heads <= 64 with S aux");
+        TORCH_CHECK(head_size == head_size_v, "We don't support S aux with hdim != hdim_v");
         auto s_aux = s_aux_.value();
         TORCH_CHECK(s_aux.scalar_type() == at::ScalarType::BFloat16,
-            "We only support bf16 dtype for S extra.");
+            "We only support bf16 dtype for S aux.");
         CHECK_DEVICE(s_aux);
         CHECK_SHAPE(s_aux, num_heads);
         CHECK_CONTIGUOUS(s_aux);

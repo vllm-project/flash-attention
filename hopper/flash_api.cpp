@@ -432,7 +432,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
-    // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, causal or local attention
+    // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, local attention
     // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
     bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
                                   params.is_local && 

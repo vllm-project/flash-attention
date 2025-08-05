@@ -35,8 +35,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_,
-               std::optional<at::Tensor> s_aux);
+               std::optional<at::Generator> gen_);
 
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
@@ -110,7 +109,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
-            "Generator? gen, Tensor? s_aux) -> Tensor[]");
+            "Generator? gen) -> Tensor[]");
     ops.impl("varlen_fwd", torch::kCUDA, make_pytorch_shim(&mha_varlen_fwd));
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "

@@ -64,7 +64,8 @@ DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
 
-DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
 # DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
@@ -76,7 +77,7 @@ DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TR
 # DISABLE_FP16 = True
 # DISABLE_FP8 = True
 # DISABLE_VARLEN = True
-DISABLE_CLUSTER = True
+# DISABLE_CLUSTER = True
 # DISABLE_HDIM64 = True
 # DISABLE_HDIM96 = True
 # DISABLE_HDIM128 = True
@@ -84,7 +85,8 @@ DISABLE_CLUSTER = True
 # DISABLE_HDIM256 = True
 DISABLE_SM8x = True
 
-# DISABLE_HDIMDIFF = True
+DISABLE_HDIMDIFF64 = True
+# DISABLE_HDIMDIFF192 = True
 
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
@@ -488,8 +490,8 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
-        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF"] if DISABLE_HDIMDIFF else [])
-        
+        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -516,18 +518,15 @@ if not SKIP_CUDA_BUILD:
         + ([128] if not DISABLE_HDIM128 else [])
         + ([192] if not DISABLE_HDIM192 else [])
         + ([256] if not DISABLE_HDIM256 else [])
-        # + (["64_256"] if not DISABLE_HDIMDIFF else [])
-        # + (["64_512"] if not DISABLE_HDIMDIFF else [])
-        # + (["192_128"] if not DISABLE_HDIMDIFF else [])
     )
     HEAD_DIMENSIONS_DIFF64_FWD = (
         []
-        + (["64_256"] if not DISABLE_HDIMDIFF else [])
-        + (["64_512"] if not DISABLE_HDIMDIFF else [])
+        + (["64_256"] if not DISABLE_HDIMDIFF64 else [])
+        + (["64_512"] if not DISABLE_HDIMDIFF64 else [])
     )
     HEAD_DIMENSIONS_DIFF192_FWD = (
         []
-        + (["192_128"] if not DISABLE_HDIMDIFF else [])
+        + (["192_128"] if not DISABLE_HDIMDIFF192 else [])
     )
     HEAD_DIMENSIONS_FWD_SM80 = HEAD_DIMENSIONS_BWD
     SPLIT = [""] + (["_split"] if not DISABLE_SPLIT else [])
@@ -542,13 +541,14 @@ if not SKIP_CUDA_BUILD:
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                         if not (packgqa and (paged or split))]
-    if not DISABLE_HDIMDIFF:
+    if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                              if not (packgqa and (paged or split))]
+    if not DISABLE_HDIMDIFF192:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
-                             for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
-                             if not (packgqa and (paged or split))]
+                            for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF192_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                            if not (packgqa and (paged or split))]
     sources_bwd_sm80 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm80.cu"
                         for hdim, dtype, softcap in itertools.product(HEAD_DIMENSIONS_BWD, DTYPE_BWD, SOFTCAP)]
     sources_bwd_sm90 = [f"instantiations/flash_bwd_hdim{hdim}_{dtype}{softcap}_sm90.cu"

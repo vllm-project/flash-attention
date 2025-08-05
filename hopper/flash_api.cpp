@@ -1128,6 +1128,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     if(s_aux_.has_value()) {
+        TORCH_CHECK(params.arch == 90, "S aux is currently only supported for Hopper GPUs");
         TORCH_CHECK(num_heads <= 64, "We only support query heads <= 64 with S aux");
         TORCH_CHECK(head_size == head_size_v, "We don't support S aux with hdim != hdim_v");
         auto s_aux = s_aux_.value();

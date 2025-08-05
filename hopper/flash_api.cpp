@@ -272,7 +272,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             if (params.is_bf16) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF
+                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
@@ -293,7 +293,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM192
                                 if (params.d <= 192) {
-                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF
+                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     } else {
@@ -311,7 +311,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #ifndef FLASHATTENTION_DISABLE_FP16
                                 #ifndef FLASHATTENTION_DISABLE_HDIM64
                                 if (params.d <= 64) {
-                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF
+                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
@@ -332,7 +332,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 #endif
                                 #ifndef FLASHATTENTION_DISABLE_HDIM192
                                 if (params.d <= 192) {
-                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF
+                                    #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     } else {
@@ -363,7 +363,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             #endif
                             #ifndef FLASHATTENTION_DISABLE_HDIM192
                             if (params.d <= 192) {
-                                #ifndef FLASHATTENTION_DISABLE_HDIMDIFF
+                                #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                 if (params.dv <= 128 && Arch == 90) {
                                     return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                 } else {
@@ -1159,8 +1159,11 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
-    #ifdef FLASHATTENTION_DISABLE_HDIMDIFF
-    TORCH_CHECK(head_size == head_size_v, "This flash attention build does not support hdim != hdim_v");
+    #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
+    TORCH_CHECK(head_size != 64 || head_size == head_size_v, "This flash attention build does not support hdim != hdim_v when hdim = 64");
+    #endif 
+    #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
+    TORCH_CHECK(head_size != 192 || head_size == head_size_v, "This flash attention build does not support hdim != hdim_v when hdim = 192");
     #endif 
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {

@@ -37,7 +37,8 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
-DISABLE_HDIMDIFF = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
+DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
 DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
@@ -53,7 +54,8 @@ DISABLE_BACKWARD = True
 # DISABLE_HDIM128 = True
 # DISABLE_HDIM192 = True
 # DISABLE_HDIM256 = True
-# DISABLE_HDIMDIFF = True
+DISABLE_HDIMDIFF64 = True
+# DISABLE_HDIMDIFF192 = True
 
 COMPILED_HDIMS = (
     []
@@ -71,7 +73,7 @@ COMPILED_HDIMS = (
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_qv_", [False] + ([True] if not DISABLE_HDIMDIFF else []))
+@pytest.mark.parametrize("has_qv_", [False] + ([True] if not DISABLE_HDIMDIFF64 else []))
 # @pytest.mark.parametrize("has_qv_", [True])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [True])
@@ -140,11 +142,16 @@ def test_flash_attn_output(
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    if d == 192 and not DISABLE_HDIMDIFF192:
+        dv_vals = [128, d]
+    elif d == 64 and not DISABLE_HDIMDIFF64 and dtype != torch.float8_e4m3fn:
+        dv_vals = [256, 512, d]
+    else:
+        dv_vals = [d]
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # s_aux = torch.ones(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # print("s_aux ", s_aux)
-    if DISABLE_HDIMDIFF or (dtype == torch.float8_e4m3fn and d != 192) or test_sink:
+    if test_sink:
         dv_vals = [d]
     for dv in dv_vals:
         print("dv =", dv)
@@ -310,12 +317,12 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF else []))
+# @pytest.mark.parametrize("has_qv", [False] + ([True] if not DISABLE_HDIMDIFF64 else []))
 @pytest.mark.parametrize("has_qv_", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
@@ -375,11 +382,16 @@ def test_flash_attn_varlen_output(
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    if d == 192 and not DISABLE_HDIMDIFF192:
+        dv_vals = [128, d]
+    elif d == 64 and not DISABLE_HDIMDIFF64 and dtype != torch.float8_e4m3fn:
+        dv_vals = [256, 512, d]
+    else:
+        dv_vals = [d]
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # s_aux = torch.ones(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # print("s_aux", s_aux)
-    if DISABLE_HDIMDIFF or dtype == torch.float8_e4m3fn:
+    if test_sink:
         dv_vals = [d]
     for dv in dv_vals:
         print("dv =", dv)
@@ -492,7 +504,7 @@ def test_flash_attn_varlen_output(
         rtol = 2 if softcap == 0.0 else 3
 
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
-        num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3, 0] if not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad,

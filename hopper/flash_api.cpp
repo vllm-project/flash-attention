@@ -782,6 +782,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
         }
+        #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
+        TORCH_CHECK(head_size > 64, "This flash attention build does not support hdim != hdim_v when hdim <= 64");
+        #endif 
+        #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
+        TORCH_CHECK(head_size <= 64, "This flash attention build does not support hdim != hdim_v when hdim in (128, 192]");
+        #endif
     }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
@@ -1160,12 +1166,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     #ifdef FLASHATTENTION_DISABLE_APPENDKV
     TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
     #endif
-    #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
-    TORCH_CHECK(head_size != 64 || head_size == head_size_v, "This flash attention build does not support hdim != hdim_v when hdim = 64");
-    #endif 
-    #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
-    TORCH_CHECK(head_size != 192 || head_size == head_size_v, "This flash attention build does not support hdim != hdim_v when hdim = 192");
-    #endif 
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();

@@ -226,6 +226,9 @@ def flash_attn_varlen_func(
                     "FA2 does not support scheduler_metadata, q_descale, "
                     "k_descale, v_descale"
                 )
+
+        if s_aux is not None:
+            raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(

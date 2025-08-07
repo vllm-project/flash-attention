@@ -215,7 +215,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim64_e4m3*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim96_e4m3*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim128_e4m3*_sm90.cu"
-        "hopper/instantiations/flash_fwd_hdim196_e4m3*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim192_e4m3*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim256_e4m3*_sm90.cu")
     # Add these for hdim diff cases (192 only)
     file(GLOB FA3_FP8_GEN_SRCS_

@@ -61,7 +61,7 @@
     }()
 #endif
 
-#ifdef FLASHATTENTION_DISABLE_HDIMDIFF
+#ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
   #define QV_SWITCH(COND, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \

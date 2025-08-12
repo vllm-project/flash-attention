@@ -105,6 +105,9 @@ struct CollectiveMainloopFwdSm80 {
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
 
+    // Hardcoded to be at most 64 query heads
+    using SmemLayoutSAux = Layout<Shape<_64>>;
+
     // We use CACHEGLOBAL instead of CACHEALWAYS for both Q and K/V, since we won't be reading
     // from the same address by the same threadblock. This is slightly faster.
     using GmemCopyAtom = Copy_Atom<std::conditional_t<
@@ -163,12 +166,14 @@ struct CollectiveMainloopFwdSm80 {
             cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
         };
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
     struct TensorStorageSeparateQV : cute::aligned_struct<128> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+        cute::array_aligned<ElementSAux, cute::cosize_v<SmemLayoutSAux>, 128> smem_s_aux;
     };
 
     using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
@@ -651,8 +656,41 @@ struct CollectiveMainloopFwdSm80 {
                 fwd_step(n_block, local_mask_fn, cute::false_type{} /*is_first_iter*/, cute::bool_constant<Is_local>{} /*check_inf*/);
             }
         }
+
+        using TensorT = typename Softmax::TensorT;
+        using LayoutT = typename TensorT::layout_type;
+        auto finalize_dispatch = [&](float const v_descale) {
+            if (params.ptr_S_aux && (!Split || (split_idx & 0x0000FFFF) == 0)) {
+                Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
+                TensorT tSrS_aux = make_tensor<float>(LayoutT{});
+                if constexpr(!PackGQA) {
+                    #pragma unroll
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
+                        tSrS_aux(mi) = static_cast<float>(sS_aux(bidh));
+                    }
+                } else {
+                    Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_MNK{}));
+                    Tensor tScS = thr_mma.partition_C(cS);
+                    Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+                    static_assert(size<0>(tScS_rowcol) == size(tSrS_aux));
+                    int const qhead_per_khead = params.qhead_per_khead_divmod.divisor;
+                    #pragma unroll
+                    for(int mi = 0; mi < size(tSrS_aux); ++mi) {
+                        int row = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                        int bidh_mi = (row % qhead_per_khead) + bidh_kv * qhead_per_khead;
+                        tSrS_aux(mi) = static_cast<float>(sS_aux(bidh_mi));
+                    }
+                }
+                return softmax.finalize_aux(tSrS_aux, v_descale);
+            } else {
+                return softmax.finalize(v_descale);
+            }
+        };
+
         float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
-        Tensor scores_scale = softmax.finalize(v_descale);
+        // Tensor scores_scale = softmax.finalize(v_descale);
+        TensorT scores_scale = finalize_dispatch(v_descale);
+
         softmax.rescale_o(tOrO, scores_scale);
         if constexpr (Is_FP8) { flash::permute_output_fp8(tOrO); }
         return true;

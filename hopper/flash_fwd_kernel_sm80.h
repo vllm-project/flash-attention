@@ -41,6 +41,8 @@ public:
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
+    using SmemLayoutSAux = typename CollectiveMainloop::SmemLayoutSAux;
+
     // Mainloop derived types
     using TileShape_MNK = typename CollectiveMainloop::TileShape_MNK;
     using TiledMma = typename CollectiveMainloop::TiledMma;
@@ -159,6 +161,15 @@ public:
         TiledMma tiled_mma;
 
         scheduler.init_consumer();
+
+        int const num_heads = get<2>(params.mainloop.shape_Q);
+        Tensor gS_aux = make_tensor(make_gmem_ptr(params.mainloop.ptr_S_aux), make_shape(num_heads));
+        Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
+
+        if(params.mainloop.ptr_S_aux && threadIdx.x < num_heads) {
+            sS_aux(threadIdx.x) = gS_aux(threadIdx.x);
+        }
+        __syncthreads();
 
         int warp_idx = cutlass::canonical_warp_idx_sync();
         CUTLASS_PRAGMA_NO_UNROLL

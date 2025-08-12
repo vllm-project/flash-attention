@@ -69,10 +69,15 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
 constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         bool sm86_or_89, int headdim, int headdim_v, bool is_causal, bool is_local, int element_size=2,
         bool paged_kv=false, bool varlen_and_split=false,
-        bool softcap=false, bool append_kv=false) {
+        bool softcap=false, bool append_kv=false, bool use_one_mma_wg=false) {
     if (element_size == 2) {
         if (headdim <= 64) {
-            return {128, varlen_and_split ? 80 : (is_local ? 96 : 112), 4, 1, false};
+            // return {128, varlen_and_split ? 80 : (is_local ? 96 : 112), 4, 1, false};
+            if(use_one_mma_wg || varlen_and_split) {
+                return {64, 128, 4, 1, true};
+            } else {
+                return {128, 128, 8, 1, false};
+            }
         } else if (headdim <= 96) {
             return {128, varlen_and_split || is_local ? 48 : 64, 4, 1, false};
         } else if (headdim <= 128) {

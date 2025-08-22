@@ -669,16 +669,6 @@ mha_fwd_get_scheduler_metadata(
             params.tile_count_semaphore = nullptr;
         }
     }
-    // if (scheduler_needs_semaphore || use_dynamic_split) {
-    //     tile_count_semaphore = torch::empty({int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b}, opts.dtype(torch::kInt32));
-    //     if (scheduler_needs_semaphore) {
-    //         if (!use_dynamic_split) { tile_count_semaphore.zero_(); }  // If varlen we'll manually do the zero-ing
-    //         params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
-    //     } else {
-    //         params.tile_count_semaphore = nullptr;
-    //     }
-    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
-    // }
 
     if (use_prepare_varlen) {
         auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
@@ -1067,26 +1057,6 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
         params.tile_count_semaphore_offset = tile_count_semaphore_offset; // might need to zero out semaphore later
     }
-
-    // if (scheduler_needs_semaphore || use_dynamic_split) {
-    //     int metadata_size = int(scheduler_needs_semaphore) + int(use_dynamic_split) * params.b;
-    //     params.skip_scheduler_metadata_computation = scheduler_metadata_.has_value();
-    //     if (scheduler_metadata_.has_value()) {
-    //         at::Tensor scheduler_metadata = scheduler_metadata_.value();
-    //         CHECK_DEVICE(scheduler_metadata);
-    //         CHECK_SHAPE(scheduler_metadata, metadata_size);
-    //         CHECK_CONTIGUOUS(scheduler_metadata);
-    //         TORCH_CHECK(scheduler_metadata.dtype() == torch::kInt32, "scheduler_metadata must have dtype int32");
-    //         tile_count_semaphore = scheduler_metadata;
-    //     } else {
-    //         tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
-    //     }
-    //     if (scheduler_needs_semaphore && !use_dynamic_split) {
-    //         tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
-    //     }
-    //     params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() : nullptr;
-    //     params.num_splits_dynamic_ptr = use_dynamic_split ? tile_count_semaphore.data_ptr<int>() + 1 : nullptr;
-    // }
 
     if (q_v_.has_value()) {
         TORCH_CHECK(head_size <= 64, "q_v is only supported for head_size <= 64");

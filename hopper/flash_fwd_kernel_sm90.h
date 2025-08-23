@@ -81,9 +81,10 @@ public:
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-    // If we use varlen, we need more registers for the varlen dynamic persistent scheduler in producer WG.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !Varlen ? 24 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !Varlen ? 240 : 232) : 160);
+    // If we use varlen, we would like more registers for the varlen dynamic persistent scheduler in producer WG, but can only donate sometimes.
+    static constexpr bool ExtraProducerRegsForVarlen = Varlen && !Is_FP8 && (get<1>(TileShape_MNK_PV{}) == 128 || get<1>(TileShape_MNK_PV{}) == 192);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !ExtraProducerRegsForVarlen ? 24 : 40) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !ExtraProducerRegsForVarlen ? 240 : 232) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;

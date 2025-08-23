@@ -41,7 +41,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             if (use_one_mma_wg) {
                 return {64, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
             } else {
-                return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 176, true, true};
+                return {128, is_causal || is_local || paged_kv_non_TMA ? 128 : 160, true, true};
             }
             // {128, 192, false, false} and {192, 128, false, true} are quite good too
             // 128 x 192 hits the limit of smem if MmaPV_is_RS, 128 x 144 hits the limit if !MmaPV_is_RS

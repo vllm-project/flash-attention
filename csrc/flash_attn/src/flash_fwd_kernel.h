@@ -27,6 +27,62 @@ using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Accumulate pre-softmax |S| per page (logical page bucketing along N) for a single tile acc_s.
+// acc_s: (MMA=4, MMA_M, MMA_N) accumulator fragment after masking, before softmax.
+// We convert to row/col view, then atomicAdd fabs(value) into abslogits_page_ptr[b, h, q, page].
+template <typename ElementAccum, typename TensorAcc, typename Params, typename BlockInfoT>
+__forceinline__ __device__ void accumulate_abslogits_per_page(
+    const TensorAcc &acc_s, const Params &params, const BlockInfoT &binfo,
+    const int bidb, const int bidh, const int m_block, const int n_block,
+    const int kBlockM, const int kBlockN, const int kNWarps)
+{
+    if (params.abslogits_page_ptr == nullptr) return;
+    // Determine page config.
+    const int page_size = params.abslogits_page_size > 0 ? params.abslogits_page_size : 16;
+    // Total pages based on padded seqlen_k_rounded to keep strides consistent.
+    int n_pages = params.abslogits_num_pages_rounded > 0
+        ? params.abslogits_num_pages_rounded
+        : (params.seqlen_k_rounded + page_size - 1) / page_size;
+    // Base pointer cast
+    float *base = reinterpret_cast<float*>(params.abslogits_page_ptr);
+
+    // Map acc to row/col view
+    auto scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
+    const int lane = threadIdx.x % 32;
+    const int warp_row_stride = kNWarps * 16;
+    const int row_idx_offset = m_block * kBlockM + (threadIdx.x / 32) * 16 + (lane) / 4;
+
+    // Iterate rows in the same nesting as mask: mi1 over size<0,1>, i over size<0,0>
+    #pragma unroll
+    for (int mi1 = 0; mi1 < size<0,1>(scores); ++mi1) {
+        const int row_base = row_idx_offset + mi1 * warp_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size<0,0>(scores); ++i) {
+            const int q_row = row_base + i * 8;
+            if (q_row >= binfo.actual_seqlen_q) continue;
+            #pragma unroll
+            for (int ni = 0; ni < size<1,1>(scores); ++ni) {
+                const int col_idx_base = n_block * kBlockN + (lane % 4) * 2 + ni * 8;
+                #pragma unroll
+                for (int j = 0; j < size<1,0>(scores); ++j) {
+                    const int col = col_idx_base + j;
+                    if (col < 0 || col >= binfo.actual_seqlen_k) continue;
+                    float val = scores(make_coord(i, mi1), make_coord(j, ni));
+                    if (!isfinite(val)) continue;
+                    float contrib = fabsf(val);
+                    int page = (col + binfo.leftpad_k) / page_size;
+                    if (page >= n_pages) continue;
+                    size_t idx = bidb * (size_t)params.abslogits_page_batch_stride
+                               + bidh * (size_t)params.abslogits_page_head_stride
+                               + q_row * (size_t)params.abslogits_page_row_stride
+                               + page;
+                    atomicAdd(&base[idx], contrib);
+                }
+            }
+        }
+    }
+}
+
 template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
 __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
         // When params.unpadded_lse is false, LSE is written as (b, h, seqlen_q) - this is non-variable seqlen path.
@@ -338,7 +394,10 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
-        // TODO: when we have key_padding_mask we'll need to Check_inf
+    // Accumulate per-page |S| before softmax
+    accumulate_abslogits_per_page<ElementAccum>(acc_s, params, binfo, bidb, bidh, m_block, n_block,
+                            kBlockM, kBlockN, kNWarps);
+    // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -400,11 +459,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             cute::cp_async_fence();
         }
 
-        mask.template apply_mask</*Causal_mask=*/false>(
+    mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
-
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+    // Accumulate per-page |S| before softmax
+    accumulate_abslogits_per_page<ElementAccum>(acc_s, params, binfo, bidb, bidh, m_block, n_block,
+                            kBlockM, kBlockN, kNWarps);
+    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -932,7 +993,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
-        // We have key_padding_mask so we'll need to Check_inf
+    // Accumulate per-page |S| before softmax
+    accumulate_abslogits_per_page<ElementAccum>(acc_s, params, binfo, bidb, bidh, m_block, n_block,
+                            kBlockM, kBlockN, kNWarps);
+    // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
@@ -997,7 +1061,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+    // Accumulate per-page |S| before softmax
+    accumulate_abslogits_per_page<ElementAccum>(acc_s, params, binfo, bidb, bidh, m_block, n_block,
+                            kBlockM, kBlockN, kNWarps);
+    softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)

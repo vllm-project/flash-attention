@@ -140,6 +140,16 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+
+    // Optional: accumulate pre-softmax |S| per page for each (b, h, q).
+    // Layout expected: [b, h, seqlen_q, n_pages_rounded] in row-major, where n_pages_rounded = ceil(seqlen_k_rounded / page_size).
+    // All strides below are in elements, not bytes.
+    void * __restrict__ abslogits_page_ptr;            // float*
+    index_t abslogits_page_batch_stride;               // stride between batches
+    index_t abslogits_page_head_stride;                // stride between heads
+    index_t abslogits_page_row_stride;                 // stride between rows (q index)
+    int abslogits_page_size;                           // page size in tokens (default 16 if 0)
+    int abslogits_num_pages_rounded;                   // n_pages rounded for pointer arithmetic (optional; if 0, compute from seqlen_k_rounded & page_size)
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

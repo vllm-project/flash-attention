@@ -89,9 +89,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
         } else {
             seqlen = seqlen_q_static;
         }
-        if(packgqa) { seqlen *= qhead_per_khead; }
         return batch_idx < num_batch && lane < kNumBatchPerWarp
-            ? cute::make_tuple(blockm_divmod.div(seqlen + blockm_divmod.divisor - 1), seqlen)
+            ? cute::make_tuple(blockm_divmod.div(seqlen * (packgqa ? qhead_per_khead : 1) + blockm_divmod.divisor - 1), seqlen)
             : cute::make_tuple(0, 0);
     };
 
@@ -167,9 +166,12 @@ __global__ void prepare_varlen_num_blocks_kernel(
     if constexpr (Sort) {
         if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
             num_n_blocks = INT_MIN; // sort last
-        } else if (is_causal) {
+        }
+        else if (is_causal) {
+            // sort by middle member to process
+            num_n_blocks = num_n_blocks * blockn_divmod.divisor - (seqlen_q / 2);
             // sort by shortest member to process
-            num_n_blocks = num_n_blocks * blockn_divmod.divisor - seqlen_q;
+            // num_n_blocks = num_n_blocks * blockn_divmod.divisor - seqlen_q;
         }
         int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
         batch_coords[0] = make_int4(num_n_blocks, seqlen_q, num_splits_dynamic, batch_idx);
@@ -179,7 +181,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
         if (is_causal) {
             // reset value to num_n_blocks
-            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y);
+            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + (batch_coords[0].y / 2));
+            // batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y);
         }
 
         // When sorting, we re-index some metadata by 'virtual batch index'
@@ -191,13 +194,13 @@ __global__ void prepare_varlen_num_blocks_kernel(
         batch_idx = batch_cta_idx_offset + threadIdx.x;
         if (batch_idx < num_batch && threadIdx.x < 992) {
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
-            prepare_seqlen_q_ptr[batch_idx] = batch_coords[0].y;
+            prepare_seqlen_q_ptr[batch_idx] = batch_coords[0].y * (packgqa ? qhead_per_khead : 1);
             if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z; }
             varlen_batch_idx_ptr[batch_idx] = batch_coords[0].w;
         }  
     } else {
         if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
-            prepare_seqlen_q_ptr[batch_idx] = seqlen_q;
+            prepare_seqlen_q_ptr[batch_idx] = seqlen_q * (packgqa ? qhead_per_khead : 1);
             if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic; }
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);

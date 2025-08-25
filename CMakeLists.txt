@@ -185,8 +185,8 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim256_bf16*_sm90.cu")
     # Add these for hdim diff cases
     file(GLOB FA3_BF16_GEN_SRCS_
-        # "hopper/instantiations/flash_fwd_hdim64_256_bf16*_sm90.cu"
-        # "hopper/instantiations/flash_fwd_hdim64_512_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_256_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_512_bf16*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim192_128_bf16*_sm90.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
     file(GLOB FA3_BF16_GEN_SRCS_
@@ -202,8 +202,8 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim256_fp16*_sm90.cu")
     # Add these for hdim diff cases
     file(GLOB FA3_FP16_GEN_SRCS_
-    #     "hopper/instantiations/flash_fwd_hdim64_256_fp16*_sm90.cu"
-    #     "hopper/instantiations/flash_fwd_hdim64_512_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_256_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_512_fp16*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim192_128_fp16*_sm90.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
     file(GLOB FA3_FP16_GEN_SRCS_

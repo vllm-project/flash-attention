@@ -479,8 +479,8 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
-    // penalty for larger batch size in varlen case, assuming at least 1 mblock per batch
-    if(params.num_splits_dynamic_ptr) { total_mblocks += (params.b - 1) * params.h_k; }
+    // penalty for larger batch size in varlen case, assuming at least half of batches have non-zero seqlen_q
+    if(params.num_splits_dynamic_ptr) { total_mblocks += (params.b / 2) * params.h_k; }
     // For debugging
     // printf("num sm = %d.\n", params.num_sm);
     // printf("bM = %d, bN = %d.\n", kBlockM, kBlockN);

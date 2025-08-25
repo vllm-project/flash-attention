@@ -1126,7 +1126,7 @@ struct CollectiveMainloopFwdSm90 {
         using TensorT = typename Softmax::TensorT;
         using LayoutT = typename TensorT::layout_type;
         auto finalize_dispatch = [&](TensorT& scores_scale, float const v_descale) {
-            if (params.ptr_S_aux && (!Split || (split_idx & 0x0000FFFF) == 0)) {
+            if (params.ptr_S_aux && (!Split || split_idx == 0)) {
                 Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
                 Tensor tSrS_aux = make_tensor_like(scores_scale);
                 static_assert(is_static<decltype(layout(tSrS_aux))>::value);

@@ -150,6 +150,7 @@ if (FA2_ENABLED)
         SOURCES
             csrc/flash_attn/flash_api.cpp
             csrc/flash_attn/flash_api_sparse.cpp
+            csrc/flash_attn/tree_attention.cpp
             csrc/flash_attn/flash_api_torch_lib.cpp
             ${FA2_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}

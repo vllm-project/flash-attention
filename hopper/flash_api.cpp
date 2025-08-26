@@ -268,7 +268,14 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
+                    #ifdef FLASHATTENTION_PACKGQA_ONLY
+                    // Always enable PackGQA except for hdimdiff cases to reduce compilation
+                    static constexpr bool PackGQA = true;
+                    static constexpr bool PackGQA_HDIMDIFF = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    #else
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    static constexpr bool PackGQA_HDIMDIFF = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    #endif
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
                         if (!params.is_e4m3) {
                             if (params.is_bf16) {
@@ -276,9 +283,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 64) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -297,7 +304,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 192) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -315,9 +322,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 64) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -336,7 +343,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 192) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -367,7 +374,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             if (params.d <= 192) {
                                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                 if (params.dv <= 128 && Arch == 90) {
-                                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                 } else {
                                     return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                 }
@@ -434,15 +441,15 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation and binary size.
     // Has little effect on speed.
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
+    #ifdef FLASHATTENTION_DISABLE_PACKGQA
+    return false;
+    #else
     // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, local attention
     // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
     bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
                                   params.is_local && 
                                   params.d == 64 && (params.dv == params.d);
     if (packgqa_override) { return true; }
-    #ifdef FLASHATTENTION_DISABLE_PACKGQA
-    return false;
-    #else
     // params.page_table must already be set
     if (params.h == params.h_k) { return false; }
     // This needs to match the kernel configs

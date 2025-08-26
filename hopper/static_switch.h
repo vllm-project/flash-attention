@@ -210,11 +210,14 @@
 #else
   #define PACK_GQA_BLOCK_SWITCH(QHEADS_PER_KHEADS, BLOCK_H, ...)                                 \
   [&] {                                                                                          \
-    if (QHEADS_PER_KHEADS == 16) {                                                                \
-      constexpr static int BLOCK_H = 16;                                                          \
+    if (QHEADS_PER_KHEADS == 16) {                                                               \
+      constexpr static int BLOCK_H = 16;                                                         \
       return __VA_ARGS__();                                                                      \
-    } else if (QHEADS_PER_KHEADS == 8) {                                                        \
-      constexpr static int BLOCK_H = 8;                                                         \
+    } else if (QHEADS_PER_KHEADS == 8) {                                                         \
+      constexpr static int BLOCK_H = 8;                                                          \
+      return __VA_ARGS__();                                                                      \
+    } else if (QHEADS_PER_KHEADS == 4) {                                                         \
+      constexpr static int BLOCK_H = 4;                                                          \
       return __VA_ARGS__();                                                                      \
     } else {                                                                                     \
       constexpr static int BLOCK_H = 1;                                                          \

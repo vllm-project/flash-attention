@@ -636,6 +636,9 @@ mha_fwd_get_scheduler_metadata(
     // Always enable PackGQA for Split
     params.pack_gqa |= params.num_splits > 1;
     // printf("Num splits (metadata) = %d.\n", params.num_splits);
+    #ifdef FLASHATTENTION_PACKGQA_ONLY
+    params.pack_gqa |= params.d == params.dv;
+    #endif
 
     bool const use_dynamic_split = params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
 
@@ -1020,6 +1023,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split
     params.pack_gqa |= (params.num_splits > 1);
+    #ifdef FLASHATTENTION_PACKGQA_ONLY
+    params.pack_gqa |= params.d == params.dv;
+    #endif
 
     bool const use_dynamic_split = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA && params.num_splits > 1;
     // disable split for varlen and >992 batches for now

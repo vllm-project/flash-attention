@@ -147,7 +147,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         num_splits_dynamic = 1;
     } else {
         // remove contributions from prefills
-        int total_blocks = num_m_blocks <= 2 ? num_m_blocks * num_n_blocks : 0;
+        int total_blocks = num_m_blocks <= 2 || num_batch == 1 ? num_m_blocks * num_n_blocks : 0;
         // Warp sum
         #pragma unroll
         for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
@@ -158,8 +158,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
         total_blocks = total_blocks_smem[0];
         // 10% margin
         int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
-        // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
-        num_splits_dynamic = num_m_blocks <= 2
+        blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
+        num_splits_dynamic = num_m_blocks <= 2 || num_batch == 1
             ? std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1) : 1;
         // num_n_blocks per work tile for the batch
         num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 

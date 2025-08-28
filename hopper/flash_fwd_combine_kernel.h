@@ -424,6 +424,11 @@ public:
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
         TileScheduler tile_scheduler{shared_storage};
 
+        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            cutlass::arch::wait_on_dependent_grids();
+            *params.semaphore_to_reset = 0;
+        }
+
         Tensor sLSE = make_tensor(make_smem_ptr(shared_storage.smem_lse_partial.data()), SmemLayoutLSE{});
         Tensor sMaxValidSplit = make_tensor(make_smem_ptr(shared_storage.smem_max_valid_split.data()), Shape<Int<kBlockM>>{});
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
@@ -437,11 +442,6 @@ public:
         int const maybe_virtual_batch = block_coord.bidb;
         if (maybe_virtual_batch >= params.b) { return; }
         int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
-
-        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
-            cutlass::arch::wait_on_dependent_grids();
-            *params.semaphore_to_reset = 0;
-        }
         
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;

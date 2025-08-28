@@ -169,9 +169,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
         }
         else if (is_causal) {
             // sort by middle member to process
-            num_n_blocks = num_n_blocks * blockn_divmod.divisor - (seqlen_q / 2);
+            // num_n_blocks = num_n_blocks * blockn_divmod.divisor - (seqlen_q / 2);
             // sort by shortest member to process
-            // num_n_blocks = num_n_blocks * blockn_divmod.divisor - seqlen_q;
+            num_n_blocks = num_n_blocks * blockn_divmod.divisor - seqlen_q;
         }
         int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
         batch_coords[0] = make_int4(num_n_blocks, seqlen_q, num_splits_dynamic, batch_idx);
@@ -181,8 +181,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
         if (is_causal) {
             // reset value to num_n_blocks
-            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + (batch_coords[0].y / 2));
-            // batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y);
+            // batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + (batch_coords[0].y / 2));
+            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y);
         }
 
         // When sorting, we re-index some metadata by 'virtual batch index'

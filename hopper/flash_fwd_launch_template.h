@@ -60,8 +60,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
 
     static constexpr int NumProducerThreads = Arch >= 90 ? CollectiveMainloop::NumProducerThreads : CollectiveMainloop::NumMmaThreads;
     static constexpr bool LPT = Is_causal || Is_local;
-    // static constexpr bool Sort = !Is_local;
-     static constexpr bool Sort = false;
+    static constexpr bool Sort = !Is_local;
+    //  static constexpr bool Sort = false;
     using SchedulerPersistent = std::conditional_t<Varlen,
         flash::VarlenDynamicPersistentTileScheduler<kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads, NumProducerThreads, Split, PackGQA, Arch >= 90 /*WarpSpecialized*/, LPT, Sort, true /*Prepared*/>,
         std::conditional_t<!Is_causal && !Is_local,

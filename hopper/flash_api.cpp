@@ -651,8 +651,8 @@ mha_fwd_get_scheduler_metadata(
     at::Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    // params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
-    params.varlen_sort_batches = false;
+    params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
+    // params.varlen_sort_batches = false;
     params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
     if (scheduler_needs_semaphore || use_prepare_varlen) {   
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
@@ -1035,8 +1035,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     bool const scheduler_needs_semaphore = params.arch >= 90
         ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
         : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
-    // params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
-    params.varlen_sort_batches = false;
+    params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
+    // params.varlen_sort_batches = false;
     params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
     if (scheduler_needs_semaphore || use_prepare_varlen) {
         int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers

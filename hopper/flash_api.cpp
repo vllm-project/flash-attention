@@ -492,7 +492,11 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // printf("num_n_blocks, num_m_blocks = %d, %d.\n", num_n_blocks, num_m_blocks);
     // printf("total m blocks = %d.\n", total_mblocks);
     // printf("seqlen_k = %d, size_one_kv_head = %d.\n", params.seqlen_k, size_one_kv_head);
-    return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
+    if (params.b == 1 || !params.num_splits_dynamic_ptr) {
+        return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 64);
+    } else {
+        return 64; // just get max splits
+    }
     #endif
 }
 

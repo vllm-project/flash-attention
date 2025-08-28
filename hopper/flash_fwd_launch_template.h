@@ -226,8 +226,8 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                 int const qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
                                 PACK_GQA_BLOCK_SWITCH(qhead_per_khead, kBlockH_, [&] {
                                     // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
-                                    // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
-                                    static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
+                                    // Disable for hdim diff, fp16 to shrink build
+                                    static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> ? 1 : kBlockH_;
                                     run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
                                 });
                             });

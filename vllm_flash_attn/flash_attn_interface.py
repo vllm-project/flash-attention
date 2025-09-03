@@ -445,7 +445,8 @@ def flash_attn_with_kvcache(
             rotary_interleaved,
             num_splits,
         )
-    elif fa_version == 3:
+    else:
+        assert fa_version == 3
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k_cache, v_cache, # q, k, v

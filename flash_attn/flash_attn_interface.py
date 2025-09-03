@@ -7,7 +7,6 @@ import torch.nn as nn
 import os
 
 # isort: off
-# We need to import the CUDA kernels after importing torch
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 if USE_TRITON_ROCM:
     from .flash_attn_triton_amd import interface_fa as flash_attn_gpu
@@ -17,11 +16,38 @@ else:
 # isort: on
 
 def maybe_contiguous(x):
+    """若最后一维非连续，则返回其 contiguous 拷贝。
+
+    约定：
+    - CUDA 内核通常要求张量在最后一维（特征维）是连续存储的；
+    - 为避免不必要的拷贝，仅在需要时才执行 .contiguous()。
+
+    参数：
+    - x: 可为 None 或 torch.Tensor。
+
+    返回：
+    - 当 x 为张量且最后一维非连续时，返回连续副本；否则原样返回。
+    """
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
-    # This should match the block sizes in the CUDA kernel
+    """根据设备架构与 head_dim 推断 CUDA kernel 的列方向块大小（BLOCK_N）。
+
+    说明：
+    - 该逻辑需与 CUDA 内核里的分块策略保持一致（否则会影响性能/正确性）。
+    - Ampere/Ada/Hopper 等不同 SM 架构会采用不同的优选块大小；
+        同时是否启用 dropout、是否因果掩码也会影响选择。
+
+    参数：
+    - device: torch.device 或设备索引；
+    - head_dim: 每头维度（<=256）；
+    - is_dropout: 是否启用 dropout；
+    - is_causal: 是否使用因果掩码；
+
+    返回：
+    - int，推荐的 BLOCK_N。
+    """
     assert head_dim <= 256
     major, minor = torch.cuda.get_device_capability(device)
     is_sm8x = major == 8 and minor > 0  # Only include sm86 and sm89, exclude sm80 (A100)
@@ -52,6 +78,7 @@ def _get_block_size_n(device, head_dim, is_dropout, is_causal):
 
 
 def round_multiple(x, m):
+    """向上对齐到 m 的倍数（常用于对齐 seqlen 到 128 的倍数以便 kernel 分块）。"""
     return (x + m - 1) // m * m
 
 
@@ -92,6 +119,22 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """前向（定长）FlashAttention 自定义算子包装。
+
+    形状：
+    - q, k, v: (batch, seqlen, nheads{/_k}, headdim)
+    - 返回 out: (batch, seqlen, nheads, headdim)
+    - 返回 softmax_lse: (batch, nheads, seqlen)（用于数值稳定的 LSE 累积）
+    - 返回 S_dmask: 若 return_softmax=True 且 dropout>0，返回 softmax 近似/掩码张量；否则为空张量
+    - 返回 rng_state: (2,) 内部随机状态
+
+    关键参数：
+    - softmax_scale: 一般为 1/sqrt(headdim)
+    - causal / window_size_left/right: 控制因果/局部窗口注意力；
+    - softcap: >0 生效，先缩放后 tanh 再缩放（抑制极值分数）；
+    - alibi_slopes: 见 ALiBi 论文，对分数加入线性位置偏置；
+    - return_softmax: 仅测试/调试用途，会返回 S_dmask，且通常只在训练、且有 dropout 时才有用。
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
@@ -166,6 +209,27 @@ def _flash_attn_varlen_forward(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """前向（变长）FlashAttention 自定义算子包装。
+
+    形状/变长约定：
+    - q: (total_q, nheads, headdim)，k/v: (total_k, nheads_k, headdim)
+    - cu_seqlens_q/k: (B+1,), int32，形如 [0, len_0, len_0+len_1, ...]
+    - max_seqlen_q/k: 每 batch 中的最大长度，用于 kernel 配置
+    - 可选 block_table（paged KV）：(B, max_num_blocks_per_seq) int32
+    - 可选 leftpad_k：(B,) int32，左填充长度（用于局部/相对位置场景）
+    - 可选 seqused_k：(B,) int32，每条样本实际使用的 K 数，常见于 KV cache 预填
+
+    返回：
+    - out: (total_q, nheads, headdim)
+    - softmax_lse: (nheads, total_q)
+    - S_dmask: 若 return_softmax=True 且 dropout>0，返回 softmax 近似/掩码张量，否则为空
+    - rng_state: (2,) 随机状态
+
+    说明：
+    - zero_tensors=True 时，某些中间张量会被零化以降低反馈干扰（主要用于数值/调试场景）；
+    - causal/window_size/softcap/alibi 与定长版本一致；
+    - nheads_k < nheads 时表示 GQA/MQA（Q 头会按比例复用 KV 头）。
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
         q,
@@ -237,6 +301,73 @@ if torch.__version__ >= "2.4.0":
     _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn._flash_attn_varlen_forward
 else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
+
+
+def fa2_varlen_fwd_raw(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    return_softmax: bool = False,
+    block_table: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    zero_tensors: bool = False,
+):
+    """直接调用底层 FA2 变长前向（flash_attn_gpu.varlen_fwd），原样返回所有结果。
+
+    使用场景：
+    - 你的自定义内核可能会在标准返回（out, lse, S_dmask, rng_state）之后，
+      追加额外调试/统计张量（例如累计 |s| 的 abs_s）；此处不固定返回数量，
+      调用方可通过 len(ret) 与索引来取额外结果。
+
+    形状与参数：
+    - 与 _flash_attn_varlen_forward 一致；softmax_scale 默认取 1/sqrt(headdim)。
+    - 返回 ret 通常是长度>=4的元组：
+        [0] out:(total_q, nheads, headdim)
+        [1] softmax_lse:(nheads, total_q)
+        [2] S_dmask: 仅在 return_softmax=True 且 dropout>0 时非空
+        [3] rng_state:(2,)
+        [4+] 额外张量（例如 abs_s），若内核实现提供
+    """
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    ret = flash_attn_gpu.varlen_fwd(
+        q,
+        k,
+        v,
+        None,                 # rng_state (in)
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        leftpad_k,
+        block_table,
+        alibi_slopes,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        zero_tensors,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        return_softmax,
+        None,                 # workspace / debug
+    )
+    return ret
 
 
 @_torch_custom_op_wrapper("flash_attn::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")

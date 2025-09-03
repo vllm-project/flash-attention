@@ -136,6 +136,8 @@ def flash_attn_varlen_func(
     return_attn_probs=False,
     block_table=None,
     return_softmax_lse=False,
+    # If True, return any extra auxiliary tensors the kernel provides (e.g., abs_s)
+    return_aux: bool = False,
     out=None,
     # FA3 Only
     scheduler_metadata=None,
@@ -230,7 +232,7 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
-        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+        _ret = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
             out,
             cu_seqlens_q,
@@ -253,6 +255,16 @@ def flash_attn_varlen_func(
             return_softmax_lse and dropout_p > 0,
             None,
         )
+        #允许返回abs_s
+        # Be tolerant to customized kernels that return extra tensors (e.g., abs_s)
+        if isinstance(_ret, (tuple, list)) and len(_ret) >= 2:
+            out, softmax_lse = _ret[0], _ret[1]
+            extras = _ret[2:]
+            if return_aux and len(extras) > 0:
+                return (out, softmax_lse, *extras) if return_softmax_lse else (out, *extras)
+        else:
+            # Fallback: assume canonical 2-returns
+            out, softmax_lse = _ret
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(

@@ -283,7 +283,13 @@ def get_version() -> str:
 
 
 ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa2_C"))
-ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
+#编译禁用FA3
+# Allow disabling FA3 via environment variable to reduce build time/memory
+_DISABLE_FA3 = os.getenv("FLASH_ATTN_DISABLE_FA3")
+if _DISABLE_FA3:
+    logger.info("FLASH_ATTN_DISABLE_FA3=%s -> skipping _vllm_fa3_C target", _DISABLE_FA3)
+else:
+    ext_modules.append(CMakeExtension(name="vllm_flash_attn._vllm_fa3_C"))
 
 setup(
     name="vllm-flash-attn",

@@ -265,6 +265,7 @@ def flash_attn_varlen_func(
         else:
             # Fallback: assume canonical 2-returns
             out, softmax_lse = _ret
+    # 若内核无 extras张量返回，按常规返回
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(

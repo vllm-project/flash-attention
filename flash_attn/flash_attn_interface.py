@@ -325,22 +325,37 @@ def fa2_varlen_fwd_raw(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ):
-    """直接调用底层 FA2 变长前向（flash_attn_gpu.varlen_fwd），原样返回所有结果。
+    """直接调用底层 FA2 变长前向 kernel（``flash_attn_gpu.varlen_fwd``），并返回所有结果。
 
-    使用场景：
-    - 你的自定义内核可能会在标准返回（out, lse, S_dmask, rng_state）之后，
-      追加额外调试/统计张量（例如累计 |s| 的 abs_s）；此处不固定返回数量，
-      调用方可通过 len(ret) 与索引来取额外结果。
+        适用目的
+        - 调试/观测：在 CUDA 内核里增加了额外的调试或统计张量（例如累计 |s| 的 ``abs_s``），
+            本函数保留完整返回列表，便于直接拿到这些输出。
+        - 行为对照：绕开 Autograd.Function 的填充/裁剪等兼容逻辑，最小化 Python 端干预，观察纯内核输出。
 
-    形状与参数：
-    - 与 _flash_attn_varlen_forward 一致；softmax_scale 默认取 1/sqrt(headdim)。
-    - 返回 ret 通常是长度>=4的元组：
-        [0] out:(total_q, nheads, headdim)
-        [1] softmax_lse:(nheads, total_q)
-        [2] S_dmask: 仅在 return_softmax=True 且 dropout>0 时非空
-        [3] rng_state:(2,)
-        [4+] 额外张量（例如 abs_s），若内核实现提供
-    """
+        Inputs contract
+        - q: ``(total_q, nheads, headdim)``
+        - k/v: ``(total_k, nheads_k, headdim)``，支持 GQA/MQA（nheads_k ≤ nheads）
+        - cu_seqlens_q / cu_seqlens_k: ``(B+1,)``、严格为 ``torch.int32`` 的前缀和索引；必须单调非降、首元素为 0、末元素分别为 ``total_q/total_k``。
+        - max_seqlen_q / max_seqlen_k: 每 batch 的最大长度（用于 kernel 配置）
+        - 其它可选：``block_table``（分页 KV）、``leftpad_k``、``seqused_k``、``alibi_slopes`` 等，未用可传 ``None``。
+        - softmax_scale: 若为 ``None``，默认取 ``1/sqrt(headdim)``。
+
+        Outputs contract
+        - 返回值是一个长度≥4的元组，顺序与底层内核保持一致：
+                0. ``out``: ``(total_q, nheads, headdim)``
+                1. ``softmax_lse``: ``(nheads, total_q)``（或内核定义的等价变体），用于数值稳定 softmax 的 log-sum-exp
+                2. ``S_dmask``: 仅在 ``return_softmax=True`` 且 ``dropout_p>0`` 时为非空 tensor；否则通常为空张量
+                3. ``rng_state``: ``(2,)`` 的内部随机数状态
+                4+. 额外张量：若你的内核实现有额外返回（如 ``abs_s`` 等），会依次追加在这里
+
+        
+        简例
+        >>> ret = fa2_varlen_fwd_raw(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        ...                          max_seqlen_q=max_q, max_seqlen_k=max_k, causal=True,
+        ...                          return_softmax=False)
+        >>> out, lse, S_dmask, rng_state, *extras = ret
+        >>> abs_s = extras[0] if extras else None
+        """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)

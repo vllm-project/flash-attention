@@ -232,29 +232,70 @@ def flash_attn_varlen_func(
             raise NotImplementedError("FA2 does not support s_aux")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
-        _ret = torch.ops._vllm_fa2_C.varlen_fwd(
-            q, k, v,
-            out,
-            cu_seqlens_q,
-            # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp 
-            # still wants it so we pass all zeros
-            dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
-            seqused_k,
-            None,
-            block_table,
-            alibi_slopes,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            softmax_scale,
-            False,
-            causal,
-            real_window_size[0],
-            real_window_size[1],
-            softcap,
-            return_softmax_lse and dropout_p > 0,
-            None,
-        )
+    # Prefer helper that returns auxiliary tensors (abs_s) if available
+    #
+    # 约定与行为说明（FA2）：
+    # - 非分页（k/v 为线性布局）：扩展 helper 会在 (out, lse) 之外返回一个 abs_s，形状为 (Hq, total_q)，
+    #   表示每个 head、每个 query token 的 |scores| 沿 key 维度求和后的结果。
+    # - 分页（k/v 形状为 (num_blocks, page_block_size, Hkv, D)，且提供 block_table, seqused_k）：
+    #   扩展 helper 会在 (out, lse) 之外返回 per-page abs_s，形状为 (B, Hq, max_blocks)，其中：
+    #     * B 来自 cu_seqlens_q 的批大小；
+    #     * max_blocks = block_table.shape[1]；
+    #     * page 的定义与 vLLM 的 page_block_size 一致（物理缓存页，不一定与计算 tile 对齐）。
+    # - causal/window/alibi：abs_s 仅用于数值分析，不参与训练/推理；为与参考实现对齐，helper 内部不应用 causal mask，
+    #   且采用 1/sqrt(D) 的缩放计算 scores。
+    # - cu_seqlens_k 参数：
+    #     * 非分页路径：用于切片线性 K/V；
+    #     * 分页路径：切片使用 block_table + seqused_k，cu_seqlens_k 在 helper 内不会被使用。这里若无 cu_seqlens_k，
+    #       仍传入与 cu_seqlens_q 等形状的 dummy tensor 以满足 C++ 调用签名。
+    # - 互斥约束：paged-KV 时不得同时传 cu_seqlens_k 与 seqused_k（上方已断言）。
+        op_namespace = torch.ops._vllm_fa2_C
+        if return_aux and hasattr(op_namespace, "varlen_fwd_with_abs"):
+            _ret = op_namespace.varlen_fwd_with_abs(
+                q, k, v,
+                out,
+                cu_seqlens_q,
+        # 非分页：真实 cu_seqlens_k；分页：传 dummy（helper 内不会使用该参数来切片分页 K/V）。
+        dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
+                seqused_k,
+                None,
+                block_table,
+                alibi_slopes,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                False,
+                causal,
+                real_window_size[0],
+                real_window_size[1],
+                softcap,
+                return_softmax_lse and dropout_p > 0,
+                None,
+            )
+        else:
+            _ret = torch.ops._vllm_fa2_C.varlen_fwd(
+                q, k, v,
+                out,
+                cu_seqlens_q,
+        # 非分页：真实 cu_seqlens_k；分页：算子仍要求形参存在，这里传与 cu_seqlens_q 等形状的 dummy。
+                dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
+                seqused_k,
+                None,
+                block_table,
+                alibi_slopes,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                False,
+                causal,
+                real_window_size[0],
+                real_window_size[1],
+                softcap,
+                return_softmax_lse and dropout_p > 0,
+                None,
+            )
         #允许返回abs_s
         # Be tolerant to customized kernels that return extra tensors (e.g., abs_s)
         if isinstance(_ret, (tuple, list)) and len(_ret) >= 2:

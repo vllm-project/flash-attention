@@ -89,6 +89,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
             make_stride(_1{}, params.v_dim_stride, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0));
+
     typename CollectiveMainloop::Arguments mainloop_args {
         static_cast<Element const*>(params.q_ptr),
         {seqlen_q, params.d, params.h, batch_q},  // shape_Q
@@ -129,7 +130,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
         params.leftpad_k, params.seqlens_rotary,
-        static_cast<ElementS const*>(params.s_aux_ptr)
+        static_cast<ElementS const*>(params.s_aux_ptr),
+        params.cp_world_size, params.cp_rank,
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
@@ -156,6 +158,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         // params.num_m_blocks_ptr,
         params.num_splits_dynamic_ptr,
+        params.cp_world_size,
+        params.cp_rank,
     };
 
     if (Varlen && params.num_splits_dynamic_ptr && !params.skip_scheduler_metadata_computation) {

@@ -121,9 +121,13 @@ COMPILED_HDIMS = (
         (4224, 4224),
     ],
 )
+@pytest.mark.parametrize(
+    "cp_world_size", [4, 2],
+)
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv_, mha_type, dtype, test_sink
+        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv_, mha_type, dtype, test_sink,
+        cp_world_size,
 ):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
@@ -151,6 +155,7 @@ def test_flash_attn_output(
     s_aux = torch.randn(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # s_aux = torch.ones(nheads, device=device, dtype=torch.bfloat16) * 4 if test_sink else None
     # print("s_aux ", s_aux)
+    cp_rank = 0
     if test_sink:
         dv_vals = [d]
     for dv in dv_vals:
@@ -168,7 +173,7 @@ def test_flash_attn_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
+        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k * cp_world_size, (2,))
         # window_size = (-1, -1) if not local else (16, 0)
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32) * 2 for _ in range(3)]
@@ -190,6 +195,8 @@ def test_flash_attn_output(
             window_size=window_size,
             softcap=softcap,
             s_aux=s_aux,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -206,6 +213,8 @@ def test_flash_attn_output(
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
             s_aux=s_aux,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
         )
 
         # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_ref).float()
@@ -238,6 +247,8 @@ def test_flash_attn_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 s_aux=s_aux,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
             print("Pack GQA =", pack_gqa)
             print("Num splits =", num_splits)

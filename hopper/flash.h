@@ -161,6 +161,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The S extra matrix, (num_heads)
     void *__restrict__ s_aux_ptr;
+
+    // CP (Context Parallelism) parameters
+    int cp_world_size;
+    int cp_rank;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

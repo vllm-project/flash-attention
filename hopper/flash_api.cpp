@@ -434,8 +434,8 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
     // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, local attention
     // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
-    bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
-                                  params.is_local && 
+    bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 &&
+                                  params.is_local &&
                                   params.d == 64 && (params.dv == params.d);
     if (packgqa_override) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA
@@ -701,7 +701,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> &s_aux_ // (h)
+        std::optional<const at::Tensor> &s_aux_, // (h)
+        int const cp_world_size,  // context parallelism (cp) world size
+        int const cp_rank         // cp rank
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -784,7 +786,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
         #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
         TORCH_CHECK(head_size > 64, "This flash attention build does not support hdim != hdim_v when hdim <= 64");
-        #endif 
+        #endif
         #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
         TORCH_CHECK(head_size <= 64, "This flash attention build does not support hdim != hdim_v when hdim in (128, 192]");
         #endif
@@ -1147,6 +1149,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     } else {
         params.s_aux_ptr = nullptr;
     }
+
+    params.cp_world_size = cp_world_size;
+    params.cp_rank = cp_rank;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");

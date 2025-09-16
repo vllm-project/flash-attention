@@ -4,11 +4,28 @@ import time
 from typing import List
 
 import torch
+import importlib.util
+import os
 
-try:
-    from flash_attn.utils.cpu_block_attn import one_pass_abs_share
-except Exception:
-    one_pass_abs_share = None  # type: ignore
+# Optional CPU reference (one_pass_abs_share). We load it via filesystem so that
+# the repo不需要安装为包 (没有 flash_attn 模块也可运行)。
+def _load_cpu_abs_share():
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(this_dir, '..'))  # benchmarks/.. -> repo root (approx)
+    candidate = os.path.join(repo_root, 'flash_attn', 'utils', 'cpu_block_attn.py')
+    if not os.path.isfile(candidate):
+        return None
+    spec = importlib.util.spec_from_file_location("_cpu_block_attn_mod", candidate)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)  # type: ignore
+    except Exception:
+        return None
+    return getattr(mod, 'one_pass_abs_share', None)
+
+one_pass_abs_share = _load_cpu_abs_share()
 
 try:
     # vLLM style FA2 interface (already used in other benchmark script)
@@ -18,17 +35,17 @@ except Exception:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Benchmark abs_s overhead: baseline QK^T vs FA2 kernel return_aux vs CPU reconstruction")
+    p = argparse.ArgumentParser(description="Benchmark abs_s overhead: baseline vs FA2 (vllm_flash_attn) return_aux vs optional CPU reconstruction")
     p.add_argument('--d', type=int, default=128, help='Head dimension')
     p.add_argument('--N', type=int, nargs='+', default=[512, 1024, 2048], help='Sequence lengths')
     p.add_argument('--dtype', type=str, default='float16', choices=['float16','bfloat16','float32'], help='GPU dtype')
     p.add_argument('--causal', action='store_true', help='Apply causal mask (j>i zeroed)')
     p.add_argument('--iters', type=int, default=100, help='Timing iterations')
     p.add_argument('--warmup', type=int, default=20, help='Warmup iterations')
-    p.add_argument('--device', type=str, default='cuda', help='GPU device')
+    p.add_argument('--device', type=str, default='cuda', help='Device: cuda | cuda:IDX | IDX | cpu')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--compare-values', action='store_true', help='Compare kernel abs_s (row |S| sums) with CPU reference sums')
-    p.add_argument('--no-cpu', action='store_true', help='Skip CPU abs share path')
+    p.add_argument('--no-cpu', action='store_true', help='Skip CPU abs share path (or forced if cpu_block_attn not found)')
     p.add_argument('--no-gpu', action='store_true', help='Skip GPU abs share path')
     p.add_argument('--verbose', action='store_true')
     return p.parse_args()
@@ -138,11 +155,30 @@ def estimate_flops(N: int, d: int):
     return matmul_flops, abs_norm_flops
 
 
+def _parse_device(dev_str: str):
+    s = dev_str.strip().lower()
+    if s == 'cpu':
+        return 'cpu'
+    if s == 'cuda':
+        return 'cuda:0'
+    if s.startswith('cuda:'):
+        return s
+    # pure integer -> cuda:index
+    if s.isdigit():
+        return f'cuda:{s}'
+    return s  # fallback as-is
+
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available() and not args.no_gpu:
-        torch.cuda.set_device(args.device)
+    parsed_device = _parse_device(args.device)
+    use_gpu = torch.cuda.is_available() and not args.no_gpu and parsed_device != 'cpu'
+    if use_gpu:
+        try:
+            torch.cuda.set_device(parsed_device)
+        except Exception as e:
+            print(f"[WARN] 无法设置 GPU 设备 '{parsed_device}': {e}. 将跳过 GPU 基准。")
+            use_gpu = False
     else:
         if not torch.cuda.is_available() and not args.no_gpu:
             print("[WARN] CUDA 不可用，GPU 路径将被跳过")
@@ -164,18 +200,18 @@ def main():
         Q_cpu = torch.randn(N, H, d, dtype=torch.float32)
         K_cpu = torch.randn(N, H, d, dtype=torch.float32)
 
-        if torch.cuda.is_available() and not args.no_gpu:
+        if use_gpu:
             Q_gpu = to_dtype(Q_cpu.cuda(non_blocking=True), gpu_dtype)
             K_gpu = to_dtype(K_cpu.cuda(non_blocking=True), gpu_dtype)
         else:
             Q_gpu = K_gpu = None
 
-        if Q_gpu is not None and flash_attn_varlen_func is not None and not args.no_gpu:
+        if Q_gpu is not None and flash_attn_varlen_func is not None and use_gpu:
             baseline_t = time_fn(lambda a,b: _call_kernel_abs_s(a,b,args.causal, want_aux=False), Q_gpu, K_gpu, iters=args.iters, warmup=args.warmup)
         else:
             baseline_t = float('nan')
 
-        if Q_gpu is not None and flash_attn_varlen_func is not None and not args.no_gpu:
+        if Q_gpu is not None and flash_attn_varlen_func is not None and use_gpu:
             gpu_abs_t = time_fn(lambda a,b: _call_kernel_abs_s(a,b,args.causal, want_aux=True), Q_gpu, K_gpu, iters=args.iters, warmup=args.warmup)
         else:
             gpu_abs_t = float('nan')
@@ -194,7 +230,7 @@ def main():
 
         print(f"{N:6d} | {baseline_t*1e3:12.3f} | {gpu_abs_t*1e3:14.3f} | {gpu_overhead:6.1f} | {cpu_abs_t*1e3:11.3f} | {cpu_overhead:6.1f} | {gflops:13.2f} | {abs_extra_gflops:16.3f}")
 
-        if args.compare_values and Q_gpu is not None and one_pass_abs_share is not None and not args.no_gpu and not args.no_cpu and flash_attn_varlen_func is not None:
+    if args.compare_values and Q_gpu is not None and one_pass_abs_share is not None and use_gpu and not args.no_cpu and flash_attn_varlen_func is not None:
             try:
                 outs = _call_kernel_abs_s(Q_gpu, K_gpu, args.causal, want_aux=True)
                 extras = outs[2:] if isinstance(outs,(tuple,list)) else []

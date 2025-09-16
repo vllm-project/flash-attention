@@ -412,6 +412,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSAux const* const ptr_S_aux = nullptr;
+        int const dcp_rank = 0;
+        int const dcp_world_size = 1;
+        int const* const query_base_positions = nullptr;
     };
 
     // Device side kernel params
@@ -469,6 +472,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         ElementSAux const* const ptr_S_aux = nullptr;
+        int const dcp_rank = 0;
+        int const dcp_world_size = 1;
+        int const* const query_base_positions = nullptr;
     };
 
     static Params
@@ -584,7 +590,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_S_aux};
+                args.ptr_S_aux,
+                args.dcp_rank, args.dcp_world_size, args.query_base_positions};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1093,7 +1100,9 @@ struct CollectiveMainloopFwdSm90 {
         // But we subtract n_offset for consistency in mask calculations
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 - n_offset /*sink_token_length*/,
-            params.qhead_per_khead_divmod
+            params.qhead_per_khead_divmod,
+            params.dcp_rank, params.dcp_world_size,
+            params.query_base_positions != nullptr ? params.query_base_positions[bidb] : 0
         );
 
         float softcap_val = params.softcap_val;

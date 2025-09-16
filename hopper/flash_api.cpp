@@ -701,7 +701,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> &s_aux_ // (h)
+        std::optional<const at::Tensor> &s_aux_, // (h)
+        int dcp_rank,
+        int dcp_world_size,
+        std::optional<const at::Tensor> &query_base_positions_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1148,6 +1151,15 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.s_aux_ptr = nullptr;
     }
 
+    // Set context parallelism parameters
+    params.dcp_rank = dcp_rank;
+    params.dcp_world_size = dcp_world_size;
+    if (query_base_positions_.has_value()) {
+        params.query_base_positions = query_base_positions_.value().data_ptr<int>();
+    } else {
+        params.query_base_positions = nullptr;
+    }
+
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
@@ -1280,7 +1292,10 @@ std::vector<at::Tensor> mha_bwd(
     int window_size_right,
     float const softcap,
     bool const deterministic,
-    int const sm_margin) {
+    int const sm_margin,
+    int dcp_rank,
+    int dcp_world_size,
+    std::optional<const at::Tensor> &query_base_positions_) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1512,6 +1527,15 @@ std::vector<at::Tensor> mha_bwd(
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
     params.dv = head_size;  // We don't support hdim_v being different from hdim_qk for now
+
+    // Set context parallelism parameters
+    params.dcp_rank = dcp_rank;
+    params.dcp_world_size = dcp_world_size;
+    if (query_base_positions_.has_value()) {
+        params.query_base_positions = query_base_positions_.value().data_ptr<int>();
+    } else {
+        params.query_base_positions = nullptr;
+    }
 
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();

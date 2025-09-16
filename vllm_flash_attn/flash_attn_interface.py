@@ -146,6 +146,10 @@ def flash_attn_varlen_func(
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
     s_aux=None,
+    # Context parallelism parameters for MLA decode
+    dcp_rank=None,
+    dcp_world_size=None,
+    query_base_positions=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -255,6 +259,18 @@ def flash_attn_varlen_func(
         )
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
+
+        # Handle context parallelism parameters - convert None to default values
+        dcp_rank_val = dcp_rank if dcp_rank is not None else 0
+        dcp_world_size_val = dcp_world_size if dcp_world_size is not None else 1
+
+        # For query_base_positions, we need to handle the tensor case
+        query_base_positions_tensor = query_base_positions
+        if query_base_positions is None:
+            # Create a zero tensor with the right shape for the batch
+            batch_size = cu_seqlens_q.numel() - 1
+            query_base_positions_tensor = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
+
         out, softmax_lse, _, _ = torch.ops._vllm_fa3_C.fwd(
             q, k, v,
             None, None,       # k_new, v_new
@@ -279,7 +295,10 @@ def flash_attn_varlen_func(
             num_splits,
             None,             # pack_gqa
             0,                # sm_margin
-            s_aux             # s_aux
+            s_aux,            # s_aux
+            dcp_rank_val,     # dcp_rank
+            dcp_world_size_val,  # dcp_world_size
+            query_base_positions_tensor  # query_base_positions
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

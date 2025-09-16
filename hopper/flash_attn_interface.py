@@ -49,7 +49,10 @@ def _flash_attn_forward(
         num_splits=1,
         pack_gqa=None,
         sm_margin=0,
-        s_aux=None):
+        s_aux=None,
+        dcp_rank=0,
+        dcp_world_size=1,
+        query_base_positions=None):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -61,6 +64,9 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
+    # Handle context parallelism parameters
+    query_base_positions = maybe_contiguous(query_base_positions)
+
     out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
@@ -95,7 +101,10 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
-        s_aux
+        s_aux,
+        dcp_rank,
+        dcp_world_size,
+        query_base_positions
     )
     return out, softmax_lse, *rest
 
@@ -122,9 +131,15 @@ def _flash_attn_backward(
         softcap=0.0,
         deterministic=False,
         sm_margin=0,
+        dcp_rank=0,
+        dcp_world_size=1,
+        query_base_positions=None,
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # Handle context parallelism parameters
+    query_base_positions = maybe_contiguous(query_base_positions)
+
     dq, dk, dv, softmax_d, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
@@ -148,6 +163,9 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        dcp_rank,
+        dcp_world_size,
+        query_base_positions,
     )
     return dq, dk, dv, softmax_d
 
@@ -351,6 +369,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         s_aux=None,
+        dcp_rank=0,
+        dcp_world_size=1,
+        query_base_positions=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -380,6 +401,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
             s_aux=s_aux,
+            dcp_rank=dcp_rank,
+            dcp_world_size=dcp_world_size,
+            query_base_positions=query_base_positions,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -391,6 +415,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        # Save context parallelism parameters for backward pass
+        ctx.dcp_rank = dcp_rank
+        ctx.dcp_world_size = dcp_world_size
+        ctx.query_base_positions = query_base_positions
         return out, softmax_lse
 
     @staticmethod
@@ -419,11 +447,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            ctx.dcp_rank,
+            ctx.dcp_world_size,
+            ctx.query_base_positions,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -582,6 +613,9 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     s_aux=None,
+    dcp_rank=0,
+    dcp_world_size=1,
+    query_base_positions=None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -604,6 +638,9 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         s_aux,
+        dcp_rank,
+        dcp_world_size,
+        query_base_positions,
     )
 
 

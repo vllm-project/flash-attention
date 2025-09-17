@@ -122,9 +122,9 @@ COMPILED_HDIMS = (
     ],
 )
 @pytest.mark.parametrize(
-    "cp_world_size", [4, 2],
+    "cp_world_size", [4, 2, 1], # 1 means disabling cp
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+#@pytest.mark.parametrize('seqlen_q,seqlen_k', [(1, 1)])
 def test_flash_attn_output(
         seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv_, mha_type, dtype, test_sink,
         cp_world_size,
@@ -135,6 +135,8 @@ def test_flash_attn_output(
         pytest.skip("Has Qv requires hdim 64 and dtype to be float16 or bfloat16 (not float8_e4m3fn)")
     if test_sink and has_qv_:
         pytest.skip("Sink disabled for Qv")
+    if cp_world_size > 1 and local:
+        pytest.skip("context parallelism is not supported with local attention yet")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)

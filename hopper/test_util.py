@@ -250,12 +250,12 @@ def construct_cp_mask(
 
     # Calculate effective sequence lengths
     sk = (
-        seqlen_k * cp_world_size  # Global seqlen_k for DCP
+        torch.tensor(seqlen_k * cp_world_size, device=device, dtype=torch.long)  # Global seqlen_k for DCP
         if key_padding_mask is None
         else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1") * cp_world_size
     )
     sq = (
-        seqlen_q
+        torch.tensor(seqlen_q, device=device, dtype=torch.long)  # Global seqlen_k for DCP
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )

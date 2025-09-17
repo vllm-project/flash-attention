@@ -7,25 +7,27 @@ import torch
 import importlib.util
 import os
 
-# Optional CPU reference (one_pass_abs_share). We load it via filesystem so that
-# the repo不需要安装为包 (没有 flash_attn 模块也可运行)。
-def _load_cpu_abs_share():
+# Load CPU helpers (module file directly), whether or not certain symbols exist.
+def _load_cpu_helpers():
     this_dir = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(this_dir, '..'))  # benchmarks/.. -> repo root (approx)
     candidate = os.path.join(repo_root, 'flash_attn', 'utils', 'cpu_block_attn.py')
     if not os.path.isfile(candidate):
-        return None
+        return None, None, None
     spec = importlib.util.spec_from_file_location("_cpu_block_attn_mod", candidate)
     if spec is None or spec.loader is None:
-        return None
+        return None, None, None
     mod = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(mod)  # type: ignore
     except Exception:
-        return None
-    return getattr(mod, 'one_pass_abs_share', None)
+        return None, None, None
+    one_pass = getattr(mod, 'one_pass_abs_share', None)
+    kernel_abs = getattr(mod, 'kernel_abs_s_cpu', None)
+    blockwise = getattr(mod, 'blockwise_softmax_block_share', None)
+    return one_pass, kernel_abs, blockwise
 
-one_pass_abs_share = _load_cpu_abs_share()
+one_pass_abs_share, kernel_abs_s_cpu, blockwise_softmax_block_share = _load_cpu_helpers()
 
 try:
     # vLLM style FA2 interface (already used in other benchmark script)
@@ -44,10 +46,12 @@ def parse_args():
     p.add_argument('--warmup', type=int, default=20, help='Warmup iterations')
     p.add_argument('--device', type=str, default='cuda', help='Device: cuda | cuda:IDX | IDX | cpu')
     p.add_argument('--seed', type=int, default=0)
-    p.add_argument('--compare-values', action='store_true', help='Compare kernel abs_s (row |S| sums) with CPU reference sums')
+    p.add_argument('--compare-values', action='store_true', help='Compare kernel abs_s vs CPU reference (1/sqrt(D), no causal); uses inline CPU ref if utils export is absent')
     p.add_argument('--no-cpu', action='store_true', help='Skip CPU abs share path (or forced if cpu_block_attn not found)')
     p.add_argument('--no-gpu', action='store_true', help='Skip GPU abs share path')
     p.add_argument('--verbose', action='store_true')
+    p.add_argument('--block-size', type=int, default=0, help='Block size for CPU blockwise softmax mass W; if 0, a default will be chosen')
+    p.add_argument('--report-block', action='store_true', help='Print diagnostics for blockwise W (row sum ~1, sample)')
     return p.parse_args()
 
 
@@ -128,6 +132,32 @@ def baseline_matmul(q: torch.Tensor, k: torch.Tensor, causal: bool):
     return outs[0]
 
 
+def _cpu_abs_s_inline(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Inline CPU reference for abs_s (scale 1/sqrt(D), no causal).
+
+    Accepts q, k as (N, D) or (N, 1, D). Returns (1, N).
+    Only used for --compare-values when utils do not export kernel_abs_s_cpu.
+    """
+    if q.dim() == 3:
+        N, H, D = q.shape
+        assert H == 1, "inline abs_s expects H=1"
+        q2 = q[:, 0, :].contiguous()
+    else:
+        N, D = q.shape
+        q2 = q.contiguous()
+    if k.dim() == 3:
+        Nk, Hk, Dk = k.shape
+        assert Hk == 1 and Nk == N and Dk == D
+        k2 = k[:, 0, :].contiguous()
+    else:
+        Nk, Dk = k.shape
+        assert Nk == N and Dk == D
+        k2 = k.contiguous()
+    scale = (1.0 / (D ** 0.5))
+    S = (q2 @ k2.T) * scale  # (N, N)
+    return S.abs().sum(dim=-1, keepdim=True).transpose(0, 1)  # (1, N)
+
+
 def time_fn(fn, *args, iters: int, warmup: int):
     # GPU sync aware timer.
     for _ in range(warmup):
@@ -190,7 +220,7 @@ def main():
     }
     gpu_dtype = dtype_map[args.dtype]
 
-    header = f"{'N':>6} | {'Baseline(ms)':>12} | {'Kernel_abs(ms)':>14} | {'+%':>6} | {'CPU_abs(ms)':>11} | {'+%':>6} | {'Matmul GFLOPs':>13} | {'Abs Extra GFLOPs':>16}"
+    header = f"{'N':>6} | {'Baseline(ms)':>12} | {'Kernel_abs(ms)':>14} | {'+%':>6} | {'CPU_block(ms)':>13} | {'+%':>6} | {'Matmul GFLOPs':>13} | {'Abs Extra GFLOPs':>16}"
     print(header)
     print('-'*len(header))
 
@@ -216,8 +246,14 @@ def main():
         else:
             gpu_abs_t = float('nan')
 
-        if not args.no_cpu and one_pass_abs_share is not None:
-            cpu_abs_t = time_fn(lambda a,b: one_pass_abs_share(a.squeeze(1), b.squeeze(1), causal=args.causal), Q_cpu, K_cpu, iters=max(5, args.iters//10), warmup=max(2, args.warmup//10))
+        # CPU blockwise timing (uses blockwise_softmax_block_share if available)
+        if not args.no_cpu and blockwise_softmax_block_share is not None:
+            bs_used = args.block_size if (args.block_size and args.block_size > 0) else min(128, N)
+            cpu_abs_t = time_fn(
+                lambda a,b: blockwise_softmax_block_share(a.squeeze(1), b.squeeze(1), bs_used, causal=args.causal),
+                Q_cpu, K_cpu,
+                iters=max(5, args.iters//10), warmup=max(2, args.warmup//10)
+            )
         else:
             cpu_abs_t = float('nan')
 
@@ -230,31 +266,54 @@ def main():
 
         print(f"{N:6d} | {baseline_t*1e3:12.3f} | {gpu_abs_t*1e3:14.3f} | {gpu_overhead:6.1f} | {cpu_abs_t*1e3:11.3f} | {cpu_overhead:6.1f} | {gflops:13.2f} | {abs_extra_gflops:16.3f}")
 
-    if args.compare_values and Q_gpu is not None and one_pass_abs_share is not None and use_gpu and not args.no_cpu and flash_attn_varlen_func is not None:
+        # Diagnostics for blockwise W
+        if args.report_block and blockwise_softmax_block_share is not None and not math.isnan(cpu_abs_t):
+            try:
+                bs_used = args.block_size if (args.block_size and args.block_size > 0) else min(128, N)
+                Wblk = blockwise_softmax_block_share(Q_cpu.squeeze(1), K_cpu.squeeze(1), bs_used, causal=args.causal)
+                rowsum = Wblk.sum(dim=1)
+                print(f"    blockW rowsum min={rowsum.min().item():.6f} max={rowsum.max().item():.6f} mean={rowsum.mean().item():.6f} Tc={Wblk.shape[1]}")
+                if args.verbose:
+                    i = min(3, Wblk.shape[0]-1)
+                    print(f"    sample W[i,:5]={Wblk[i,:min(5,Wblk.shape[1])].tolist()}")
+            except Exception as e:
+                print(f"    [block] failed: {e}")
+
+        # -------- value compare (per N) --------
+        if args.compare_values:
+            if not use_gpu:
+                print("    [compare] skip: GPU disabled or unavailable")
+                continue
+            if flash_attn_varlen_func is None:
+                print("    [compare] skip: flash_attn_varlen_func not imported")
+                continue
             try:
                 outs = _call_kernel_abs_s(Q_gpu, K_gpu, args.causal, want_aux=True)
-                extras = outs[2:] if isinstance(outs,(tuple,list)) else []
-                abs_s = None
-                for ex in extras:
-                    if isinstance(ex, torch.Tensor):
-                        abs_s = ex
-                        break
-                if abs_s is None:
-                    print("    (No abs_s returned by kernel)")
-                else:
-                    Qf = Q_cpu.squeeze(1)
-                    Kf = K_cpu.squeeze(1)
-                    S_cpu = Qf @ Kf.T
-                    if args.causal:
-                        mask = torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1)
-                        S_cpu = S_cpu.masked_fill(mask, 0.0)
-                    ref_sums = S_cpu.abs().sum(dim=-1)
-                    abs_s_view = abs_s.reshape(-1, N)[0].float().cpu()
-                    max_diff = (abs_s_view - ref_sums).abs().max().item()
-                    rel_err = max_diff / (ref_sums.abs().max().item() + 1e-9)
-                    print(f"    abs_s row-sum max_diff={max_diff:.3e} rel_err={rel_err:.3e}")
             except Exception as e:
-                print(f"    (compare failed: {e})")
+                print(f"    [compare] kernel call failed: {e}")
+                continue
+            extras = outs[2:] if isinstance(outs,(tuple,list)) else []
+            abs_s = None
+            for ex in extras:
+                if isinstance(ex, torch.Tensor):
+                    abs_s = ex
+                    break
+            if abs_s is None:
+                print("    [compare] skip: kernel returned no aux tensor (abs_s)")
+                continue
+            # CPU reference (kernel semantics: scale 1/sqrt(d), no causal)
+            Qf = Q_cpu.float()
+            Kf = K_cpu.float()
+            if kernel_abs_s_cpu is not None:
+                ref = kernel_abs_s_cpu(Qf, Kf)[0].cpu()  # H=1
+            else:
+                ref = _cpu_abs_s_inline(Qf.squeeze(1), Kf.squeeze(1))[0].cpu()
+            abs_s_view = abs_s.reshape(-1, N)[0].float().cpu()
+            max_diff = (abs_s_view - ref).abs().max().item()
+            rel_err = max_diff / (ref.abs().max().item() + 1e-9)
+            print(f"    abs_s max_diff={max_diff:.3e} rel_err={rel_err:.3e} (kernel_vs_cpu)")
+            if args.verbose:
+                print(f"    shapes: abs_s={tuple(abs_s.shape)} ref={tuple(ref.shape)}")
 
     print("Done.")
 

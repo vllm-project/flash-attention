@@ -1,62 +1,72 @@
-"""CPU single-pass absolute score share utility (minimal).
+"""CPU blockwise softmax mass share utility.
 
-Only保留绝对值份额 (abs_s) 计算：
+仅保留按列块（blockwise）计算 softmax 概率质量份额 W 的实现：
 
-    one_pass_abs_share(Q, K, *, causal=False)
+    blockwise_softmax_block_share(Q, K, block_size, *, causal=False) -> W
 
-定义：
-    S = Q K^T
-    若 causal=True，则对 j > i 的位置设为 0（不计入强度）。
-    W_abs[i,j] = |S[i,j]| / sum_j |S[i,j]|  （行归一化，若行全 0 则返回该行 0）
-
-注意：本实现会构建完整 (N,N) 矩阵，适用于中小 N 的分析与验证，不做内存优化。
+约定：
+- Q, K 为 (N, d) 的 CPU tensor；内部使用缩放 1/sqrt(d)；
+- 返回 W 形状为 (N, Tc)，Tc = ceil(N / block_size)，表示每一行在各列块上的 softmax 质量份额；
+- 若 causal=True，则仅累计每行 i 的 key 索引 j ≤ i 的质量。
 """
 from __future__ import annotations
-from typing import Tuple
 import torch
+__all__ = ["blockwise_softmax_block_share"]
 
-__all__ = ["one_pass_abs_share"]
 
+def blockwise_softmax_block_share(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    block_size: int,
+    *,
+    causal: bool = False,
+) -> torch.Tensor:
+    """按 FlashAttention 的在线 LSE 更新，计算每行在各列块上的 softmax 概率质量份额。
 
-'''
-Applies a causal mask to the input tensor S.
-'''
-def _apply_causal_mask_full(S: torch.Tensor):
-    N = S.shape[0]
-    mask = torch.triu(torch.ones(N, N, dtype=torch.bool), diagonal=1)
-    return mask
-
-def one_pass_abs_share(Q: torch.Tensor, K: torch.Tensor, *, causal: bool=False) -> torch.Tensor:
-    """计算绝对值份额矩阵 W_abs (单趟, 返回 N x N)。
-
-    Args:
-        Q, K: 形状 (N, d) 的 CPU tensor。
-        causal: 是否应用因果遮挡；若 True，则列 j>i 位置的分数置 0。
-
-    Returns:
-        W_abs: (N,N) 行归一化矩阵；若某行全 0，则该行保持 0。
+    返回 W 形状 (N, Tc)，其中 Tc = ceil(N / block_size)。
     """
     assert Q.device.type == 'cpu' and K.device.type == 'cpu', "Use CPU tensors."
     N, d = Q.shape
     assert K.shape == (N, d)
-    S = Q @ K.T  # (N,N)
-    if causal:
-        mask = _apply_causal_mask_full(S)
-        S = S.masked_fill(mask, 0.0)
-    A = S.abs()
-    denom = A.sum(dim=-1, keepdim=True)  # (N,1)
-    nonzero = denom > 0
-    # 避免除 0：行和为 0 的行保持 0
-    W = torch.zeros_like(A)
-    if nonzero.any():
-        W[nonzero.squeeze(1)] = A[nonzero.squeeze(1)] / denom[nonzero]
-    return W
+    Qf = Q.float()
+    Kf = K.float()
+    scale = (1.0 / d**0.5)
 
-# ---------- Demo ----------
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    N, d = 16, 8
-    Q = torch.randn(N, d)
-    K = torch.randn(N, d)
-    W_abs = one_pass_abs_share(Q, K, causal=True)
-    print("Abs share shape:", W_abs.shape, "row0 sum=", float(W_abs[0].sum()))
+    Tc = (N + block_size - 1) // block_size
+    W = torch.zeros(N, Tc, dtype=torch.float32)
+    m = torch.full((N,), float('-inf'), dtype=torch.float32)
+    l = torch.zeros(N, dtype=torch.float32)
+    row_idx = torch.arange(N, dtype=torch.long)
+
+    for j in range(Tc):
+        start = j * block_size
+        end = min(N, (j + 1) * block_size)
+        K_blk = Kf[start:end]
+        S_blk = (Qf @ K_blk.T) * scale  # (N, B)
+
+        if causal:
+            key_idx = torch.arange(start, end, dtype=torch.long)
+            allow = key_idx.unsqueeze(0) <= row_idx.unsqueeze(1)
+            S_blk = torch.where(allow, S_blk, torch.full_like(S_blk, float('-inf')))
+
+        blk_max, _ = S_blk.max(dim=1)
+        m_new = torch.maximum(m, blk_max)
+
+        exp_term = torch.exp(S_blk - m_new.unsqueeze(1))
+        P = exp_term.sum(dim=1)
+
+        alpha = torch.zeros_like(l)
+        finite_mask = torch.isfinite(m_new)
+        alpha[finite_mask] = torch.exp((m - m_new)[finite_mask])
+
+        l_new = l * alpha + P
+
+        wj = torch.zeros_like(l_new)
+        nz = l_new > 0
+        wj[nz] = P[nz] / l_new[nz]
+        W[:, j] = wj
+
+        m = m_new
+        l = l_new
+
+    return W

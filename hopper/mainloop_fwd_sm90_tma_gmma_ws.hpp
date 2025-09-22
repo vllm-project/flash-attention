@@ -1298,7 +1298,10 @@ struct CollectiveMainloopFwdSm90 {
             int const n_block_min_before_local_mask = !Is_local
                 ? n_block_min
                 : std::max(n_block_min,
-                           cute::ceil_div(m_idx_max + params.cp_world_size * seqlen_k - seqlen_q - params.window_size_left, kBlockN));
+                           cute::ceil_div(m_idx_max +
+                                          params.cp_world_size * seqlen_k -
+                                          seqlen_q - params.window_size_left,
+                                          params.cp_world_size * kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {

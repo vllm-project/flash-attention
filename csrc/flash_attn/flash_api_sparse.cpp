@@ -231,7 +231,7 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(q.get_device())};
 
     auto opts = q.options();
 
@@ -435,7 +435,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(q.get_device())};
 
     auto opts = q.options();
     auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));

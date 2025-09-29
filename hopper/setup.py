@@ -67,7 +67,9 @@ ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TR
 DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "FALSE") == "TRUE"
 DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") == "TRUE"
 
-# DISABLE_BACKWARD = True
+PACKGQA_ONLY = os.getenv("FLASH_ATTENTION_PACKGQA_ONLY", "FALSE") == "TRUE"
+
+DISABLE_BACKWARD = True
 # DISABLE_SPLIT = True
 # DISABLE_PAGEDKV = True
 # DISABLE_APPENDKV = True
@@ -77,16 +79,18 @@ DISABLE_HDIMDIFF192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF192", "FALSE") 
 # DISABLE_FP16 = True
 # DISABLE_FP8 = True
 # DISABLE_VARLEN = True
-# DISABLE_CLUSTER = True
+DISABLE_CLUSTER = True
 # DISABLE_HDIM64 = True
 # DISABLE_HDIM96 = True
 # DISABLE_HDIM128 = True
 # DISABLE_HDIM192 = True
 # DISABLE_HDIM256 = True
-# DISABLE_SM8x = True
+DISABLE_SM8x = True
 
-# DISABLE_HDIMDIFF64 = True
+DISABLE_HDIMDIFF64 = True
 # DISABLE_HDIMDIFF192 = True
+
+PACKGQA_ONLY = True
 
 # HACK: we monkey patch pytorch's _write_ninja_file to pass
 # "-gencode arch=compute_sm90a,code=sm_90a" to files ending in '_sm90.cu',
@@ -492,6 +496,8 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF192"] if DISABLE_HDIMDIFF192 else [])
+        + (["-DFLASHATTENTION_PACKGQA_ONLY"] if PACKGQA_ONLY else [])
+        + (["-DFLASHATTENTION_VARLEN_ONLY"])
     )
 
     DTYPE_FWD_SM80 = ["bf16"] + (["fp16"] if not DISABLE_FP16 else [])
@@ -537,10 +543,15 @@ if not SKIP_CUDA_BUILD:
     # We already always hard-code PackGQA=true for Sm8x
     sources_fwd_sm80 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}_sm80.cu"
                         for hdim, dtype, split, paged, softcap in itertools.product(HEAD_DIMENSIONS_FWD_SM80, DTYPE_FWD_SM80, SPLIT, PAGEDKV, SOFTCAP_ALL)]
-    # We already always hard-code PackGQA=true for Sm9x if PagedKV or Split
+    # We already always hard-code PackGQA=true for Sm9x
+    # "not (packgqa and (paged or split))" is default setting since PackGQA=true if PagedKV or Split
+    # We then add "(packgqa or paged or split)" to enable PackGQA always
     sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                         for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
-                        if not (packgqa and (paged or split))]
+                        if not (packgqa and (paged or split)) and (not PACKGQA_ONLY or packgqa or paged or split)]
+    # sources_fwd_sm90 = [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+    #                     for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_FWD, DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+    #                     if not (packgqa and (paged or split))]
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)

@@ -547,7 +547,7 @@ struct CollectiveMainloopFwdSm90 {
                 return nullptr;
             }
         }();
-
+        
         auto const shape_Qv_packed = cute::conditional_return<!PackGQA>(
             shape_Qv,
             make_shape(make_shape(qhead_per_khead, get<0>(shape_Qv)), get<1>(shape_Qv), get<2>(args.shape_K), get<3>(shape_Qv))
@@ -1007,7 +1007,6 @@ struct CollectiveMainloopFwdSm90 {
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
-        // block index
         int const m_block = get<0>(block_coord);
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
@@ -1103,7 +1102,7 @@ struct CollectiveMainloopFwdSm90 {
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 - n_offset /*sink_token_length*/,
             params.qhead_per_khead_divmod,
-            params.cp_world_size, params.cp_rank, seqlen_info.cp_tot_seqlen_k
+            params.cp_world_size, params.cp_rank, seqlen_info.tot_seqlen_k
         );
 
         float softcap_val = params.softcap_val;
@@ -1211,7 +1210,6 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         if constexpr (IntraWGOverlap) {
-
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
@@ -1283,8 +1281,7 @@ struct CollectiveMainloopFwdSm90 {
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
-                auto mask_fn = [&](auto& tSrS, int n_block) {
-                  mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+                auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
                 // If local, blocking (window_size_right + window_size_left)
                 int const n_block_min_causal_local_mask =
@@ -1297,13 +1294,15 @@ struct CollectiveMainloopFwdSm90 {
 
             int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
             // If local, blocking (m_idx_max - m_idx_min)
+            // when cp is not enabled, tot_seqlen_k is equal to seqlen_k, and cp_world_size is 1.
+            // cp_world_size is guaranteed to be greater than 0
             int const n_block_min_before_local_mask = !Is_local
                 ? n_block_min
                 : std::max(n_block_min,
-                           cute::ceil_div(m_idx_max +
-                                          params.cp_world_size * seqlen_k -
-                                          seqlen_q - params.window_size_left,
-                                          params.cp_world_size * kBlockN));
+                           cute::ceil_div(
+                           cute::ceil_div(m_idx_max + seqlen_info.tot_seqlen_k - seqlen_q - params.window_size_left - seqlen_info.cp_rank,
+                                          seqlen_info.cp_world_size),
+                           kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1429,7 +1428,7 @@ struct CollectiveMainloopFwdSm90 {
             // Tensor scores_scale = softmax.finalize(v_descale);
             Tensor scores_scale = make_tensor_like(softmax.row_max);
             finalize_dispatch(scores_scale, v_descale);
-
+            
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());

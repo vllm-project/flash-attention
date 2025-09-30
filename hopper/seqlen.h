@@ -34,7 +34,7 @@ struct SeqlenInfoQK {
     int const offset_q, offset_k, offset_q_padded;
     int const seqlen_q, seqlen_k;
     int const cp_world_size;
-    int const cp_tot_seqlen_k;
+    int const tot_seqlen_k;
 
     CUTLASS_DEVICE
     SeqlenInfoQK(int const bidb, int const seqlen_q_static, int const seqlen_k_static,
@@ -56,9 +56,9 @@ struct SeqlenInfoQK {
                    ? seqlen_k_static
                    : (seqused_k ? seqused_k[bidb] : (cu_seqlens_k ? cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb] : seqlen_k_static)))
         , cp_world_size(cp_world_size)
-        , cp_tot_seqlen_k(cp_tot_seqused_k == nullptr
-                          ? 0
-                          : cp_tot_seqused_k[bidb])
+        , tot_seqlen_k(cp_tot_seqused_k == nullptr
+                       ? seqlen_k
+                       : cp_tot_seqused_k[bidb])
     {
     }
 
@@ -74,7 +74,7 @@ struct SeqlenInfoQKNewK {
     int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k, seqlen_rotary;
     int const cp_world_size;
     int const cp_rank;
-    int const cp_tot_seqlen_k;
+    int const tot_seqlen_k;
 
     CUTLASS_DEVICE
     SeqlenInfoQKNewK(int const bidb, int const seqlen_q_static, int const seqlen_k_static, int const shape_K_new_0,
@@ -100,9 +100,9 @@ struct SeqlenInfoQKNewK {
         , seqlen_rotary(!AppendKV || !seqlens_rotary ? seqlen_k_og + leftpad_k : seqlens_rotary[bidb])
         , cp_world_size(cp_world_size)
         , cp_rank(cp_rank)
-        , cp_tot_seqlen_k(cp_tot_seqused_k == nullptr
-                          ? 0
-                          : cp_tot_seqused_k[bidb])
+        , tot_seqlen_k(cp_tot_seqused_k == nullptr
+                       ? seqlen_k
+                       : cp_tot_seqused_k[bidb])
     {
     }
 

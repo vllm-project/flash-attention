@@ -434,7 +434,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     if (params.arch < 90 || (params.page_table && !params.pagedkv_tma) || params.num_splits > 1) { return true; }
     // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, local attention
     // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
-    bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 &&
+    bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
                                   params.is_local &&
                                   params.d == 64 && (params.dv == params.d);
     if (packgqa_override) { return true; }
@@ -787,7 +787,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         }
         #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
         TORCH_CHECK(head_size > 64, "This flash attention build does not support hdim != hdim_v when hdim <= 64");
-        #endif
+        #endif 
         #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
         TORCH_CHECK(head_size <= 64, "This flash attention build does not support hdim != hdim_v when hdim in (128, 192]");
         #endif
@@ -1161,6 +1161,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.cp_rank = cp_rank;
     params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
       static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
+    TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
+    TORCH_CHECK(cp_world_size != 1 || cp_rank == 0, "When context parallelism is disabled, cp_rank must be zero");
+    TORCH_CHECK(cp_world_size == 1 || cp_tot_seqused_k_.has_value(), "cp_tot_seqused_k_ must be provided when context parallelism is enabled.");
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");

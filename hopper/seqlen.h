@@ -100,7 +100,7 @@ struct SeqlenInfoQKNewK {
         , seqlen_rotary(!AppendKV || !seqlens_rotary ? seqlen_k_og + leftpad_k : seqlens_rotary[bidb])
         , cp_world_size(cp_world_size)
         , cp_rank(cp_rank)
-        , tot_seqlen_k(cp_tot_seqused_k == nullptr
+        , tot_seqlen_k(cp_tot_seqused_k == nullptr and cp_world_size <= 1
                        ? seqlen_k
                        : cp_tot_seqused_k[bidb])
     {

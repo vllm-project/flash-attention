@@ -165,6 +165,7 @@ def construct_local_mask(
     device=None,
     cp_world_size=1,
     cp_rank=0,
+    cp_tot_seqlen_k=None,
 ):
     if cp_world_size > 1:
         return construct_cp_mask(
@@ -172,6 +173,7 @@ def construct_local_mask(
             seqlen_k,
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
             window_size=window_size,
             sink_token_length=sink_token_length,
             query_padding_mask=query_padding_mask,
@@ -209,6 +211,7 @@ def construct_cp_mask(
     seqlen_k,
     cp_world_size=1,
     cp_rank=0,
+    cp_tot_seqlen_k=None,
     window_size=(-1, -1),  # -1 means infinite window size
     sink_token_length=0,
     query_padding_mask=None,
@@ -250,7 +253,7 @@ def construct_cp_mask(
 
     # Calculate effective sequence lengths
     sk = (
-        torch.tensor(seqlen_k * cp_world_size, device=device, dtype=torch.long)  # Global seqlen_k for DCP
+        cp_tot_seqlen_k[0]
         if key_padding_mask is None
         else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1") * cp_world_size
     )
@@ -300,7 +303,6 @@ def construct_cp_mask(
                 ),
             )
 
-    print(f"cp {mask=}")
     return mask
 
 
@@ -326,6 +328,7 @@ def attention_ref(
     s_aux=None,
     cp_world_size=1,
     cp_rank=0,
+    cp_tot_seqlen_k=None,
 ):
     """
     Arguments:
@@ -396,6 +399,7 @@ def attention_ref(
             device=q.device,
             cp_world_size=cp_world_size,
             cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
         )
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:

@@ -1284,8 +1284,13 @@ struct CollectiveMainloopFwdSm90 {
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
                 // If local, blocking (window_size_right + window_size_left)
+                // when cp is not enabled, tot_seqlen_k is equal to seqlen_k, and cp_world_size is 1.
+                // cp_world_size is guaranteed to be greater than 0
                 int const n_block_min_causal_local_mask =
-                    std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+                    std::max(n_block_min,
+                             (m_idx_min + seqlen_info.tot_seqlen_k - seqlen_q + params.window_size_right) /
+                             seqlen_info.cp_world_size /
+                             kBlockN);
                 #pragma unroll 1
                 for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                     fwd_step(n_block, mask_fn, cute::true_type{} /*check_inf*/);

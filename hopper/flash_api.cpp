@@ -435,7 +435,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
     // Always enable PackGQA for special case of hdim = 64, qheads/kvheads = 8, local attention
     // TODO: investigate more cases where PackGQA improves perf due to better tile quantization
     bool const packgqa_override = params.arch >= 90 && (params.h / params.h_k) == 8 && 
-                                  params.is_local &&
+                                  params.is_local && 
                                   params.d == 64 && (params.dv == params.d);
     if (packgqa_override) { return true; }
     #ifdef FLASHATTENTION_DISABLE_PACKGQA

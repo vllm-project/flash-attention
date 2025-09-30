@@ -231,6 +231,7 @@ def construct_cp_mask(
         seqlen_k: Length of key sequence (local to this rank)
         cp_world_size: Number of context parallel ranks
         cp_rank: Current rank ID (0 to cp_world_size-1)
+        cp_tot_seqlen_k: Total lengths of key sequence in cp world
         window_size: (left_window, right_window), -1 = infinite
         sink_token_length: Number of "sink" tokens that can always be attended to
         query_padding_mask: Which query positions are valid
@@ -350,6 +351,7 @@ def attention_ref(
         s_aux: (nheads)
         cp_world_size: Number of context parallel ranks
         cp_rank: Current rank ID (0 to cp_world_size-1)
+        cp_tot_seqlen_k:  (batch_size) total seqlen of k/v in cp world
     Output:
         output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout

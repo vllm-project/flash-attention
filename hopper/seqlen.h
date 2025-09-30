@@ -56,7 +56,7 @@ struct SeqlenInfoQK {
                    ? seqlen_k_static
                    : (seqused_k ? seqused_k[bidb] : (cu_seqlens_k ? cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb] : seqlen_k_static)))
         , cp_world_size(cp_world_size)
-        , tot_seqlen_k(cp_tot_seqused_k == nullptr
+        , tot_seqlen_k(cp_tot_seqused_k == nullptr and cp_world_size <= 1
                        ? seqlen_k
                        : cp_tot_seqused_k[bidb])
     {

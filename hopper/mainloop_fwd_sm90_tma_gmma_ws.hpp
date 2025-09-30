@@ -415,6 +415,7 @@ struct CollectiveMainloopFwdSm90 {
         // Context parallelism (CP) parameters
         int const cp_world_size = 1;
         int const cp_rank = 0;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     // Device side kernel params
@@ -474,6 +475,7 @@ struct CollectiveMainloopFwdSm90 {
         ElementSAux const* const ptr_S_aux = nullptr;
         int cp_world_size = 1;
         int cp_rank = 0;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     static Params
@@ -590,7 +592,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
                 args.ptr_S_aux,
-                args.cp_world_size, args.cp_rank};
+                args.cp_world_size, args.cp_rank, args.cp_tot_seqused_k};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1101,7 +1103,7 @@ struct CollectiveMainloopFwdSm90 {
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 - n_offset /*sink_token_length*/,
             params.qhead_per_khead_divmod,
-            params.cp_world_size, params.cp_rank
+            params.cp_world_size, params.cp_rank, seqlen_info.cp_tot_seqlen_k
         );
 
         float softcap_val = params.softcap_val;

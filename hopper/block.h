@@ -38,11 +38,17 @@ struct BlockMN {
             // TODO: check off-by-1 error
             if (PackGQA) { m_idx_max = qhead_per_khead_divmod.divide(m_idx_max - 1) + 1 ; }
             // If local, blocking (m_idx_max - m_idx_min + window_size_right + window_size_left)  
-            n_block_max = std::min(n_block_max,
-                                   cute::ceil_div(m_idx_max +
-                                                  seqlen_info.cp_world_size * seqlen_k -
-                                                  seqlen_q + window_size_right,
-                                                  seqlen_info.cp_world_size * kBlockN));
+            if (seqlen_info.cp_world_size > 1) {
+              n_block_max = std::min(n_block_max,
+                                     cute::ceil_div(
+                                     cute::ceil_div(m_idx_max + seqlen_info.cp_tot_seqlen_k - seqlen_q + window_size_right - seqlen_info.cp_rank,
+                                                    seqlen_info.cp_world_size),
+                                     kBlockN));
+            } else {
+              n_block_max = std::min(n_block_max,
+                                     cute::ceil_div(m_idx_max + seqlen_k - seqlen_q + window_size_right,
+                                                    kBlockN));
+            }
         }
         // Now, only adjust n_block_min if split
         int n_block_min = 0;

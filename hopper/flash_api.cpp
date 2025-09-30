@@ -703,7 +703,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int const sm_margin,
         std::optional<const at::Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
-        int const cp_rank         // cp rank
+        int const cp_rank,         // cp rank
+        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -840,6 +841,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
         CHECK_DEVICE(seqused_k); CHECK_CONTIGUOUS(seqused_k);
         CHECK_SHAPE(seqused_k, batch_size);
+    }
+    if (cp_tot_seqused_k_.has_value()) {
+        auto cp_tot_seqused_k = cp_tot_seqused_k_.value();
+        TORCH_CHECK(cp_tot_seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        CHECK_DEVICE(cp_tot_seqused_k); CHECK_CONTIGUOUS(cp_tot_seqused_k);
+        CHECK_SHAPE(cp_tot_seqused_k, batch_size);
     }
 
     if (leftpad_k_.has_value()) {
@@ -1152,6 +1159,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     params.cp_world_size = cp_world_size;
     params.cp_rank = cp_rank;
+    params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
+      static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");

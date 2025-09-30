@@ -148,6 +148,7 @@ def flash_attn_varlen_func(
     s_aux=None,
     cp_world_size=1,
     cp_rank=0,
+    cp_tot_seqused_k=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -284,6 +285,7 @@ def flash_attn_varlen_func(
             s_aux,            # s_aux
             cp_world_size,
             cp_rank,
+            cp_tot_seqused_k,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
@@ -322,6 +324,7 @@ def flash_attn_with_kvcache(
     s_aux=None,
     cp_world_size=1,
     cp_rank=0,
+    cp_tot_seqused_k=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from

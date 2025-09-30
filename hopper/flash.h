@@ -165,6 +165,7 @@ struct Flash_fwd_params : public Qkv_params {
     // CP (Context Parallelism) parameters
     int cp_world_size;
     int cp_rank;
+    int *__restrict__ cp_tot_seqused_k;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

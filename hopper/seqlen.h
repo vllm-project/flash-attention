@@ -34,12 +34,14 @@ struct SeqlenInfoQK {
     int const offset_q, offset_k, offset_q_padded;
     int const seqlen_q, seqlen_k;
     int const cp_world_size;
+    int const cp_tot_seqlen_k;
 
     CUTLASS_DEVICE
     SeqlenInfoQK(int const bidb, int const seqlen_q_static, int const seqlen_k_static,
                  int const* const cu_seqlens_q, int const* const cu_seqlens_k,
                  int const* const seqused_q, int const* const seqused_k,
-                 int const cp_world_size=1)
+                 int const cp_world_size=1,
+                 int const* const cp_tot_seqused_k=nullptr)
         : offset_q(!Varlen || cu_seqlens_q == nullptr ? 0 : cu_seqlens_q[bidb])
         , offset_k(!Varlen || cu_seqlens_k == nullptr ? 0 : cu_seqlens_k[bidb])
         // If varlen, the layout for dPSum, LSE_log2, and dQaccum is that we pad each sequence in the batch
@@ -54,6 +56,9 @@ struct SeqlenInfoQK {
                    ? seqlen_k_static
                    : (seqused_k ? seqused_k[bidb] : (cu_seqlens_k ? cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb] : seqlen_k_static)))
         , cp_world_size(cp_world_size)
+        , cp_tot_seqlen_k(cp_tot_seqused_k == nullptr
+                          ? 0
+                          : cp_tot_seqused_k[bidb])
     {
     }
 
@@ -68,12 +73,15 @@ struct SeqlenInfoQKNewK {
     int const offset_q, offset_k, offset_k_new;
     int const seqlen_q, seqlen_k_og, seqlen_k_new, seqlen_k, seqlen_rotary;
     int const cp_world_size;
+    int const cp_rank;
+    int const cp_tot_seqlen_k;
 
     CUTLASS_DEVICE
     SeqlenInfoQKNewK(int const bidb, int const seqlen_q_static, int const seqlen_k_static, int const shape_K_new_0,
                      int const* const cu_seqlens_q, int const* const cu_seqlens_k, int const* const cu_seqlens_k_new,
                      int const* const seqused_q, int const* const seqused_k, int const* const ptr_leftpad_k,
-                     int const* const seqlens_rotary, int const cp_world_size=1
+                     int const* const seqlens_rotary, int const cp_world_size=1, int const cp_rank=0,
+                     int const* const cp_tot_seqused_k=nullptr
                      )
         : leftpad_k(ptr_leftpad_k ? ptr_leftpad_k[bidb] : 0)
         , offset_q(!Varlen || cu_seqlens_q == nullptr ? 0 : cu_seqlens_q[bidb])
@@ -91,6 +99,10 @@ struct SeqlenInfoQKNewK {
         , seqlen_k(!AppendKV ? seqlen_k_og : seqlen_k_og + seqlen_k_new)
         , seqlen_rotary(!AppendKV || !seqlens_rotary ? seqlen_k_og + leftpad_k : seqlens_rotary[bidb])
         , cp_world_size(cp_world_size)
+        , cp_rank(cp_rank)
+        , cp_tot_seqlen_k(cp_tot_seqused_k == nullptr
+                          ? 0
+                          : cp_tot_seqused_k[bidb])
     {
     }
 

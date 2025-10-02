@@ -23,11 +23,15 @@ struct Mask {
     int const seqlen_q, seqlen_k;
     int const window_size_left, window_size_right, sink_token_length;
     cutlass::FastDivmod const qhead_per_khead_divmod;
+    // Context parallelism parameters for MLA decode
+    int const dcp_rank, dcp_world_size;
+    int const query_base_position;
 
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
-         cutlass::FastDivmod const &qhead_per_khead_divmod)
+         cutlass::FastDivmod const &qhead_per_khead_divmod,
+         const int dcp_rank = 0, const int dcp_world_size = 1, const int query_base_position = 0)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -35,6 +39,9 @@ struct Mask {
         , window_size_right(window_size_right)
         , sink_token_length(sink_token_length)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
+        , dcp_rank(dcp_rank)
+        , dcp_world_size(dcp_world_size)
+        , query_base_position(query_base_position)
     {
     };
 
@@ -89,8 +96,12 @@ struct Mask {
                         int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
+                        // For context parallelism, adjust causal mask based on global query position
+                        int const global_row_idx = query_base_position + row_idx;
+                        int const kv_offset = (dcp_world_size > 1) ? (seqlen_k * dcp_rank / dcp_world_size) : 0;
+                        int const adjusted_causal_row_offset = causal_row_offset - kv_offset;
                         int const col_limit_right = !Seqlenk_mask
-                            ? row_idx + causal_row_offset
+                            ? ((dcp_world_size > 1) ? global_row_idx + adjusted_causal_row_offset : row_idx + causal_row_offset)
                             : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {

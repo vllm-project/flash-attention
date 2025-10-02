@@ -161,6 +161,11 @@ struct Flash_fwd_params : public Qkv_params {
 
     // The S extra matrix, (num_heads)
     void *__restrict__ s_aux_ptr;
+
+    // Context parallelism parameters for MLA decode
+    int dcp_rank;
+    int dcp_world_size;
+    int *__restrict__ query_base_positions;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

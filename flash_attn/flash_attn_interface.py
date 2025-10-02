@@ -1389,6 +1389,9 @@ def flash_attn_varlen_func(
     deterministic=False,
     return_attn_probs=False,
     block_table=None,
+    dcp_rank=None,
+    dcp_world_size=None,
+    query_base_positions=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1445,6 +1448,14 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # Context parallelism parameters are only supported in Flash Attention 3
+    # For Flash Attention 2, these parameters are ignored with a warning
+    if dcp_rank is not None or dcp_world_size is not None or query_base_positions is not None:
+        import warnings
+        warnings.warn("Context parallelism parameters (dcp_rank, dcp_world_size, query_base_positions) "
+                     "are only supported in Flash Attention 3. These parameters will be ignored.",
+                     UserWarning)
+
     return FlashAttnVarlenFunc.apply(
         q,
         k,

@@ -7,6 +7,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(FA2_ENABLED ON)
 set(FA3_ENABLED ON)
 
+# Allow disabling FA3 from environment without changing setup.py
+if(DEFINED ENV{FLASH_ATTN_DISABLE_FA3} AND NOT "$ENV{FLASH_ATTN_DISABLE_FA3}" STREQUAL "")
+    message(STATUS "FLASH_ATTN_DISABLE_FA3 is set -> Disabling FA3 build")
+    set(FA3_ENABLED OFF)
+endif()
+
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
 set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
 

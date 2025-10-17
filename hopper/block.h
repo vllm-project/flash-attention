@@ -17,7 +17,7 @@ struct BlockMN {
             int const window_size_left, int const window_size_right,
             cutlass::FastDivmod const& qhead_per_khead_divmod) {
 
-        int seqlen_k = seqlen_info.seqlen_k;
+        int seqlen_k = seqlen_info.tot_seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
         int n_offset = 0;
 

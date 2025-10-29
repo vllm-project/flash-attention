@@ -8,6 +8,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include "fp8_promotion_helper.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 
 #include "cute/tensor.hpp"
@@ -1253,7 +1254,17 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 }
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                
+                // FP8 promotion helper for P×V GEMM
+                if constexpr (Is_FP8) {
+                    flash::GmmaPromotionHelper promoter(tOrO);
+                    promoter.step([&](auto& accum_frag) {
+                        flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), accum_frag);
+                    });
+                    promoter.flush();
+                } else {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                }
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1325,7 +1336,17 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            
+            // FP8 promotion helper for P×V GEMM
+            if constexpr (Is_FP8) {
+                flash::GmmaPromotionHelper promoter(tOrO);
+                promoter.step([&](auto& accum_frag) {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), accum_frag);
+                });
+                promoter.flush();
+            } else {
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            }
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // cute::copy(softmax.finalize(v_descale), scores_scale);
             finalize_dispatch(scores_scale, v_descale);
@@ -1382,11 +1403,31 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                if constexpr (!MmaPV_use_RS_WG1) {
-                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                
+                // FP8 promotion helper to prevent FP22 accumulation precision loss
+                if constexpr (Is_FP8) {
+                    flash::GmmaPromotionHelper promoter(tOrO);
+                    
+                    if constexpr (!MmaPV_use_RS_WG1) {
+                        promoter.step([&](auto& accum_frag) {
+                            flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), accum_frag);
+                        });
+                    } else {
+                        TiledMmaPV_RS tiled_mma_pv_rs;
+                        promoter.step([&](auto& accum_frag) {
+                            flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), accum_frag);
+                        });
+                    }
+                    
+                    promoter.flush();
                 } else {
-                    TiledMmaPV_RS tiled_mma_pv_rs;
-                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    // Original BF16 path (no promotion needed)
+                    if constexpr (!MmaPV_use_RS_WG1) {
+                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    } else {
+                        TiledMmaPV_RS tiled_mma_pv_rs;
+                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+                    }
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
@@ -1509,7 +1550,17 @@ struct CollectiveMainloopFwdSm90 {
         // If HasQv, then by the time P is ready, V must have been ready as well
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
-        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        
+        // FP8 promotion helper for P×V GEMM
+        if constexpr (Is_FP8) {
+            flash::GmmaPromotionHelper promoter(tOrO);
+            promoter.step([&](auto& accum_frag) {
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), accum_frag);
+            });
+            promoter.flush();
+        } else {
+            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+        }
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
@@ -1524,7 +1575,17 @@ struct CollectiveMainloopFwdSm90 {
                 auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
                 pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
             }
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            
+            // FP8 promotion helper for P×V GEMM
+            if constexpr (Is_FP8) {
+                flash::GmmaPromotionHelper promoter(tOrO);
+                promoter.step([&](auto& accum_frag) {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), accum_frag);
+                });
+                promoter.flush();
+            } else {
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            }
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             pipeline_v.consumer_release(smem_pipe_read);  // release V
         };

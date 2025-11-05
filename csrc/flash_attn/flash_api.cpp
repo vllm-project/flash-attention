@@ -49,7 +49,11 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false) {
+                      const bool unpadded_lse=false,
+                      //TODO(dudugong-gitch): sinks
+                      const std::optional<at::Tensor> s_aux_ = std::nullopt,
+                      //TODO(dudugong-gitch):q heads per k heads
+                      int q_heads_per_k_heads = 1) {
 
     // Reset the parameters
     params = {};
@@ -81,6 +85,23 @@ void set_params_fprop(Flash_fwd_params &params,
              params.o_batch_stride *= seqlen_q;
         }
     }
+    // TODO(dudugong-gitch): sink-tokens support – integrate into params
+    if (s_aux_.has_value()) {
+        TORCH_CHECK(q.size(-1) == v.size(-1),
+                    "We don't support S_aux with hdim != hdim_v");
+        auto s_aux = s_aux_.value();
+        TORCH_CHECK(s_aux.device() == q.device(),
+                    "s_aux must be on the same device as q");
+        TORCH_CHECK(s_aux.ndimension() == 1,
+                    c10::str("s_aux must be 1-D, but got ", s_aux.ndimension(), "-D."));
+        params.s_aux_ptr = s_aux.data_ptr();
+        TORCH_CHECK(s_aux.scalar_type() == q.scalar_type(),
+                    "s_aux and q must have the same dtype");
+    } else {
+        params.s_aux_ptr = nullptr;
+    }
+    //TODO(dudugong-gitch): q_heads_per_k_heads
+    params.q_heads_per_k_heads = q_heads_per_k_heads;
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
@@ -533,7 +554,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               //TODO(dudugong-gitch): sinks
+               const std::optional<at::Tensor> &s_aux = std::nullopt) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -587,6 +610,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (is_causal) { window_size_right = 0; }
 
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
+
+    //TODO(dudugong-gitch): validate shape
+    TORCH_CHECK(!s_aux.has_value() || s_aux.value().size(0) == q.size(-2),
+                c10::str("s_aux.size(0) must equal the number of heads of q (",
+                q.size(-2), "), but got ", s_aux.value().size(0), "."));
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
@@ -689,7 +717,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_right,
                      softcap,
                      seqlenq_ngroups_swapped,
-                     /*unpadded_lse*/true);
+                     /*unpadded_lse*/true,
+                    /*s aux*/s_aux,
+                    /*q_heads_per_k_heads*/ngroups);
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -1251,7 +1281,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                //TODO(dudugong-gitch): sinks
+                const std::optional<at::Tensor> &s_aux = std::nullopt
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1309,6 +1341,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
+    //TODO(dudugong-gitch): q_heads_per_k_heads
+    const int q_heads_per_k_heads = num_heads / num_heads_k;
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && head_size_og % 8 == 0 && !alibi_slopes_.has_value();
     if (seqlenq_ngroups_swapped) {
         const int ngroups = num_heads / num_heads_k;
@@ -1384,8 +1418,11 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
-                     );
+                     softcap,
+                     /*seqlenq_ngroups_swapped default*/false,
+                     /*unpadded_lse default*/false,
+                    /*s aux*/s_aux,
+                    /*q_heads_per_k_heads*/q_heads_per_k_heads);
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

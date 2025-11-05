@@ -1253,25 +1253,7 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 }
-                
-                if constexpr (Is_FP8) {
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-                    // Use temp fragment to avoid FP22 accumulation in tOrO
-                    auto temp_frag = cute::make_fragment_like(tOrO);
-                    cute::clear(temp_frag);
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), temp_frag);
-                    
-                    // Add to main accumulator in true FP32
-                    #pragma unroll
-                    for (int i = 0; i < cute::size(tOrO); ++i) {
-                        tOrO(i) += temp_frag(i);
-                    }
-#else
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-#endif
-                } else {
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-                }
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -1343,25 +1325,7 @@ struct CollectiveMainloopFwdSm90 {
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
-            
-            if constexpr (Is_FP8) {
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-                // Use temp fragment to avoid FP22 accumulation in tOrO
-                auto temp_frag = cute::make_fragment_like(tOrO);
-                cute::clear(temp_frag);
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), temp_frag);
-                
-                // Add to main accumulator in true FP32
-                #pragma unroll
-                for (int i = 0; i < cute::size(tOrO); ++i) {
-                    tOrO(i) += temp_frag(i);
-                }
-#else
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-#endif
-            } else {
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-            }
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             // cute::copy(softmax.finalize(v_descale), scores_scale);
             finalize_dispatch(scores_scale, v_descale);
@@ -1418,47 +1382,11 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
-                
-                if constexpr (Is_FP8) {
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-                    // Use temp fragment to avoid FP22 accumulation in tOrO
-                    if constexpr (!MmaPV_use_RS_WG1) {
-                        auto temp_frag = cute::make_fragment_like(tOrO);
-                        cute::clear(temp_frag);
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), temp_frag);
-                        
-                        // Add to main accumulator in true FP32
-                        #pragma unroll
-                        for (int i = 0; i < cute::size(tOrO); ++i) {
-                            tOrO(i) += temp_frag(i);
-                        }
-                    } else {
-                        TiledMmaPV_RS tiled_mma_pv_rs;
-                        auto temp_frag = cute::make_fragment_like(tOrO);
-                        cute::clear(temp_frag);
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), temp_frag);
-                        
-                        // Add to main accumulator in true FP32
-                        #pragma unroll
-                        for (int i = 0; i < cute::size(tOrO); ++i) {
-                            tOrO(i) += temp_frag(i);
-                        }
-                    }
-#else
-                    if constexpr (!MmaPV_use_RS_WG1) {
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                    } else {
-                        TiledMmaPV_RS tiled_mma_pv_rs;
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                    }
-#endif
+                if constexpr (!MmaPV_use_RS_WG1) {
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 } else {
-                    if constexpr (!MmaPV_use_RS_WG1) {
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                    } else {
-                        TiledMmaPV_RS tiled_mma_pv_rs;
-                        flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                    }
+                    TiledMmaPV_RS tiled_mma_pv_rs;
+                    flash::gemm</*zero_init=*/Is_first_iter, /*wg_wait=*/-1>(tiled_mma_pv_rs, tOrP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 }
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
@@ -1581,25 +1509,7 @@ struct CollectiveMainloopFwdSm90 {
         // If HasQv, then by the time P is ready, V must have been ready as well
         if constexpr (!HasQv) { pipeline_v.consumer_wait(smem_pipe_read); }
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
-        
-        if constexpr (Is_FP8) {
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-            // Use temp fragment to avoid FP22 accumulation in tOrO
-            auto temp_frag = cute::make_fragment_like(tOrO);
-            cute::clear(temp_frag);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), temp_frag);
-            
-            // Add to main accumulator in true FP32
-            #pragma unroll
-            for (int i = 0; i < cute::size(tOrO); ++i) {
-                tOrO(i) += temp_frag(i);
-            }
-#else
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-#endif
-        } else {
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-        }
+        flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
         cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
         pipeline_v.consumer_release(smem_pipe_read);  // release V
         --n_block;
@@ -1614,25 +1524,7 @@ struct CollectiveMainloopFwdSm90 {
                 auto barrier_token = pipeline_v.consumer_try_wait(smem_pipe_read);
                 pipeline_v.consumer_wait(smem_pipe_read, barrier_token);
             }
-            
-            if constexpr (Is_FP8) {
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-                // Use temp fragment to avoid FP22 accumulation in tOrO
-                auto temp_frag = cute::make_fragment_like(tOrO);
-                cute::clear(temp_frag);
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), temp_frag);
-                
-                // Add to main accumulator in true FP32
-                #pragma unroll
-                for (int i = 0; i < cute::size(tOrO); ++i) {
-                    tOrO(i) += temp_frag(i);
-                }
-#else
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-#endif
-            } else {
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-            }
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_pv, tOsP, tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
             pipeline_v.consumer_release(smem_pipe_read);  // release V
         };

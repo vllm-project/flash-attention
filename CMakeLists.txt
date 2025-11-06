@@ -238,48 +238,46 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
                     hopper/flash_fwd_combine.cu
                     hopper/flash_prepare_scheduler.cu
                 CUDA_ARCHS "${FA3_ARCHS}")
-
-            define_gpu_extension_target(
-                _vllm_fa3_C
-                DESTINATION vllm_flash_attn
-                LANGUAGE ${VLLM_GPU_LANG}
-                SOURCES
-                    hopper/flash_fwd_combine.cu
-                    hopper/flash_prepare_scheduler.cu
-                    hopper/flash_api.cpp
-                    hopper/flash_api_torch_lib.cpp
-                    ${FA3_GEN_SRCS}
-                COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
-                ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis
-                USE_SABI 3
-                WITH_SOABI)
-
-            target_include_directories(_vllm_fa3_C PRIVATE
-                hopper
-                csrc/common
-                csrc/cutlass/include)
-
-            # custom definitions
-            target_compile_definitions(_vllm_fa3_C PRIVATE
-                FLASHATTENTION_DISABLE_BACKWARD
-                FLASHATTENTION_DISABLE_DROPOUT
-                # FLASHATTENTION_DISABLE_ALIBI
-                FLASHATTENTION_DISABLE_SOFTCAP
-                FLASHATTENTION_DISABLE_UNEVEN_K
-                # FLASHATTENTION_DISABLE_LOCAL
-                FLASHATTENTION_DISABLE_PYBIND
-                FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
-                FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
-                # FLASHATTENTION_DISABLE_SM8x
-                # FLASHATTENTION_DISABLE_HDIMDIFF64
-                # FLASHATTENTION_DISABLE_HDIMDIFF192
-                CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
-                CUTLASS_ENABLE_GDC_FOR_SM90
-            )
-        else()
-            message(STATUS "FA3 is disabled because 9.0 is not in CUDA_ARCHS (FA3 only supports sm90).")
         endif()
     endif()
+
+    define_gpu_extension_target(
+        _vllm_fa3_C
+        DESTINATION vllm_flash_attn
+        LANGUAGE ${VLLM_GPU_LANG}
+        SOURCES
+            hopper/flash_fwd_combine.cu
+            hopper/flash_prepare_scheduler.cu
+            hopper/flash_api.cpp
+            hopper/flash_api_torch_lib.cpp
+            ${FA3_GEN_SRCS}
+        COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
+        ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis
+        USE_SABI 3
+        WITH_SOABI)
+
+    target_include_directories(_vllm_fa3_C PRIVATE
+        hopper
+        csrc/common
+        csrc/cutlass/include)
+
+    # custom definitions
+    target_compile_definitions(_vllm_fa3_C PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        # FLASHATTENTION_DISABLE_ALIBI
+        FLASHATTENTION_DISABLE_SOFTCAP
+        FLASHATTENTION_DISABLE_UNEVEN_K
+        # FLASHATTENTION_DISABLE_LOCAL
+        FLASHATTENTION_DISABLE_PYBIND
+        FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
+        FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
+        # FLASHATTENTION_DISABLE_SM8x
+        # FLASHATTENTION_DISABLE_HDIMDIFF64
+        # FLASHATTENTION_DISABLE_HDIMDIFF192
+        CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
+        CUTLASS_ENABLE_GDC_FOR_SM90
+    )
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
 endif ()

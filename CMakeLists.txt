@@ -221,24 +221,19 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
     # For CUDA we set the architectures on a per file basis
-    # FaV3 is only supported for Hopper (9.0), not for higher or lower architectures
+    # FaV3 is not yet supported in Blackwell
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        set(FA3_ARCHS "")
-        if ("9.0" IN_LIST CUDA_ARCHS)
-            set(FA3_ARCHS "9.0a")
-        endif()
+        cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
         message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
 
-        if (FA3_ARCHS)
-            set_gencode_flags_for_srcs(
-                SRCS "${FA3_GEN_SRCS}"
-                CUDA_ARCHS "${FA3_ARCHS}")
-            set_gencode_flags_for_srcs(
-                SRCS 
-                    hopper/flash_fwd_combine.cu
-                    hopper/flash_prepare_scheduler.cu
-                CUDA_ARCHS "${FA3_ARCHS}")
-        endif()
+        set_gencode_flags_for_srcs(
+            SRCS "${FA3_GEN_SRCS}"
+            CUDA_ARCHS "${FA3_ARCHS}")
+        set_gencode_flags_for_srcs(
+            SRCS 
+                hopper/flash_fwd_combine.cu
+                hopper/flash_prepare_scheduler.cu
+            CUDA_ARCHS "${FA3_ARCHS}")
     endif()
 
     define_gpu_extension_target(

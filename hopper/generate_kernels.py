@@ -29,7 +29,7 @@ DTYPE_MAP_BWD = {
 }
 
 SM = [80, 90]  # Sm kernels support up to
-HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
+HEAD_DIMENSIONS = [40, 64, 72, 80, 96, 128, 192, 256]
 PAGEDKV = [False, True]
 SPLIT = [False, True]
 SOFTCAP = [False, True]

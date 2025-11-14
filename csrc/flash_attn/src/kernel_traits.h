@@ -68,7 +68,11 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
+    static constexpr int kBlockKGmem = (
+        kHeadDim % 128 == 0 ? 128 : (
+        kHeadDim % 64 == 0 ? 64 : (
+        kHeadDim % 32 == 0 ? 32 : (
+        kHeadDim % 16 == 0 ? 16 : 8))));
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
     using TiledMma = TiledMMA<
@@ -203,7 +207,11 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kHeadDim = kHeadDim_;
     static_assert(kHeadDim % 32 == 0);
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128 : (kHeadDim % 64 == 0 ? 64 : 32);
+    static constexpr int kBlockKGmem = (
+        kHeadDim % 128 == 0 ? 128 : (
+        kHeadDim % 64 == 0 ? 64 : (
+        kHeadDim % 32 == 0 ? 32 : (
+        kHeadDim % 16 == 0 ? 16 : 8))));
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
     static constexpr int AtomLayoutMSdP = AtomLayoutMSdP_;

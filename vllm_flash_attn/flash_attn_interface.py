@@ -271,6 +271,7 @@ def flash_attn_varlen_func(
             real_window_size[1],
             softcap,
             return_softmax_lse and dropout_p > 0,
+            num_splits,
             None,
         )
     elif fa_version == 3:

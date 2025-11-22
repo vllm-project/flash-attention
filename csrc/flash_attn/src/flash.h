@@ -41,6 +41,8 @@ struct Qkv_params {
     // In the case of multi-query and grouped-query attention (MQA/GQA), nheads_k could be
     // different from nheads (query).
     int h_h_k_ratio; // precompute h / h_k,
+    //TODO(dudugong-gitch):q_heads_per_k_heads 
+    int q_heads_per_k_heads = 1;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -140,6 +142,8 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+    // TODO(dudugong-gitch): sink-token vector pointer
+    void *__restrict__ s_aux_ptr = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

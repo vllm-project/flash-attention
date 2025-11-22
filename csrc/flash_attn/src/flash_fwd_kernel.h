@@ -430,8 +430,34 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
-
+// TODO(dudugong-gitch): fetch current sink values and inject into normalize_softmax_lse
+    Tensor lse = [&]{
+        if (params.s_aux_ptr && params.seqlenq_ngroups_swapped){
+            Tensor s_aux_cur = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
+            Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+            Tensor tScS = thr_mma.partition_C(cS);
+            Tensor tScS_rowcol = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()));
+            static_assert(size<0>(tScS_rowcol) == size(s_aux_cur));
+            #pragma unroll
+            for(int mi = 0; mi < size(s_aux_cur); ++mi) {
+                int row = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                int bidh_mi = (row % params.q_heads_per_k_heads) + bidh * params.q_heads_per_k_heads;
+                s_aux_cur(mi) = static_cast<float>(reinterpret_cast<const Element*>(params.s_aux_ptr)[bidh_mi]);
+            }
+            return  softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax,/*s_aux_cur=*/s_aux_cur, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+        else if(params.s_aux_ptr && !params.seqlenq_ngroups_swapped){
+            Tensor s_aux_cur = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
+            #pragma unroll
+            for(int mi = 0; mi < size(s_aux_cur); ++mi) {
+                s_aux_cur(mi) = static_cast<float>(reinterpret_cast<const Element*>(params.s_aux_ptr)[bidh]);
+            }
+            return  softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax,/*s_aux_cur=*/s_aux_cur, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+        else{
+            return  softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+    }();
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
@@ -1008,8 +1034,34 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     }
 
     // Epilogue
-
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
+// TODO(dudugong-gitch): fetch current sink values and inject into normalize_softmax_lse
+    Tensor lse = [&]{
+        if (params.s_aux_ptr && params.seqlenq_ngroups_swapped){
+            Tensor s_aux_cur = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
+            Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+            Tensor tScS = thr_mma.partition_C(cS);
+            Tensor tScS_rowcol = make_tensor(tScS.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tScS.layout()));
+            static_assert(size<0>(tScS_rowcol) == size(s_aux_cur));
+            #pragma unroll
+            for(int mi = 0; mi < size(s_aux_cur); ++mi) {
+                int row = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                int bidh_mi = (row % params.q_heads_per_k_heads) + bidh * params.q_heads_per_k_heads;
+                s_aux_cur(mi) = static_cast<float>(reinterpret_cast<const Element*>(params.s_aux_ptr)[bidh_mi]);
+            }
+            return  softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax,/*s_aux_cur=*/s_aux_cur, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+        else if(params.s_aux_ptr && !params.seqlenq_ngroups_swapped){
+            Tensor s_aux_cur = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
+            #pragma unroll
+            for(int mi = 0; mi < size(s_aux_cur); ++mi) {
+                s_aux_cur(mi) = static_cast<float>(reinterpret_cast<const Element*>(params.s_aux_ptr)[bidh]);
+            }
+            return  softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax,/*s_aux_cur=*/s_aux_cur, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+        else{
+            return  softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax, /*scale_softmax_log2=*/params.scale_softmax_log2);
+        }
+    }();
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)

@@ -421,7 +421,13 @@ function (define_gpu_extension_target GPU_MOD_NAME)
     set(GPU_WITH_SOABI)
   endif()
 
-  if (GPU_USE_SABI)
+  run_python(IS_FREETHREADED_PYTHON
+    "import sysconfig; print(1 if sysconfig.get_config_var(\"Py_GIL_DISABLED\") else 0)"
+    "Failed to determine whether interpreter is free-threaded")
+
+  # Free-threaded Python doesn't yet support the stable ABI (see PEP 803/809),
+  # so avoid using the stable ABI under free-threading only.
+  if (GPU_USE_SABI AND NOT IS_FREETHREADED_PYTHON)
     Python_add_library(${GPU_MOD_NAME} MODULE USE_SABI ${GPU_USE_SABI} ${GPU_WITH_SOABI} "${GPU_SOURCES}")
   else()
     Python_add_library(${GPU_MOD_NAME} MODULE ${GPU_WITH_SOABI} "${GPU_SOURCES}")

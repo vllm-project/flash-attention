@@ -61,6 +61,12 @@ namespace pybind11::detail {
 
 #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
 
+namespace {
+inline at::cuda::CUDAGuard make_cuda_guard_from_tensor(const at::Tensor& t) {
+  return at::cuda::CUDAGuard(static_cast<c10::DeviceIndex>(t.get_device()));
+}
+} // namespace
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -644,7 +650,7 @@ mha_fwd_get_scheduler_metadata(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)seqused_k.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(seqused_k);
 
     auto opts = seqused_k.options();
     // This needs to be set after get_num_splits
@@ -736,7 +742,10 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> &s_aux_ // (h)
+        std::optional<const at::Tensor> &s_aux_, // (h)
+        int const cp_world_size,  // context parallelism (cp) world size
+        int const cp_rank,         // cp rank
+        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -874,6 +883,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         CHECK_DEVICE(seqused_k); CHECK_CONTIGUOUS(seqused_k);
         CHECK_SHAPE(seqused_k, batch_size);
     }
+    if (cp_tot_seqused_k_.has_value()) {
+        auto cp_tot_seqused_k = cp_tot_seqused_k_.value();
+        TORCH_CHECK(cp_tot_seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        CHECK_DEVICE(cp_tot_seqused_k); CHECK_CONTIGUOUS(cp_tot_seqused_k);
+        CHECK_SHAPE(cp_tot_seqused_k, batch_size);
+    }
 
     if (leftpad_k_.has_value()) {
         auto leftpad_k = leftpad_k_.value();
@@ -919,7 +934,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     at::Tensor softmax_lse;
     if (!is_varlen_q) {
@@ -1207,6 +1222,17 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     } else {
         params.s_aux_ptr = nullptr;
     }
+
+    params.cp_world_size = cp_world_size;
+    params.cp_rank = cp_rank;
+    params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
+      static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
+    TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
+    TORCH_CHECK(cp_world_size != 1 || cp_rank == 0, "When context parallelism is disabled, cp_rank must be zero");
+    TORCH_CHECK(cp_world_size == 1 || cp_tot_seqused_k_.has_value(), "cp_tot_seqused_k_ must be provided when context parallelism is enabled.");
+    TORCH_CHECK(!(params.is_local && cp_world_size > 1), 
+        "Local attention (sliding window) is not currently supported with context parallelism (cp_world_size > 1)."
+        "Requires proper n_offset handling in block boundary calculations in mainloop and block.h");
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
     TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
@@ -1514,7 +1540,7 @@ std::vector<at::Tensor> mha_bwd(
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto device_guard = make_cuda_guard_from_tensor(q);
 
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64

@@ -23,7 +23,9 @@ set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 
 # Supported NVIDIA architectures.
 set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
-if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    list(APPEND CUDA_SUPPORTED_ARCHS "10.0" "11.0" "12.0")
+elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND CUDA_SUPPORTED_ARCHS "10.0" "10.1" "12.0")
 endif()
 
@@ -168,7 +170,7 @@ if (FA2_ENABLED)
         FLASHATTENTION_DISABLE_DROPOUT
         # FLASHATTENTION_DISABLE_ALIBI
         # FLASHATTENTION_DISABLE_SOFTCAP
-        FLASHATTENTION_DISABLE_UNEVEN_K
+        # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
     )
@@ -195,12 +197,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim256_bf16_paged*_sm90.cu")
     # Add these for hdim diff cases
     file(GLOB FA3_BF16_GEN_SRCS_
-        # "hopper/instantiations/flash_fwd_hdim64_256_bf16*_sm90.cu"
-        # "hopper/instantiations/flash_fwd_hdim64_512_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_256_bf16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_512_bf16*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim192_128_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_*_bf16_*_sm80.cu")
     list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
     
     # FP16 source files
@@ -223,12 +222,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         )
     # Add these for hdim diff cases
     file(GLOB FA3_FP16_GEN_SRCS_
-    #     "hopper/instantiations/flash_fwd_hdim64_256_fp16*_sm90.cu"
-    #     "hopper/instantiations/flash_fwd_hdim64_512_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_256_fp16*_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim64_512_fp16*_sm90.cu"
         "hopper/instantiations/flash_fwd_hdim192_128_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "hopper/instantiations/flash_fwd_*_fp16_*_sm80.cu")
     list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
@@ -258,7 +254,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
     # For CUDA we set the architectures on a per file basis
     # FaV3 is not yet supported in Blackwell
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA3_ARCHS "8.0;9.0a;" "${CUDA_ARCHS}")
+        cuda_archs_loose_intersection(FA3_ARCHS "9.0a;" "${CUDA_ARCHS}")
         message(STATUS "FA3_ARCHS: ${FA3_ARCHS}")
 
         set_gencode_flags_for_srcs(
@@ -303,9 +299,10 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_VARLEN_ONLY # Custom flag to save on binary size
         FLASHATTENTION_PACKGQA_ONLY # Custom flag to save on binary size
         FLASHATTENTION_DISABLE_CLUSTER # disabled for varlen in any case
-        # FLASHATTENTION_DISABLE_SM8x
-        FLASHATTENTION_DISABLE_HDIMDIFF64
+        FLASHATTENTION_DISABLE_SM8x
+        # FLASHATTENTION_DISABLE_HDIMDIFF64
         # FLASHATTENTION_DISABLE_HDIMDIFF192
+        FLASHATTENTION_DISABLE_APPENDKV
         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
         CUTLASS_ENABLE_GDC_FOR_SM90
     )

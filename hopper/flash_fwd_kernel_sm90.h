@@ -349,7 +349,10 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
+                    params.mainloop.seqlens_rotary,
+                    params.mainloop.cp_world_size,
+                    params.mainloop.cp_rank,
+                    params.mainloop.cp_tot_seqused_k
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
@@ -398,7 +401,9 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
+                    params.mainloop.seqlens_rotary, params.mainloop.cp_world_size,
+                    params.mainloop.cp_rank,
+                    params.mainloop.cp_tot_seqused_k
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.store_kv_new(

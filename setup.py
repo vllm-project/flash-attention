@@ -4,6 +4,7 @@ import sys
 import os
 import re
 import ast
+import sysconfig
 from collections import namedtuple
 from pathlib import Path
 from typing import Dict
@@ -79,10 +80,14 @@ def _is_hip() -> bool:
             or VLLM_TARGET_DEVICE == "rocm") and torch.version.hip is not None
 
 
+def is_freethreaded():
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=True, **kwa)
+        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 

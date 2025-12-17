@@ -161,7 +161,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.num_splits_dynamic_ptr,
         params.prepare_seqlen_q_ptr,
         params.varlen_batch_idx_ptr,
-        params.num_nheads_in_l2_ptr
+        params.num_nheads_in_l2_ptr,
         params.cp_world_size,
         params.cp_rank,
     };

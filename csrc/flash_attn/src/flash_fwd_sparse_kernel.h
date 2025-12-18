@@ -363,7 +363,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
-            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
             // if (cute::thread0()) { print(tOrP); }
             flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             // if (cute::thread0()) { print(scores); }
@@ -422,7 +422,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
-            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
             // if (cute::thread0()) { print(tOrP); }
             flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             // if (cute::thread0()) { print(scores); }
@@ -591,7 +591,7 @@ inline __device__ void sparse_attn_1rowblock(const Params &params, const int bid
 
             // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
             // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
-            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
             // if (cute::thread0()) { print(tOrP); }
             flash::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             // if (cute::thread0()) { print(scores); }

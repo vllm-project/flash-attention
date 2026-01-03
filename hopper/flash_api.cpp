@@ -732,6 +732,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> &k_descale_,  // (b, h_k)
         std::optional<at::Tensor> &v_descale_,  // (b, h_k)
+        std::optional<at::Tensor> &o_scale_,    // scalar or (1,), output quantization scale for FP8 output
         float const softmax_scale,
         bool is_causal,
         int window_size_left,
@@ -1206,6 +1207,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    // Handle output scale for FP8 output quantization
+    if (o_scale_.has_value()) {
+        auto o_scale = o_scale_.value();
+        CHECK_DEVICE(o_scale);
+        TORCH_CHECK(o_scale.numel() == 1, "o_scale must be a scalar tensor");
+        params.o_scale_ptr = o_scale.data_ptr<float>();
+    } else {
+        params.o_scale_ptr = nullptr;
     }
 
     if(s_aux_.has_value()) {

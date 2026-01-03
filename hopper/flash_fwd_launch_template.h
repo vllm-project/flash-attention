@@ -146,7 +146,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.softmax_lseaccum_ptr),
         {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, params.h * seqlen_q * batch_q},  // stride_LSE_partial
         params.h_k,
-        params.cu_seqlens_q, params.seqused_q
+        params.cu_seqlens_q, params.seqused_q, params.o_scale_ptr
     };
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);

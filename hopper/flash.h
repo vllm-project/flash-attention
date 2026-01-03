@@ -61,6 +61,9 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_descale_batch_stride;
     index_t v_descale_head_stride;
 
+    // For FP8 output quantization
+    float * __restrict__ o_scale_ptr;
+
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
     int total_q, total_k, total_knew;

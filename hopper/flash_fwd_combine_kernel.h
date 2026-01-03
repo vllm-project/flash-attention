@@ -155,6 +155,7 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        float const* const o_scale_ptr = nullptr;
     };
 
     // Kernel entry point API
@@ -176,6 +177,7 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        float const* const o_scale_ptr = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -200,7 +202,8 @@ public:
             args.seqused,
             args.num_splits_dynamic_ptr,
             args.varlen_batch_idx_ptr,
-            args.semaphore_to_reset
+            args.semaphore_to_reset,
+            args.o_scale_ptr
         };
     }
 
@@ -687,6 +690,16 @@ public:
         }
 
         // Step 7: Write the final O to gmem
+        // Apply output scaling for FP8 output quantization
+        // Scale is applied in FP32 before type conversion to avoid overflow
+        // Uses saturation to FP8 e4m3fn range [-448, 448]
+        if (params.o_scale_ptr != nullptr) {
+            float const o_scale = *params.o_scale_ptr;
+            #pragma unroll
+            for (int i = 0; i < size(tOrO); ++i) {
+                tOrO(i) = fminf(fmaxf(tOrO(i) * o_scale, -448.0f), 448.0f);
+            }
+        }
         Tensor rO = make_tensor_like<Element>(tOrO);
         flash::convert_type_out(tOrO, rO);
         auto shape_O = make_shape(get<0>(params.shape_O_partial), get<1>(params.shape_O_partial) - k_block * kBlockK, get<3>(params.shape_O_partial), get<4>(params.shape_O_partial));

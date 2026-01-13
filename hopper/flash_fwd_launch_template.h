@@ -29,11 +29,11 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
           bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, bool FP8_Output, int kBlockH=1>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
     static_assert(!FP8_Output || Is_FP8, "FP8 output requires FP8 input");
-    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
     using ElementS = cutlass::bfloat16_t;

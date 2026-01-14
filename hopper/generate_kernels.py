@@ -135,24 +135,20 @@ class Kernel:
 def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, split, paged_kv, softcap, packgqa, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SPLIT, PAGEDKV, SOFTCAP, PACKGQA, SM):
         # We always enable PackGQA for Sm8x or PagedKV or Split
-         # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
+        # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
         if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
         
-        # For FP8 input (e4m3), generate both FP8_Output=false and FP8_Output=true variants
-        if dtype == "e4m3":
-            for fp8_output in FP8_OUTPUT:
-                if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
-                    yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=fp8_output, direction="fwd")
-                if sm == 90 and head_dim == 192:
-                    yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=128, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=fp8_output, direction="fwd")
-        else:
-            # For non-FP8 input (fp16, bf16), only generate FP8_Output=false variants
+        # FP8 output variants only for FP8 input (e4m3) on SM90
+        fp8_outputs = [False, True] if (dtype == "e4m3" and sm >= 90) else [False]
+        
+        for fp8_output in fp8_outputs:
             if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
-                yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
+                yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=fp8_output, direction="fwd")
             if sm == 90 and head_dim == 192:
-                yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=128, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
-            if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"]:
+                yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=128, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=fp8_output, direction="fwd")
+            # Special hdim cases only for non-FP8 dtypes (bf16/fp16 with hdim 64)
+            if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"] and not fp8_output:
                 yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
                 yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
     

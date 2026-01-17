@@ -398,12 +398,9 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    # batch_size = 40
-    # nheads = 16
+    # batch_size = 1024
     batch_size = 9 if seqlen_q <= 2048 else 2
     nheads = 6
-    # batch_size = 2
-    # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     if d == 192 and not DISABLE_HDIMDIFF192:
@@ -546,6 +543,8 @@ def test_flash_attn_varlen_output(
                 k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 softcap=softcap,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
                 s_aux=s_aux,
             )
             print("Pack GQA =",pack_gqa)
@@ -648,10 +647,10 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [False])
+# @pytest.mark.parametrize("new_kv", [True])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(False, True)])
+# @pytest.mark.parametrize("causal,local", [(True, False)])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True])
 @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -661,7 +660,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None) else [0.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
-# @pytest.mark.parametrize("page_size", [4])
+# @pytest.mark.parametrize("page_size", [None])
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
@@ -673,7 +672,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", COMPILED_HDIMS)
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [128])
 # @pytest.mark.parametrize("d", [192])
 # @pytest.mark.parametrize("test_sink", [False, True])
 @pytest.mark.parametrize("test_sink", [False])
@@ -928,7 +927,6 @@ def test_flash_attn_kvcache(
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         num_splits_vals = [1, 3, 0] if not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False, True]
-        # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             print("Num splits = ",num_splits)
             print("Precompute metadata = ",precompute_metadata)
@@ -936,7 +934,10 @@ def test_flash_attn_kvcache(
             if precompute_metadata:
                 # WARNING: seqlen_k is not max_seqlen_k if using page table, so we can't expect this to make sense?
                 scheduler_metadata = get_scheduler_metadata(
-                    batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
+                    batch_size,
+                    max_seqlen_q if varlen_q else seqlen_q,
+                    seqlen_k if page_size is None else page_table.shape[1] * page_size,
+                    nheads, nheads_k, d,
                     cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
                     max_seqlen_k_new=seqlen_new, page_size=page_size,

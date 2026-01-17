@@ -210,8 +210,14 @@
 #else
   #define PACK_GQA_BLOCK_SWITCH(QHEADS_PER_KHEADS, BLOCK_H, ...)                                 \
   [&] {                                                                                          \
-    if (QHEADS_PER_KHEADS == 8) {                                                                \
+    if (QHEADS_PER_KHEADS == 16) {                                                               \
+      constexpr static int BLOCK_H = 16;                                                         \
+      return __VA_ARGS__();                                                                      \
+    } else if (QHEADS_PER_KHEADS == 8) {                                                         \
       constexpr static int BLOCK_H = 8;                                                          \
+      return __VA_ARGS__();                                                                      \
+    } else if (QHEADS_PER_KHEADS == 4) {                                                         \
+      constexpr static int BLOCK_H = 4;                                                          \
       return __VA_ARGS__();                                                                      \
     } else {                                                                                     \
       constexpr static int BLOCK_H = 1;                                                          \
@@ -219,3 +225,26 @@
     }                                                                                            \
   }()
 #endif
+
+#define NUM_WARP_SWITCH(VALUE, CONST_NAME, ...)                                                  \
+  [&] {                                                                                          \
+    if (VALUE <= 1) {                                                                            \
+      constexpr static int CONST_NAME = 1;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else if (VALUE <= 2) {                                                                     \
+      constexpr static int CONST_NAME = 2;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else if (VALUE <= 4) {                                                                     \
+      constexpr static int CONST_NAME = 4;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else if (VALUE <= 8) {                                                                     \
+      constexpr static int CONST_NAME = 8;                                                       \
+      return __VA_ARGS__();                                                                      \
+    } else if (VALUE <= 16) {                                                                    \
+      constexpr static int CONST_NAME = 16;                                                      \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int CONST_NAME = 32;                                                      \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()

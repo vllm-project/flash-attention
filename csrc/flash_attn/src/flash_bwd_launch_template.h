@@ -157,6 +157,26 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
 }
 
 template<typename T, bool Is_causal>
+void run_mha_bwd_hdim40(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 40;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
+}
+
+template<typename T, bool Is_causal>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
     int device;
@@ -199,6 +219,46 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 4, false, T>>(params, stream);
 
     // run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 64, 4, 4, 2, 4, false, false, T>>(params, stream);
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_hdim72(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 72;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 144 * 1024) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
+}
+
+template<typename T, bool Is_causal>
+void run_mha_bwd_hdim80(Flash_bwd_params &params, cudaStream_t stream) {
+    constexpr static int Headdim = 80;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if (max_smem_per_block >= 144 * 1024) {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
+    });
 }
 
 template<typename T, bool Is_causal>

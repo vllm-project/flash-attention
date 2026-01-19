@@ -92,8 +92,17 @@
     if (HEADDIM <= 32) {                   \
       constexpr static int kHeadDim = 32;  \
       return __VA_ARGS__();                \
+    } else if (HEADDIM <= 40) {            \
+      constexpr static int kHeadDim = 40;  \
+      return __VA_ARGS__();                \
     } else if (HEADDIM <= 64) {            \
       constexpr static int kHeadDim = 64;  \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 72) {            \
+      constexpr static int kHeadDim = 72;  \
+      return __VA_ARGS__();                \
+    } else if (HEADDIM <= 80) {            \
+      constexpr static int kHeadDim = 80;  \
       return __VA_ARGS__();                \
     } else if (HEADDIM <= 96) {            \
       constexpr static int kHeadDim = 96;  \

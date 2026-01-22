@@ -424,6 +424,7 @@ struct CollectiveMainloopFwdSm90 {
         ShapeQKV const shape_Q;
         StrideQK const stride_Q;
         ShapeQPacked const shape_Q_packed;
+        ShapeQPackedTMA const shape_Q_packed_tma;
         StrideQPacked const stride_Q_packed;
         Element* const ptr_K;
         ShapeQKV const shape_K;
@@ -574,7 +575,7 @@ struct CollectiveMainloopFwdSm90 {
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
         // (assigning it to params.softcap_val) and pre-multiply softcap_val * log2(e)
         // (assigning it to params.softmax_scale_log2).
-        return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
+        return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, shape_Q_packed_tma, stride_Q_packed,
                 args.ptr_K, args.shape_K, args.stride_K, args.ptr_V, args.headdim_v, args.stride_V,
                 args.ptr_K_new, args.shape_K_new, args.stride_K_new, args.ptr_V_new, args.stride_V_new,
                 args.ptr_Qv, args.stride_Qv, shape_Qv_packed, stride_Qv_packed,
@@ -688,7 +689,7 @@ struct CollectiveMainloopFwdSm90 {
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q_packed_tma)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);

@@ -21,7 +21,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MNK_PV_, class ClusterShape_, class Element_, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false, int kBlockH_=1>
+          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false>
 struct CollectiveEpilogueFwd {
 
     using TileShape_MNK_PV = TileShape_MNK_PV_;
@@ -32,10 +32,9 @@ struct CollectiveEpilogueFwd {
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool PackGQA = PackGQA_;
-    static constexpr bool PackGQA_TMA = PackGQA && (kBlockH_ > 1);
     static constexpr bool Split = Split_;
     static constexpr bool Use_smem = !(Split && !Varlen);
-    static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && !Split && (!PackGQA || PackGQA_TMA);
+    static constexpr bool Use_TMA_O = ArchTag::kMinComputeCapability >= 90 && !Varlen && !Split && !PackGQA;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
     static_assert(ArchTag::kMinComputeCapability >= 90 || CUTE_STATIC_V(size(ClusterShape{})) == 1);
@@ -43,7 +42,6 @@ struct CollectiveEpilogueFwd {
 
     static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
     static constexpr int kHeadDimV = get<1>(TileShape_MNK_PV{});
-    static constexpr int kBlockH = kBlockH_;
 
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
 
@@ -94,10 +92,11 @@ struct CollectiveEpilogueFwd {
     using ShapeLSEPacked = std::conditional_t<!PackGQA, cute::Shape<int32_t, int32_t, int32_t, int32_t>, cute::Shape<cute::Shape<int32_t, int32_t>, int32_t, int32_t, int32_t>>;
     using StrideLSEPacked = std::conditional_t<!PackGQA, StrideLSE, cute::Stride<cute::Stride<int64_t, _1>, int64_t, int64_t, int64_t>>;
 
+    using EpilogueTile_MN = decltype(select<0, 1>(TileShape_MNK_PV{}));
     using CopyOpR2S = std::conditional_t<
         ArchTag::kMinComputeCapability >= 90,
         // cute::SM90_U32x4_STSM_N if Element size is 2 bytes (fp16, bf16)
-        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element>()),
+        decltype(cutlass::epilogue::collective::detail::sm90_get_smem_store_op_for_accumulator<StrideO, Element, EpilogueTile_MN>()),
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
     using SmemCopyAtomO = Copy_Atom<CopyOpR2S, Element>;
@@ -163,6 +162,14 @@ struct CollectiveEpilogueFwd {
 
     static Params
     to_underlying_arguments(Arguments const& args) {
+        Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), args.shape_O, args.stride_O);
+        TMA_O tma_store_O = [&]{
+            if constexpr (Use_TMA_O) {
+                return make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{}, select<0, 1>(TileShape_MNK_PV{}), _1{}); // no mcast
+            } else {
+                return nullptr;
+            }
+        }();
         // If PackGQA, reshape O to be ((qhead_per_khead, seqlen_q), head_size, nhead_k, batch_size, num_splits)
         int const qhead_per_khead = !PackGQA ? 1 : cute::ceil_div(get<2>(args.shape_O), args.nheads_kv);
         auto const shape_O_packed = cute::conditional_return<!PackGQA>(
@@ -179,15 +186,6 @@ struct CollectiveEpilogueFwd {
             args.stride_O_partial,
             make_stride(make_stride(get<2>(args.stride_O_partial), get<0>(args.stride_O_partial)), get<1>(args.stride_O_partial), get<2>(args.stride_O_partial) * qhead_per_khead, get<3>(args.stride_O_partial), get<4>(args.stride_O_partial))
         );
-        Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), shape_O_packed, stride_O_packed);
-        TMA_O tma_store_O = [&]{
-            if constexpr (Use_TMA_O) {
-                return make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{}, select<0, 1>(TileShape_MNK_PV{}), _1{}); // no mcast
-            } else {
-                return nullptr;
-            }
-        }();
-        
         // If PackGQA, Reshape LSE to be ((qhead_per_khead, seqlen_q), nhead_k, batch_size, num_splits)
         auto const shape_LSE_packed = cute::conditional_return<!PackGQA>(
             select<0, 2, 3, 4>(args.shape_O),
@@ -316,7 +314,7 @@ struct CollectiveEpilogueFwd {
 
         // Step 3: Write O from smem -> gmem
         if constexpr (Use_TMA_O) {
-            Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O_packed)(_, _, bidh, bidb, split_idx);
+            Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, bidb, split_idx);
             Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
             auto block_tma_O = params.tma_store_O.get_slice(_0{});
             Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)

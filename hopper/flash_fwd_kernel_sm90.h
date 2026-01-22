@@ -299,14 +299,6 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-        const int num_heads = get<2>(params.mainloop.shape_Q);
-        Tensor gS_aux = make_tensor(make_gmem_ptr(params.mainloop.ptr_S_aux), make_shape(num_heads));
-        Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
-
-        if(params.mainloop.ptr_S_aux && threadIdx.x < num_heads) {
-            sS_aux(threadIdx.x) = gS_aux(threadIdx.x);
-        }
-
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
             cute::cluster_arrive_relaxed();
@@ -349,10 +341,7 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary,
-                    params.mainloop.cp_world_size,
-                    params.mainloop.cp_rank,
-                    params.mainloop.cp_tot_seqused_k
+                    params.mainloop.seqlens_rotary
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
@@ -401,9 +390,7 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary, params.mainloop.cp_world_size,
-                    params.mainloop.cp_rank,
-                    params.mainloop.cp_tot_seqused_k
+                    params.mainloop.seqlens_rotary
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.store_kv_new(

@@ -30,11 +30,11 @@ def maybe_contiguous(x):
 
 def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
-    configs = []
+    configs=[]
     # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
-    max_threads_per_block = 1024
+    max_threads_per_block=1024
     # Default to warp size 32 if not defined by device
-    warp_size = getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32)
+    warp_size=getattr(torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32)
     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
     return [triton.Config({}, num_warps=warp_count) for warp_count in [1, 2, 4, 8, 16, 32]
             if warp_count * warp_size <= max_threads_per_block]
@@ -164,7 +164,6 @@ def rms_norm_ref(
     configs=triton_autotune_configs(),
     key=["N", "HAS_RESIDUAL", "STORE_RESIDUAL_OUT", "IS_RMS_NORM", "HAS_BIAS", "HAS_X1", "HAS_W1", "HAS_B1"],
 )
-# torch compile doesn't like triton.heuristics, so we set these manually when calling the kernel
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_RESIDUAL": lambda args: args["RESIDUAL"] is not None})
 # @triton.heuristics({"HAS_X1": lambda args: args["X1"] is not None})
@@ -472,7 +471,6 @@ def _layer_norm_fwd_impl(
     configs=triton_autotune_configs(),
     key=["N", "HAS_DRESIDUAL", "STORE_DRESIDUAL", "IS_RMS_NORM", "HAS_BIAS", "HAS_DROPOUT"],
 )
-# torch compile doesn't like triton.heuristics, so we set these manually when calling the kernel
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
 # @triton.heuristics({"HAS_DRESIDUAL": lambda args: args["DRESIDUAL"] is not None})
 # @triton.heuristics({"STORE_DRESIDUAL": lambda args: args["DRESIDUAL_IN"] is not None})
@@ -844,7 +842,6 @@ def _layer_norm_bwd_impl(
 
 
 class LayerNormFn(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -1127,7 +1124,6 @@ class RMSNorm(torch.nn.Module):
 
 
 class LayerNormLinearFn(torch.autograd.Function):
-
     @staticmethod
     @custom_fwd
     def forward(

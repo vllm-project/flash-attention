@@ -30,7 +30,8 @@ struct Mask {
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
          cutlass::FastDivmod const &attention_chunk_divmod,
-         cutlass::FastDivmod const &qhead_per_khead_divmod)
+         cutlass::FastDivmod const &qhead_per_khead_divmod,
+         const int cp_world_size = 1, const int cp_rank = 0, const int tot_seqlen_k = 0)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -142,7 +143,6 @@ struct Mask {
                     }
                 }
             } else {
-                // TODO: backward does not support attention_chunk yet
                 int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
                 int const causal_row_offset = seqlenk_col_limit - seqlen_q + m_block * kBlockM + thread_row_offset;
                 if constexpr (Causal_mask) {

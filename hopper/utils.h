@@ -335,15 +335,6 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
             }
         }
     }
-
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-    if constexpr (Use_Two_Level) {
-        #pragma unroll
-        for (int i = 0; i < cute::size(tCrC); ++i) {
-            tCrC(i) = tCrC_original(i) + tCrC(i);  // Add temp results to original
-        }
-    }
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -686,6 +677,22 @@ CUTE_DEVICE T warp_prefix_sum(T val) {
     }
     return val;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename T>
+CUTE_DEVICE T warp_shfl_get(T val, int src_lane) {
+    return __shfl_sync(0xffffffff, val, src_lane);
+};
+
+template<typename T>
+CUTE_DEVICE T warp_shfl_get_last(T val) {
+    return __shfl_sync(0xffffffff, val, cutlass::NumThreadsPerWarp - 1);
+};
+
+CUTE_DEVICE int warp_last_true_laneid(bool cond) {
+    return __popc(__ballot_sync(0xffffffff, cond));
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

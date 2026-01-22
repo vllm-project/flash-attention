@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao
+# Copyright (c) 2023, Tri Dao.
 
 import math
 from functools import partial
@@ -265,7 +265,6 @@ def apply_rotary_emb_qkv_(
 
 
 class ApplyRotaryEmbKV_(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, kv, cos, sin, interleaved=False, seqlen_offsets: Union[int, torch.Tensor] = 0):
         batch, seqlen, two, nheads, headdim = kv.shape
@@ -408,7 +407,7 @@ class RotaryEmbedding(torch.nn.Module):
                 inv_freq = self._compute_inv_freq(device=device)
             else:
                 inv_freq = self.inv_freq
-            # Don't do einsum, it converts fp32 to bf16 under AMP
+            # Don't do einsum, it converts fp32 to fp16 under AMP
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             freqs = torch.outer(t, inv_freq)
             if self.scale is None:

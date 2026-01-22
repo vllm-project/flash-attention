@@ -103,6 +103,9 @@ pytorch_profiler(flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, backw
 # benchmark_all(attention_og, q, k, v, 1.0, repeats=repeats, desc='FlashAttention Triton OG')
 # # pytorch_profiler(attention, q, k, v, 1.0, backward=True)
 
+# if scaled_upper_triang_masked_softmax is not None:
+#     benchmark_all(attention_megatron, qkv, repeats=repeats, desc='Megatron Attention')
+
 # from src.ops.fftconv import fftconv_func
 
 # dim = nheads * headdim

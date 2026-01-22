@@ -178,11 +178,6 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // Sort batches by num_n_blocks in descending order
         BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
 
-        // if (threadIdx.x == 0) {
-        //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
-        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
-        // } __syncthreads();
-
         if (is_causal) {
             // reset value to num_n_blocks
             batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
@@ -192,11 +187,10 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // and also store the vbidx -> bidx mapping.
         // 1. num_nheads_in_l2_ptr: virtual_batch_idx -> num_nheads_in_l2[batch_idx]
         // 2. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
-        // 3. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
+        // 3. prepare_seqlen_q_ptr: virtual_batch_idx -> seqlen_q[batch_idx] * (packgqa ? qhead_per_khead : 1)
         // 4. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx      
         batch_idx = batch_cta_idx_offset + threadIdx.x;
         if (batch_idx < num_batch && threadIdx.x < 992) {
-            // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
             num_m_blocks_ptr[batch_idx] = batch_coords[0].y;
             num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z;

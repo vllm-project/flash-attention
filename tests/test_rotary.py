@@ -48,7 +48,7 @@ def index_cos_sin(cos, sin, seqlen_offsets, seqlen):
 @pytest.mark.parametrize(
     "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
 )
-# @pytest.mark.parametrize('dtype', ([torch.bfloat16]))
+# @pytest.mark.parametrize('dtype', ([torch.float16]))
 @pytest.mark.parametrize("seqlen_offsets_type", [0, int, torch.Tensor])
 # @pytest.mark.parametrize("seqlen_offsets_type", [0])
 @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])

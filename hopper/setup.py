@@ -416,7 +416,6 @@ def nvcc_threads_args():
 
 # NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.3.107"}
 NVIDIA_TOOLCHAIN_VERSION = {"nvcc": "12.6.85", "ptxas": "12.8.93"}
-
 exe_extension = sysconfig.get_config_var("EXE")
 
 
@@ -532,7 +531,6 @@ if not SKIP_CUDA_BUILD:
         + ([192] if not DISABLE_HDIM192 else [])
         + ([256] if not DISABLE_HDIM256 else [])
     )
-    # build will now explode with this compilation grouping given all our templating
     # HEAD_DIMENSIONS_FWD = ["all", "diff"]
     HEAD_DIMENSIONS_FWD = HEAD_DIMENSIONS_BWD
     HEAD_DIMENSIONS_DIFF64_FWD = (

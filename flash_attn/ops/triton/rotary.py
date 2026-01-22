@@ -1,5 +1,4 @@
-# Copyright (c) 2025, Tri Dao.
-# As of 2025-04-23, we require triton >= 3.0
+# Copyright (c) 2023, Tri Dao.
 
 from typing import Optional, Union
 

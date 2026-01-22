@@ -103,6 +103,7 @@ def get_scheduler_metadata(
     max_seqlen_k_new=0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    attention_chunk=0,
     has_softcap=False,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
@@ -124,6 +125,7 @@ def get_scheduler_metadata(
         max_seqlen_k_new,
         causal,
         window_size[0], window_size[1],
+        attention_chunk,
         has_softcap,
         num_splits,
         pack_gqa,
@@ -147,6 +149,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     causal=False,
     window_size: Optional[List[int]] = None,
+    attention_chunk=0,
     softcap=0.0, # 0.0 means deactivated
     alibi_slopes=None,
     deterministic=False,
@@ -204,6 +207,7 @@ def flash_attn_varlen_func(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        attention_chunk: int. If > 0, chunked attention size for FA3.
         softcap: float. Anything > 0 activates softcapping attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
@@ -248,6 +252,8 @@ def flash_attn_varlen_func(
                 )
         if s_aux is not None:
             raise NotImplementedError("FA2 does not support s_aux")
+        if attention_chunk:
+            raise NotImplementedError("FA2 does not support attention_chunk")
         if num_splits > 1:
             raise NotImplementedError("FA2 does not support num_splits > 1")
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
@@ -294,6 +300,7 @@ def flash_attn_varlen_func(
             softmax_scale,
             causal,
             real_window_size[0], real_window_size[1],
+            attention_chunk,
             softcap,
             True,             # rotary_interleaved
             scheduler_metadata,

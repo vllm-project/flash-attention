@@ -19,7 +19,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 # @pytest.mark.parametrize("zero_centered_weight", [False, True])
 @pytest.mark.parametrize("zero_centered_weight", [False])
 @pytest.mark.parametrize("has_weight1", [False, True])
-# @pytest.mark.parametrize("has_weight1", [False])
+# @pytest.mark.parametrize("has_weight1", [True])
 @pytest.mark.parametrize("has_x1", [False, True])
 # @pytest.mark.parametrize("has_x1", [False])
 @pytest.mark.parametrize("has_rowscale", [False, True])
@@ -27,11 +27,11 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 @pytest.mark.parametrize("dropout_p", [0.0, 0.27])
 # @pytest.mark.parametrize("dropout_p", [0.0])
 @pytest.mark.parametrize("prenorm", [True, False])
-# @pytest.mark.parametrize("prenorm", [True])
+# @pytest.mark.parametrize("prenorm", [False])
 @pytest.mark.parametrize("is_rms_norm", [False, True])
 # @pytest.mark.parametrize("is_rms_norm", [True])
 @pytest.mark.parametrize("has_residual", [True, False])
-# @pytest.mark.parametrize("has_residual", [True])
+# @pytest.mark.parametrize("has_residual", [False])
 @pytest.mark.parametrize(
     "weight_dtype", [torch.float32, torch.float16] + ([torch.bfloat16] if is_sm8x else [])
 )
@@ -43,7 +43,7 @@ is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 )
 # @pytest.mark.parametrize("input_dtype,residual_dtype", [(torch.float16, torch.float16)])
 @pytest.mark.parametrize("hidden_size", [192, 2048, 2560, 3000, 4096])
-# @pytest.mark.parametrize("hidden_size", [1024])
+# @pytest.mark.parametrize("hidden_size", [256])
 def test_layer_norm(
     hidden_size,
     input_dtype,

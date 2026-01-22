@@ -578,7 +578,7 @@ def get_dropout_fraction(
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128])
-# @pytest.mark.parametrize("d", [64])
+# @pytest.mark.parametrize("d", [32])
 # @pytest.mark.parametrize('seqlen', [128, 256, 384, 512, 768, 1024, 2048])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 384, 768, 1024, 1025, 2048])
 # @pytest.mark.parametrize("seqlen", [512])
@@ -726,7 +726,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
 # @pytest.mark.parametrize('causal', [False])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [64])
+# @pytest.mark.parametrize('d', [32])
 @pytest.mark.parametrize("seqlen", [97, 128, 200, 257, 384, 512, 768, 1025, 2048])
 # @pytest.mark.parametrize('seqlen', [128])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
@@ -862,6 +862,7 @@ def test_flash_attn_varlen_qkvpacked(
         assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
+# @pytest.mark.parametrize("kvpacked", [True, False])
 @pytest.mark.parametrize("kvpacked", [False])
 # @pytest.mark.parametrize("kvpacked", [False])
 @pytest.mark.parametrize("dtype", ([torch.float16]))
@@ -1153,7 +1154,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [64])
+# @pytest.mark.parametrize('d', [160])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1173,7 +1174,6 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize('dropout_p', [0.0])
 def test_flash_attn_varlen_output(
     seqlen_q, seqlen_k, d, dropout_p, causal, local, alibi, deterministic, mha_type, dtype, kvpacked, softcap
 ):
@@ -1462,15 +1462,15 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("dtype", ([torch.float16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("local", [True])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [32])
+# @pytest.mark.parametrize("swap_sq_sk", [False, True])
 @pytest.mark.parametrize("swap_sq_sk", [False])
-# @pytest.mark.parametrize("swap_sq_sk", [True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1575,15 +1575,14 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
 @pytest.mark.parametrize("dtype", ([torch.float16]))
 # @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("local", [True])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [64])
+# @pytest.mark.parametrize("swap_sq_sk", [False, True])
 @pytest.mark.parametrize("swap_sq_sk", [False])
-# @pytest.mark.parametrize("swap_sq_sk", [True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1600,6 +1599,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     ],
 )
 # TODO: add smaller page sizes when https://github.com/Dao-AILab/flash-attention/pull/824 is merged
+# @pytest.mark.parametrize("paged_kv_block_size", [None, 256, 512])
 @pytest.mark.parametrize("paged_kv_block_size", [None])
 # @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 128)])
 def test_flash_attn_varlen_causal(
@@ -1892,10 +1892,8 @@ def test_flash_attn_splitkv(
 @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 # @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("paged_kv_block_size", [None])
-# @pytest.mark.parametrize("paged_kv_block_size", [256, 512])
-# @pytest.mark.parametrize("paged_kv_block_size", [None])
+# @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
-# @pytest.mark.parametrize("has_leftpad", [True])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])

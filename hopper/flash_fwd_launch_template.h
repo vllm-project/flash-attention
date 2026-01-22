@@ -51,10 +51,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
+    using ElementSAux = cutlass::bfloat16_t;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor>,
-        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementSAux>,
+        flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementSAux>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV>;
 
@@ -130,7 +131,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.kv_batch_idx,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
-        params.leftpad_k, params.seqlens_rotary
+        params.leftpad_k, params.seqlens_rotary,
+        static_cast<ElementS const*>(params.s_aux_ptr),
+        params.cp_world_size, params.cp_rank, params.cp_tot_seqused_k
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
@@ -153,12 +156,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         num_blocks_m, !PackGQA ? params.h : params.h_k, params.b, params.num_splits,
         params.h / params.h_k,
         params.seqlen_q,
-        params.seqlen_k, params.d, params.dv, sizeof(Element), 
+        params.seqlen_k, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_q, params.seqused_q,
         params.num_splits_dynamic_ptr,
         params.num_m_blocks_ptr,
         params.varlen_batch_idx_ptr,
-        params.num_nheads_in_l2_ptr
+        params.num_nheads_in_l2_ptr,
+        params.cp_world_size,
+        params.cp_rank
     };
 
     if (Varlen && !params.skip_scheduler_metadata_computation) {

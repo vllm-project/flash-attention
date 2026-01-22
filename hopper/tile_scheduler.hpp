@@ -29,6 +29,9 @@ struct TileSchedulerArguments {
     int const* const varlen_batch_idx_ptr = nullptr;
     // int const* const num_n_blocks_ptr = nullptr;
     int const* const num_nheads_in_l2_ptr = nullptr;
+    // CP (Context Parallelism) parameters
+    int const cp_world_size = 1;
+    int const cp_rank = 0;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -49,6 +52,8 @@ public:
         int const* const cu_seqlens;
         int const* const seqused;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int const cp_world_size = 1;
+        int const cp_rank = 0;
     };
 
     static Params
@@ -59,7 +64,8 @@ public:
                 args.qhead_per_khead, args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused,
-                args.num_splits_dynamic_ptr};
+                args.num_splits_dynamic_ptr,
+                args.cp_world_size, args.cp_rank};
     }
 
     static dim3
@@ -212,8 +218,6 @@ public:
     }
 
 };
-
-///////////////////////////////////////////////////////////////////////////////
 
 template<int NumMmaThreads=2 * cutlass::NumThreadsPerWarpGroup, int NumProducerThreads=cutlass::NumThreadsPerWarp,
         bool Split=false, bool PackGQA=false, bool WarpSpecialized=true>
@@ -617,7 +621,6 @@ public:
                 }
                 return batch_idx < params.num_batch && lane < cutlass::NumThreadsPerWarp - 1
                     ? cute::ceil_div(seqlen, kBlockM) : 0;
-                    // ? params.num_m_blocks_ptr[batch_idx] : 0;
             }
         };
 
@@ -811,7 +814,5 @@ public:
     }
 
 };
-
-///////////////////////////////////////////////////////////////////////////////
 
 } // flash

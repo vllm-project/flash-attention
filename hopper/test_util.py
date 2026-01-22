@@ -315,7 +315,24 @@ def construct_chunk_mask(
     key_padding_mask=None,
     key_leftpad=None,
     device=None,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqlen_k=None,
 ):
+    if cp_world_size > 1:
+        return construct_cp_mask(
+            seqlen_q,
+            seqlen_k,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
+            window_size=window_size,
+            sink_token_length=sink_token_length,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=device,
+        )
     row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
     col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
     if key_leftpad is not None:

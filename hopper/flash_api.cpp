@@ -252,7 +252,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
-template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool Has_softcap>
+template <int Arch, int Split, bool PagedKVNonTMA, bool PackGQA, bool PackGQA_HDIMDIFF, bool Has_softcap>
 void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
     if (!params.is_e4m3) {
         if (params.is_bf16) {
@@ -261,9 +261,9 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                 if constexpr (Arch == 90) {
                     if (params.dv > 256) {
-                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     } else if (params.dv > 64) {
-                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     }
                 }
                 #endif
@@ -281,7 +281,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                 if constexpr (Arch == 90) {
                     if (params.dv <= 128) {
-                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     }
                 }
                 #endif
@@ -298,9 +298,9 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                 if constexpr (Arch == 90) {
                     if (params.dv > 256) {
-                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     } else if (params.dv > 64) {
-                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     }
                 }
                 #endif
@@ -318,7 +318,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
                 #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                 if constexpr (Arch == 90) {
                     if (params.dv <= 128) {
-                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                     }
                 }
                 #endif
@@ -348,7 +348,7 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
             if constexpr (Arch == 90) {
                 if (params.dv <= 128) {
-                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
+                    return run_mha_fwd_<90, cutlass::float_e4m3_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                 }
             }
             #endif
@@ -374,9 +374,16 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             PAGEDKV_SWITCH(params.page_table && !params.pagedkv_tma, PagedKVNonTMA, [&] {
                 PACKGQA_SWITCH(params.pack_gqa, PackGQA_, [&] {
                     // Always enable PackGQA for Sm8x or PagedKVNonTMA or Split to reduce compilation
+                    #ifdef FLASHATTENTION_PACKGQA_ONLY
+                    // Always enable PackGQA except for hdimdiff cases to reduce compilation
+                    static constexpr bool PackGQA = true;
+                    static constexpr bool PackGQA_HDIMDIFF = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    #else
                     static constexpr bool PackGQA = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    static constexpr bool PackGQA_HDIMDIFF = PackGQA_ || Arch < 90 || PagedKVNonTMA || Split;
+                    #endif
                     SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
-                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, Has_softcap>(params, stream);
+                        run_mha_fwd_constexpr<Arch, Split, PagedKVNonTMA, PackGQA, PackGQA_HDIMDIFF, Has_softcap>(params, stream);
                     });
                 });
             });
@@ -413,9 +420,10 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
 }
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
-    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr) { return false; }
+    // disable for local since we move k_ptr to start of sliding window by m_block
+    if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
     // This needs to match the kernel configs
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, false /*paged_kv_non_TMA*/, params.softcap > 0.f, use_one_mma_wg(params));
     int const kBlockM = std::get<0>(kBlockMN_kernel_args_sm90);
     int const kBlockN = std::get<1>(kBlockMN_kernel_args_sm90);
     // Heuristic: when seqlen_q <= kBlockM, we're not compute bound, and somehow using TMA is slower,
@@ -453,7 +461,7 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // params.page_table must already be set
     // This needs to match the kernel configs
     bool varlen = params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k;
-    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f);
+    auto kBlockMN_kernel_args_sm90 = tile_size_fwd_sm90(params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, false /*v_colmajor*/, params.page_table && !params.pagedkv_tma, params.softcap > 0.f, use_one_mma_wg(params));
     // Strictly speaking we need to pass in (varlen && params.num_splits > 1) but num_splits
     // has not been set here. It's OK though because we might just underestimate kBlockN a bit
     auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, varlen, params.softcap > 0.f, params.knew_ptr);
@@ -472,6 +480,12 @@ inline int get_num_splits(Flash_fwd_params const& params) {
     // We assume the case where there's 1 long sequence and the rest are short, i.e. pretending
     // that batch = 1.
     int total_mblocks = (params.num_splits_dynamic_ptr ? 1 : params.b) * params.h_k * num_m_blocks;
+    // For debugging
+    // printf("num sm = %d.\n", params.num_sm);
+    // printf("bM = %d, bN = %d.\n", kBlockM, kBlockN);
+    // printf("num_n_blocks, num_m_blocks = %d, %d.\n", num_n_blocks, num_m_blocks);
+    // printf("total m blocks = %d.\n", total_mblocks);
+    // printf("seqlen_k = %d, size_one_kv_head = %d.\n", params.seqlen_k, size_one_kv_head);
     return num_splits_heuristic(total_mblocks, params.num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, params.is_causal || params.is_local, 128);
     #endif
 }
@@ -614,7 +628,6 @@ mha_fwd_get_scheduler_metadata(
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
     bool is_varlen = true;
@@ -710,7 +723,11 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> s_aux_,
+        int64_t cp_world_size,
+        int64_t cp_rank,
+        std::optional<at::Tensor> cp_tot_seqused_k_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -795,6 +812,12 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
                         "HeaddimV > 256 requires fp16 and bf16 data type");
         }
+        #ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
+        TORCH_CHECK(head_size > 64, "This flash attention build does not support hdim != hdim_v when hdim <= 64");
+        #endif 
+        #ifdef FLASHATTENTION_DISABLE_HDIMDIFF192
+        TORCH_CHECK(head_size <= 64, "This flash attention build does not support hdim != hdim_v when hdim in (128, 192]");
+        #endif
     }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
@@ -849,19 +872,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         CHECK_DEVICE(cp_tot_seqused_k); CHECK_CONTIGUOUS(cp_tot_seqused_k);
         CHECK_SHAPE(cp_tot_seqused_k, batch_size);
     }
-
-    if (leftpad_k_.has_value()) {
-        auto leftpad_k = leftpad_k_.value();
-        TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
-        CHECK_DEVICE(leftpad_k); CHECK_CONTIGUOUS(leftpad_k);
-        CHECK_SHAPE(leftpad_k, batch_size);
-    }
-
-    // This is what we will template on
-    bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value() || leftpad_k_.has_value();
-    #ifdef FLASHATTENTION_DISABLE_VARLEN
-        TORCH_CHECK(!is_varlen, "This flash attention build does not support varlen.");
-    #endif
 
     if (leftpad_k_.has_value()) {
         auto leftpad_k = leftpad_k_.value();
@@ -998,7 +1008,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
         }
     }
-    
+
     bool const use_prepare_varlen = is_varlen;
     params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
@@ -1006,7 +1016,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
-    // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
+    // printf("Num splits = %d.\n", params.num_splits);
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
 
     // This needs to be set after get_num_splits
@@ -1185,8 +1195,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.s_aux_ptr = nullptr;
     }
 
-    params.cp_world_size = cp_world_size;
-    params.cp_rank = cp_rank;
+    params.cp_world_size = static_cast<int>(cp_world_size);
+    params.cp_rank = static_cast<int>(cp_rank);
     params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ?
       static_cast<int *>(cp_tot_seqused_k_.value().data_ptr()) : nullptr;
     TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
@@ -1756,7 +1766,11 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? s_aux = None,"
+        "int cp_world_size = 1,"
+        "int cp_rank = 0,"
+        "Tensor? cp_tot_seqused_k = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1818,5 +1832,3 @@ TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
 }
-
-#endif

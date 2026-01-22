@@ -86,11 +86,13 @@ jobs:
           pip install setuptools==75.8.0
           # We don't want to download anything CUDA-related here
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Build core package
         env:
           FLASH_ATTENTION_SKIP_CUDA_BUILD: "TRUE"
         run: |
           python setup.py sdist --dist-dir=dist
+
       - name: Deploy
         env:
           TWINE_USERNAME: "__token__"

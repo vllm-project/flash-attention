@@ -157,7 +157,7 @@ public:
     };
 
     // Kernel entry point API
-    struct Params {
+    struct CollectiveParams {
         ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
@@ -182,7 +182,6 @@ public:
     to_underlying_arguments(Arguments const& args) {
         assert(get<1>(args.shape_LSE_partial) <= kMaxSplits);
         return {
-            args.b,
             args.ptr_O_partial,
             args.shape_O_partial,
             args.stride_O_partial,
@@ -198,8 +197,7 @@ public:
             args.seqused,
             args.num_splits_dynamic_ptr,
             args.varlen_batch_idx_ptr,
-            args.semaphore_to_reset,
-            
+            args.semaphore_to_reset
         };
     }
 

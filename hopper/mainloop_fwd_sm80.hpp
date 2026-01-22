@@ -214,6 +214,10 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSAux const* const ptr_S_aux = nullptr;
+        int cp_world_size;
+        int cp_rank;
+        int const* const cp_tot_seqused_k = nullptr;
     };
 
     // Device side kernel params
@@ -260,6 +264,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        ElementSAux const* const ptr_S_aux = nullptr;
     };
 
     static Params
@@ -302,7 +307,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.ptr_S_aux};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -426,7 +432,7 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            bidb_kv, bidh_kv, thread_idx, seqlen_k, seqlen_info.leftpad_k + n_offset,
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 

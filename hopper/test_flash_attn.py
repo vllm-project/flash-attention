@@ -126,7 +126,7 @@ if ENABLE_OPCHECK:
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("V_colmajor", [False, True])
 @pytest.mark.parametrize("V_colmajor", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -250,6 +250,10 @@ def test_flash_attn_output(
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            s_aux=s_aux,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
         )
 
         # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_ref).float()
@@ -373,7 +377,7 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("local", [False] + ([True] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("add_unused_qkv", [False, True])
 # @pytest.mark.parametrize("add_unused_qkv", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -421,13 +425,8 @@ def test_flash_attn_varlen_output(
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     # batch_size = 1024
     batch_size = 9 if seqlen_q <= 2048 else 2
-    # batch_size = 32
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
-    # batch_size = 2
-    # nheads = 1
-    # nheads_kv = nheads
-    
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
@@ -531,6 +530,7 @@ def test_flash_attn_varlen_output(
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            s_aux=s_aux,
         )
 
 
@@ -545,13 +545,7 @@ def test_flash_attn_varlen_output(
         rtol = 2 if softcap == 0.0 else 3
 
         pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
-        # pack_gqa_vals = [False]
         num_splits_vals = [1, 3, 0] if not DISABLE_SPLIT else [1]
-        # num_splits_vals = [1]
-        # print("cu_seqlens_q: ", cu_seqlens_q)
-        # print("cu_seqlens_k: ", cu_seqlens_k)
-        # print("seqused_q: ", seqused_q)
-        # print("seqused_k: ", seqused_k)
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
             out_unpad = flash_attn_varlen_func(
@@ -676,7 +670,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [False])
+# @pytest.mark.parametrize("new_kv", [True])
 @pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
 # @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
 # @pytest.mark.parametrize("causal,local", [(True, False)])
@@ -693,7 +687,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False, True])
 # @pytest.mark.parametrize("has_leftpad", [False])
 @pytest.mark.parametrize("has_batch_idx", [False, True])
-# @pytest.mark.parametrize("has_batch_idx", [True])
+# @pytest.mark.parametrize("has_batch_idx", [False])
 @pytest.mark.parametrize("varlen_q", [False, True])
 # @pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
@@ -933,7 +927,8 @@ def test_flash_attn_kvcache(
             upcast=False,
             reorder_ops=True,
             key_leftpad=cache_leftpad,
-            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            s_aux=s_aux,
         )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
@@ -956,6 +951,7 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(num_splits_vals, precompute_metadata_vals):
             print(f"{num_splits = }, {precompute_metadata = }")
             if precompute_metadata:
+                # WARNING: seqlen_k is not max_seqlen_k if using page table, so we can't expect this to make sense?
                 scheduler_metadata = get_scheduler_metadata(
                     batch_size,
                     max_seqlen_q if varlen_q else seqlen_q,
@@ -993,6 +989,7 @@ def test_flash_attn_kvcache(
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k_new,
                     max_seqlen_q=max_seqlen_q,
+                    # max_seqlen_k=max_seqlen_k,
                     rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,

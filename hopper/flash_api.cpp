@@ -289,9 +289,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 64) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -310,7 +310,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 192) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::bfloat16_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -328,9 +328,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 64) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF64
                                     if (params.dv > 256 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 512, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else if (params.dv > 64 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 64, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 64, 64, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }
@@ -349,7 +349,7 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 if (params.d <= 192) {
                                     #ifndef FLASHATTENTION_DISABLE_HDIMDIFF192
                                     if (params.dv <= 128 && Arch == 90) {
-                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF, false>(params, stream);
+                                        return run_mha_fwd_<Arch, cutlass::half_t, 192, 128, Split, PagedKVNonTMA, Has_softcap, PackGQA_HDIMDIFF>(params, stream);
                                     } else {
                                         return run_mha_fwd_<Arch, cutlass::half_t, 192, 192, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream);
                                     }

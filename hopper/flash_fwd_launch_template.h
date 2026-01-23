@@ -210,7 +210,10 @@ template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool Pag
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
-    using T_out = std::conditional_t<!Is_FP8, T, std::conditional_t<FP8_Output, cutlass::float_e4m3_t, cutlass::bfloat16_t>>;
+    // If fp8, use fp8 if output is explicitly in fp8 (o_scale provided), otherwise use bf16 
+    using _T_out_fp8 = std::conditional_t<FP8_Output, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
+    // Use T if not fp8
+    using T_out = std::conditional_t<Is_FP8, _T_out_fp8, T>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;

@@ -635,9 +635,9 @@ mha_fwd_get_scheduler_metadata(
         tile_count_semaphore = torch::empty(
             {int(scheduler_needs_semaphore) + tile_count_semaphore_offset},
             opts.dtype(torch::kInt32));
-        // {num_splits_dynamic, num_m_blocks, varlen_batch_idx, num_nheads_in_l2}
-        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_m_blocks_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        // {prepare_seqlen_q, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
+        params.prepare_seqlen_q_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
         params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
         // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
         params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
@@ -1015,9 +1015,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         if (scheduler_needs_semaphore && !use_prepare_varlen) {
             tile_count_semaphore.zero_();  // If varlen we'll manually do the zero-ing
         }
-        // {num_splits_dynamic, num_m_blocks, varlen_batch_idx, num_nheads_in_l2}
-        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
-        params.num_m_blocks_ptr =  use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        // {prepare_seqlen_q, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2}
+        params.prepare_seqlen_q_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
         params.varlen_batch_idx_ptr =  use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
         // params.num_n_blocks_ptr  = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
         params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;

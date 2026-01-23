@@ -4,6 +4,9 @@
 
 #pragma once
 
+// For TORCH_CHECK
+#include <c10/util/Exception.h>
+
 /// @param COND       - a boolean expression to switch by
 /// @param CONST_NAME - a name given for the constexpr bool variable.
 /// @param ...       - code to execute for true and false
@@ -56,6 +59,16 @@
         return __VA_ARGS__();                                                                    \
       }                                                                                          \
     }()
+#endif
+
+#ifdef FLASHATTENTION_DISABLE_HDIMDIFF64
+  #define QV_SWITCH(COND, CONST_NAME, ...)                                                  \
+  [&] {                                                                                          \
+    constexpr static bool CONST_NAME = false;                                                    \
+    return __VA_ARGS__();                                                                        \
+  }()
+#else
+  #define QV_SWITCH BOOL_SWITCH
 #endif
 
 #ifdef FLASHATTENTION_DISABLE_SOFTCAP
@@ -112,6 +125,14 @@
   #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
   [&] {                                                                                          \
     constexpr static bool CONST_NAME = false;                                                    \
+    return __VA_ARGS__();                                                                        \
+  }()
+#elif defined(FLASHATTENTION_VARLEN_ONLY)
+  #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
+  [&] {                                                                                          \
+    TORCH_CHECK(COND, "This flash attention build only supports varlen "                         \
+                      "(for build size reasons).");                                              \
+    constexpr static bool CONST_NAME = true;                                                     \
     return __VA_ARGS__();                                                                        \
   }()
 #else
@@ -179,6 +200,31 @@
       return __VA_ARGS__();                                                                      \
     }                                                                                            \
   }()
+
+#ifdef FLASH_ATTENTION_DISABLE_PACKGQA
+  #define PACK_GQA_BLOCK_SWITCH(QHEADS_PER_KHEADS, BLOCK_H, ...)                                 \
+  [&] {                                                                                          \
+      constexpr static int BLOCK_H = 1;                                                          \
+      return __VA_ARGS__();                                                                      \
+  }()
+#else
+  #define PACK_GQA_BLOCK_SWITCH(QHEADS_PER_KHEADS, BLOCK_H, ...)                                 \
+  [&] {                                                                                          \
+    if (QHEADS_PER_KHEADS == 16) {                                                               \
+      constexpr static int BLOCK_H = 16;                                                         \
+      return __VA_ARGS__();                                                                      \
+    } else if (QHEADS_PER_KHEADS == 8) {                                                         \
+      constexpr static int BLOCK_H = 8;                                                          \
+      return __VA_ARGS__();                                                                      \
+    } else if (QHEADS_PER_KHEADS == 4) {                                                         \
+      constexpr static int BLOCK_H = 4;                                                          \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+      constexpr static int BLOCK_H = 1;                                                          \
+      return __VA_ARGS__();                                                                      \
+    }                                                                                            \
+  }()
+#endif
 
 #define NUM_WARP_SWITCH(VALUE, CONST_NAME, ...)                                                  \
   [&] {                                                                                          \

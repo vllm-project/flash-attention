@@ -138,10 +138,10 @@ def get_all_kernels() -> List[Kernel]:
         # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
         if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
-        
+
         # FP8 output variants only for FP8 input (e4m3) on SM90
         fp8_outputs = [False, True] if (dtype == "e4m3" and sm >= 90) else [False]
-        
+
         for fp8_output in fp8_outputs:
             if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
                 yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=fp8_output, direction="fwd")
@@ -151,7 +151,7 @@ def get_all_kernels() -> List[Kernel]:
             if sm == 90 and head_dim == 64 and dtype in ["bf16", "fp16"] and not fp8_output:
                 yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
                 yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, fp8_output=False, direction="fwd")
-    
+
     # Backward kernels don't support FP8 output (always fp8_output=False)
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, fp8_output=False, direction="bwd")

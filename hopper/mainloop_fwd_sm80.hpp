@@ -25,7 +25,7 @@ using namespace cute;
 
 template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
-        bool PackGQA_, bool Split_, class ElementSAux_>
+        bool PackGQA_, bool Split_>
 struct CollectiveMainloopFwdSm80 {
 
     static constexpr int kStages = Stages;
@@ -34,7 +34,6 @@ struct CollectiveMainloopFwdSm80 {
     using TileShape_MNK_PV = Shape<decltype(get<0>(TileShape_MNK{})), Int<kHeadDimV>, decltype(get<1>(TileShape_MNK{}))>;
     using Element = Element_;
     using ElementAccum = ElementAccum_;
-    using ElementSAux = ElementSAux_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
     static constexpr bool Is_causal = Is_causal_;
@@ -203,7 +202,7 @@ struct CollectiveMainloopFwdSm80 {
         float const softmax_scale;
         float const* ptr_q_descale, *ptr_k_descale, *ptr_v_descale;
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
-        int const window_size_left = -1, window_size_right = -1;
+        int const window_size_left = -1, window_size_right = -1, attention_chunk = 0;
         float const softcap_val;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
@@ -214,10 +213,6 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
-        ElementSAux const* const ptr_S_aux = nullptr;
-        int cp_world_size;
-        int cp_rank;
-        int const* const cp_tot_seqused_k = nullptr;
     };
 
     // Device side kernel params
@@ -254,6 +249,7 @@ struct CollectiveMainloopFwdSm80 {
         StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
         float const softcap_val;
         int const window_size_left, window_size_right;
+        cutlass::FastDivmod attention_chunk_divmod;
         int const num_splits;
         int const* const kv_batch_idx = nullptr;
         int const* const cu_seqlens_q = nullptr;
@@ -263,7 +259,6 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
-        ElementSAux const* const ptr_S_aux = nullptr;
     };
 
     static Params
@@ -282,6 +277,9 @@ struct CollectiveMainloopFwdSm80 {
             assert(args.ptr_rotary_cos != nullptr && args.ptr_rotary_sin != nullptr);
         }
         assert(args.num_splits >= 1);
+        // Avoid dividing by zero
+        cutlass::FastDivmod attention_chunk_divmod(args.attention_chunk >= 1 ? args.attention_chunk : 1);
+        attention_chunk_divmod.divisor = args.attention_chunk;
         // If there's tanh softcapping, we do tanh(scores * softmax_scale / softcap_val) * softcap_val.
         // Right after this, we multiply by log2(e) before applying exp2.
         // To reduce the number of instructions, we instead pre-multiply softmax_scale / softcap_val
@@ -299,12 +297,11 @@ struct CollectiveMainloopFwdSm80 {
                 args.ptr_q_descale, args.ptr_k_descale, args.ptr_v_descale,
                 args.stride_q_descale, args.stride_k_descale, args.stride_v_descale,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
-                args.window_size_left, args.window_size_right,
+                args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.ptr_S_aux};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -329,10 +326,10 @@ struct CollectiveMainloopFwdSm80 {
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
         auto n_block_min_max = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         int const n_block_min = get<0>(n_block_min_max);
         int const n_block_max = get<1>(n_block_min_max);
-        int const n_offset = get<2>(n_block_min_max);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -349,9 +346,9 @@ struct CollectiveMainloopFwdSm80 {
         int const bidb_kv = params.kv_batch_idx == nullptr ? bidb : params.kv_batch_idx[bidb];
         Tensor mQ = make_tensor(make_gmem_ptr(params.ptr_Q + seqlen_info.offset_q * get<0>(params.stride_Q)), params.shape_Q_packed, params.stride_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
         Tensor gQ = local_tile(mQ, select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + (seqlen_info.offset_k + n_offset) * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mK = make_tensor(make_gmem_ptr(params.ptr_K + seqlen_info.offset_k * get<0>(params.stride_K)), params.shape_K, params.stride_K)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + (seqlen_info.offset_k + n_offset) * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
+        Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
@@ -389,7 +386,7 @@ struct CollectiveMainloopFwdSm80 {
         for (int k = 0; k < size(tKVpKV); ++k) { tKVpKV(k) = get<1>(tKVcKV(_0{}, _0{}, k)) < get<1>(params.shape_K); }
 
         int const seqlen_q = seqlen_info.seqlen_q;
-        int const seqlen_k = seqlen_info.seqlen_k - n_offset;
+        int const seqlen_k = seqlen_info.seqlen_k;
         int n_block = n_block_max - 1;
 
         // Prologue: load Q, K, V
@@ -427,7 +424,7 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, seqlen_k, seqlen_info.leftpad_k + n_offset,
+            bidb_kv, bidh_kv, thread_idx, seqlen_info.seqlen_k, seqlen_info.leftpad_k,
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/
         );
 
@@ -440,8 +437,8 @@ struct CollectiveMainloopFwdSm80 {
                 // Instead of passing in tKVcKV, we pass in t0KVcKV and subtract the offset from the limit
                 // (seqlen_k - n_block * kBlockN). This is because the entries of t0KVcKV are known at compile time.
                 int const seqlenk_row_limit = -int(get<0>(tKVcKV(_0{}, _0{}, _0{}))) + (EvenN
-                    ? seqlen_k - n_block * kBlockN
-                    : (!Seqlenk_mask ? kBlockN : std::min(seqlen_k - n_block * kBlockN, kBlockN)));
+                    ? seqlen_info.seqlen_k - n_block * kBlockN
+                    : (!Seqlenk_mask ? kBlockN : std::min(seqlen_info.seqlen_k - n_block * kBlockN, kBlockN)));
                 // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
                 flash::copy</*Is_even_MN=*/!Seqlenk_mask && EvenN, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/true>(
                     gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK_cur, t0KVcKV, tKVpKV, seqlenk_row_limit);
@@ -460,7 +457,7 @@ struct CollectiveMainloopFwdSm80 {
                 // We don't call flash::copy since it doesn't support bound checking
                 // to not overshot kBlockN when writing to smem.
                 Tensor tVgV_cur = tVgV(_, _, _, n_block);
-                int const seqlenk_row_limit = seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
+                int const seqlenk_row_limit = seqlen_info.seqlen_k - n_block * kBlockN - get<0>(tKVcKV(_0{}, _0{}, _0{}));
                 #pragma unroll
                 for (int m = 0; m < size<1>(tVsV); ++m) {
                     // If kBlockN doesn't evenly divide the tiled copy, only the last `m` needs to be checked
@@ -555,7 +552,7 @@ struct CollectiveMainloopFwdSm80 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMma> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
         float softcap_val = params.softcap_val;
@@ -628,19 +625,17 @@ struct CollectiveMainloopFwdSm80 {
         --n_block;
         if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
             auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
-            int const n_block_min_causal_local_mask =
-                std::max(n_block_min, (m_idx_min + seqlen_k - seqlen_q + params.window_size_right) / kBlockN);
+            int const n_block_min_causal_local_mask = BlockMN_t::get_n_block_min_causal_local_mask(
+                seqlen_info, m_block, n_block_min, params.window_size_right,
+                params.attention_chunk_divmod, params.qhead_per_khead_divmod);
             #pragma unroll 1
             for (; n_block >= n_block_min_causal_local_mask; --n_block) {
                 fwd_step(n_block, mask_fn, cute::false_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             }
         }
-        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : params.qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
-        int const n_block_min_before_local_mask = !Is_local
-            ? n_block_min
-            : std::max(n_block_min,
-                        cute::ceil_div(m_idx_max + seqlen_k - seqlen_q - params.window_size_left, kBlockN));
+        int const n_block_min_before_local_mask = BlockMN_t::get_n_block_min_before_local_mask(
+            seqlen_info, m_block, n_block_min, params.window_size_left,
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod);
         auto no_mask_fn = [](auto& tSrS, int n_block) { };
         #pragma unroll 1
         for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -672,7 +667,8 @@ struct CollectiveMainloopFwdSm80 {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
         auto n_block_new_min_max = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
-            params.window_size_left, params.window_size_right, params.qhead_per_khead_divmod);
+            params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
+            params.qhead_per_khead_divmod);
         int const n_block_new_min = get<0>(n_block_new_min_max);
         int const n_block_new_max = get<1>(n_block_new_min_max);
         if (n_block_new_max <= n_block_new_min) { return false; }

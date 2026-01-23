@@ -47,7 +47,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int num_batch, int num_head, int qhead_per_khead, int num_sm, int num_splits_static,
         cutlass::FastDivmod blockm_divmod, cutlass::FastDivmod blockn_divmod,
         int* const tile_count_semaphore,
-        int* const prepare_seqlen_q_ptr,
+        int* const num_m_blocks_ptr,
         int* const num_splits_dynamic_ptr,
         int* const varlen_batch_idx_ptr,
         // int* const num_n_blocks_ptr,
@@ -78,7 +78,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
 
     int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
 
-    auto get_num_m_blocks_and_seqlen = [&](int batch_idx) {
+    auto get_num_m_blocks = [&](int batch_idx) {
         int seqlen;
         if (seqused_q) {
             seqlen = batch_idx < num_batch ? seqused_q[batch_idx] : 0;
@@ -89,9 +89,9 @@ __global__ void prepare_varlen_num_blocks_kernel(
         } else {
             seqlen = seqlen_q_static;
         }
+        if(packgqa) { seqlen *= qhead_per_khead; }
         return batch_idx < num_batch && lane < kNumBatchPerWarp
-            ? cute::make_tuple(blockm_divmod.div(seqlen * (packgqa ? qhead_per_khead : 1) + blockm_divmod.divisor - 1), seqlen)
-            : cute::make_tuple(0, 0);
+            ? blockm_divmod.div(seqlen + blockm_divmod.divisor - 1) : 0;
     };
 
     auto get_num_n_blocks = [&](int batch_idx) {
@@ -124,10 +124,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     int batch_cta_idx_offset = int(blockIdx.x) * 992;
     int bidb_start = batch_cta_idx_offset + kNumBatchPerWarp * warp_idx;
     int batch_idx = lane + bidb_start;
-    // int num_m_blocks = get_num_m_blocks(batch_idx);
-    auto seqlen_q_info = get_num_m_blocks_and_seqlen(batch_idx);
-    int num_m_blocks = cute::get<0>(seqlen_q_info);
-    int seqlen_q = cute::get<1>(seqlen_q_info);
+    int num_m_blocks = get_num_m_blocks(batch_idx);
     int num_n_blocks = get_num_n_blocks(batch_idx);
 
     auto get_nheads_in_l2 = [&](int n_blocks) {
@@ -166,43 +163,51 @@ __global__ void prepare_varlen_num_blocks_kernel(
     if constexpr (Sort) {
         if(lane == kNumBatchPerWarp || batch_idx >= num_batch) {
             num_n_blocks = INT_MIN; // sort last
-        }
-        else if (is_causal) {
-            // sort by middle member to process
-            num_n_blocks = num_n_blocks * blockn_divmod.divisor - (seqlen_q / 2);
+        } else if (is_causal) {
             // sort by shortest member to process
-            // num_n_blocks = num_n_blocks * blockn_divmod.divisor - seqlen_q;
+            num_n_blocks = num_n_blocks * blockn_divmod.divisor - num_m_blocks * blockm_divmod.divisor;
         }
         int4 batch_coords[ITEMS_PER_THREAD]; // 1 item per thread
-        batch_coords[0] = make_int4(num_n_blocks, seqlen_q, num_splits_dynamic, batch_idx);
+        batch_coords[0] = make_int4(num_n_blocks, num_m_blocks, num_splits_dynamic, batch_idx);
+
+        // if (threadIdx.x == 0) {
+        //     printf("Unsorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
 
         // Sort batches by num_n_blocks in descending order
         BlockMergeSort(temp_storage).Sort(batch_coords, PrepareSortOp<int4>());
 
+        // if (threadIdx.x == 0) {
+        //     printf("Sorted: num_n_blocks - num_m_blocks = %d, num_m_blocks = %d, num_splits = %d, batch_idx = %d.\n", 
+        //         batch_coords[0].x, batch_coords[0].y, batch_coords[0].z, batch_coords[0].w);
+        // } __syncthreads();
+
         if (is_causal) {
             // reset value to num_n_blocks
-            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + (batch_coords[0].y / 2));
-            // batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y);
+            batch_coords[0].x = blockn_divmod.div(batch_coords[0].x + batch_coords[0].y * blockm_divmod.divisor);
         }
 
         // When sorting, we re-index some metadata by 'virtual batch index'
         // and also store the vbidx -> bidx mapping.
         // 1. num_nheads_in_l2_ptr: virtual_batch_idx -> num_nheads_in_l2[batch_idx]
         // 2. num_splits_dynamic_ptr: virtual_batch_idx -> num_splits[batch_idx]
-        // 3. prepare_seqlen_q_ptr: virtual_batch_idx -> seqlen_q[batch_idx] * (packgqa ? qhead_per_khead : 1)
+        // 3. num_m_blocks_ptr: virtual_batch_idx -> num_m_blocks[batch_idx]
         // 4. varlen_batch_idx_ptr: virtual_batch_idx -> batch_idx      
         batch_idx = batch_cta_idx_offset + threadIdx.x;
         if (batch_idx < num_batch && threadIdx.x < 992) {
+            // num_n_blocks_ptr[threadIdx.x] = max(batch_coords[0].x, 1);
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(batch_coords[0].x, 1)); }
-            prepare_seqlen_q_ptr[batch_idx] = batch_coords[0].y * (packgqa ? qhead_per_khead : 1);
-            if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z; }
+            num_m_blocks_ptr[batch_idx] = batch_coords[0].y;
+            num_splits_dynamic_ptr[batch_idx] = batch_coords[0].z;
             varlen_batch_idx_ptr[batch_idx] = batch_coords[0].w;
         }  
     } else {
         if (batch_idx < num_batch && lane < kNumBatchPerWarp) {
-            prepare_seqlen_q_ptr[batch_idx] = seqlen_q * (packgqa ? qhead_per_khead : 1);
-            if(num_splits_dynamic_ptr) { num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic; }
+            // num_n_blocks_ptr[batch_idx] = max(num_n_blocks, 1);
             if(num_nheads_in_l2_ptr) { num_nheads_in_l2_ptr[batch_idx] = get_nheads_in_l2(max(num_n_blocks, 1)); }
+            num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic;
+            num_m_blocks_ptr[batch_idx] = num_m_blocks;
             // printf("idx = %d, num_m_blocks = %d, num_n_blocks = %d, num_split_static = %d, num_splits_dynamic = %d\n", bidb_start + lane, num_m_blocks_ptr[bidb_start + lane], num_n_blocks, num_splits_static, num_splits_dynamic);
         }
     }
@@ -217,12 +222,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
     int num_warps = cutlass::ceil_div(params.b, 31); // warp switch will cap this at 32
     int num_ctas = cutlass::ceil_div(params.b, 31 * 32);
     // int const size_l2 = 50 * 1024 * 1024; // 50 MB
-    int const size_l2_divisor = qhead_per_khead == 1 ? 1
-            : qhead_per_khead <= 2 ? 2
-            : qhead_per_khead <= 4 ? 4
-            : qhead_per_khead <= 8 ? 8
-            : 16;
-    int const size_l2 = (32 * 1024 * 1024) / size_l2_divisor; // experimental
+    int const size_l2 = 8 * 1024 * 1024; // underestimate seems better in practice
     int const element_size = params.is_e4m3 ? 1 : 2;
     int const size_one_kvblock = blockN * (params.d + params.dv) * element_size;
     // printf("block size = %d, element size = %d, headdim = %d, headdim_v = %d, size 1 kblock = %d.\n", blockN, element_size, params.d, params.dv, size_one_kvblock);
@@ -236,7 +236,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 params.b, !packgqa ? params.h : params.h_k, qhead_per_khead, params.num_sm, params.num_splits,
                 cutlass::FastDivmod(blockM), cutlass::FastDivmod(blockN),
                 params.tile_count_semaphore,
-                params.prepare_seqlen_q_ptr,
+                params.num_m_blocks_ptr,
                 params.num_splits_dynamic_ptr,
                 params.varlen_batch_idx_ptr,
                 // params.num_n_blocks_ptr,

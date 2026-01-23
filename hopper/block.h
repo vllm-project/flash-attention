@@ -26,8 +26,13 @@ struct BlockMN {
         if constexpr (Is_local) {
             int m_idx_min = m_block * kBlockM;
             if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+            int const n_idx = m_idx_min + seqlen_k - seqlen_q;
             // unlike previously, we don't divide by kBlockN because we want offset for seqlen_k
-            n_offset = std::max(int(0), m_idx_min + seqlen_k - seqlen_q - window_size_left);
+            int n_idx_left = n_idx - window_size_left;
+            if (attention_chunk_divmod.divisor > 0) {
+                n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
+            }
+            n_offset = std::max(int(0), n_idx_left);
             // Subtract n_offset from seqlen_k for subsequent calculations such as n_block_max
             // This is the actual seqlen_k processed for this m_block
             seqlen_k -= n_offset;
@@ -54,16 +59,7 @@ struct BlockMN {
         }
         // Now, only adjust n_block_min if split
         int n_block_min = 0;
-        if constexpr (Is_local) {
-            int m_idx_min = m_block * kBlockM;
-            if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
-            int const n_idx = m_idx_min + seqlen_k - seqlen_q;
-            int n_idx_left = n_idx - window_size_left;
-            if (attention_chunk_divmod.divisor > 0) {
-                n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
-            }
-            n_block_min = std::max(int(0), n_idx_left / kBlockN);
-        }
+        
         // if (threadIdx.x == 128) { printf("Inside, bid.x = %d, bid.y = %d, bid.z = %d, split_idx = %d, n_block_min: %d, n_block_max: %d\n", blockIdx.x, blockIdx.y, blockIdx.z, split_idx, n_block_min, n_block_max); }
         if constexpr (Split) {
             uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(split_idx) >> 16; // first 16 bits are for num_splits

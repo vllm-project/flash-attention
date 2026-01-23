@@ -52,6 +52,8 @@ public:
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
+    using SmemLayoutSAux = typename CollectiveMainloop::SmemLayoutSAux;
+
     // Mainloop derived types
     using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
     using TiledMmaPV = typename CollectiveMainloop::TiledMmaPV;
@@ -79,8 +81,10 @@ public:
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    // If we use varlen, we would like more registers for the varlen dynamic persistent scheduler in producer WG, but can only donate sometimes.
+    static constexpr bool ExtraProducerRegsForVarlen = Varlen && !Is_FP8 && (get<1>(TileShape_MNK_PV{}) == 128 || get<1>(TileShape_MNK_PV{}) == 192);
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !ExtraProducerRegsForVarlen ? 24 : 40) : 32);
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV && !ExtraProducerRegsForVarlen ? 240 : 232) : 160);
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
@@ -295,6 +299,14 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
+        const int num_heads = get<2>(params.mainloop.shape_Q);
+        Tensor gS_aux = make_tensor(make_gmem_ptr(params.mainloop.ptr_S_aux), make_shape(num_heads));
+        Tensor sS_aux = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_s_aux.data()), SmemLayoutSAux{});
+
+        if(params.mainloop.ptr_S_aux && threadIdx.x < num_heads) {
+            sS_aux(threadIdx.x) = gS_aux(threadIdx.x);
+        }
+
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
             cute::cluster_arrive_relaxed();
@@ -337,7 +349,10 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
+                    params.mainloop.seqlens_rotary,
+                    params.mainloop.cp_world_size,
+                    params.mainloop.cp_rank,
+                    params.mainloop.cp_tot_seqused_k
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.load_kv_new(
@@ -386,7 +401,9 @@ public:
                     get<0>(params.mainloop.shape_K_new),
                     params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
                     params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                    params.mainloop.seqlens_rotary
+                    params.mainloop.seqlens_rotary, params.mainloop.cp_world_size,
+                    params.mainloop.cp_rank,
+                    params.mainloop.cp_tot_seqused_k
                 };
                 if constexpr (AppendKV) {
                     bool tile_new_valid = mainloop.store_kv_new(

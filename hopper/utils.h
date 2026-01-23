@@ -99,25 +99,6 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-CUTLASS_HOST_DEVICE
-int div_floor(cutlass::FastDivmod const& divmod, int dividend) {
-    // Take care of the negative case: https://stackoverflow.com/questions/39304681/division-with-negative-dividend-but-rounded-towards-negative-infinity
-    // Maybe the compiler will turn the -1 - * into bit negation operation, I haven't checked.
-    return dividend >= 0 ? divmod.divide(dividend) : -1 - divmod.divide(-1 - dividend);
-}
-
-CUTLASS_HOST_DEVICE
-int round_down(cutlass::FastDivmod const& divmod, int dividend) {
-    return div_floor(divmod, dividend) * divmod.divisor;
-}
-
-CUTLASS_HOST_DEVICE
-int round_up(cutlass::FastDivmod const& divmod, int dividend) {
-    return div_floor(divmod, dividend - 1) * divmod.divisor + divmod.divisor;
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
 template<bool Transposed=false, typename Layout0>
@@ -254,6 +235,21 @@ auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
 template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1,
         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+    static constexpr bool Is_FP8 = cute::is_same_v<typename Tensor0::value_type, cutlass::float_e4m3_t> 
+        || cute::is_same_v<typename Tensor0::value_type, cutlass::float_e5m2_t>;
+    static constexpr bool Use_Two_Level = Is_FP8 && !zero_init;
+    
+    auto tCrC_original = cute::make_fragment_like(tCrC);
+    if constexpr (Use_Two_Level) {
+        // Copy original values to backup
+        #pragma unroll
+        for (int i = 0; i < cute::size(tCrC); ++i) {
+            tCrC_original(i) = tCrC(i);
+        }
+        cute::clear(tCrC);
+    }
+#endif
     if constexpr (M_slice >= 0) {
         static constexpr int MMA_M = decltype(size<1>(tCrC))::value;
         static_assert(M_slice < MMA_M);
@@ -320,6 +316,15 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
             }
         }
     }
+
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+    if constexpr (Use_Two_Level) {
+        #pragma unroll
+        for (int i = 0; i < cute::size(tCrC); ++i) {
+            tCrC(i) = tCrC_original(i) + tCrC(i);  // Add temp results to original
+        }
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -662,6 +667,22 @@ CUTE_DEVICE T warp_prefix_sum(T val) {
     }
     return val;
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template<typename T>
+CUTE_DEVICE T warp_shfl_get(T val, int src_lane) {
+    return __shfl_sync(0xffffffff, val, src_lane);
+};
+
+template<typename T>
+CUTE_DEVICE T warp_shfl_get_last(T val) {
+    return __shfl_sync(0xffffffff, val, cutlass::NumThreadsPerWarp - 1);
+};
+
+CUTE_DEVICE int warp_last_true_laneid(bool cond) {
+    return __popc(__ballot_sync(0xffffffff, cond));
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

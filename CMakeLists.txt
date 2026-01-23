@@ -275,6 +275,7 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
             hopper/flash_fwd_combine.cu
             hopper/flash_prepare_scheduler.cu
             hopper/flash_api.cpp
+            hopper/flash_api_torch_lib.cpp
             ${FA3_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
         ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis

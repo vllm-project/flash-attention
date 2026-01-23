@@ -307,6 +307,56 @@ def construct_cp_mask(
     return mask
 
 
+def construct_chunk_mask(
+    seqlen_q,
+    seqlen_k,
+    attention_chunk,
+    query_padding_mask=None,
+    key_padding_mask=None,
+    key_leftpad=None,
+    device=None,
+    cp_world_size=1,
+    cp_rank=0,
+    cp_tot_seqlen_k=None,
+):
+    if cp_world_size > 1:
+        return construct_cp_mask(
+            seqlen_q,
+            seqlen_k,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqlen_k=cp_tot_seqlen_k,
+            window_size=window_size,
+            sink_token_length=sink_token_length,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=device,
+        )
+    row_idx = rearrange(torch.arange(seqlen_q, device=device, dtype=torch.long), "s -> s 1")
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if key_leftpad is not None:
+        key_leftpad = rearrange(key_leftpad, "b -> b 1 1 1")
+        col_idx = repeat(col_idx, "s -> b 1 1 s", b=key_leftpad.shape[0])
+        col_idx = torch.where(col_idx >= key_leftpad, col_idx - key_leftpad, 2**32)
+    sk = (
+        seqlen_k
+        if key_padding_mask is None
+        else rearrange(key_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sq = (
+        seqlen_q
+        if query_padding_mask is None
+        else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
+    )
+    sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+    # Subtract remainder instead of divide and then multiply to take care of negative values
+    col_limit_left_chunk = row_idx + sk - sq - (row_idx + sk - sq) % attention_chunk
+    return torch.logical_or(
+        col_idx < col_limit_left_chunk, col_idx >= col_limit_left_chunk + attention_chunk
+    )
+
+
 def attention_ref(
     q,
     k,
@@ -321,6 +371,7 @@ def attention_ref(
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),  # -1 means infinite window size
+    attention_chunk=0,
     sink_token_length=0,
     softcap=0.0,
     upcast=True,
@@ -334,8 +385,8 @@ def attention_ref(
     """
     Arguments:
         q: (batch_size, seqlen_q, nheads, head_dim)
-        k: (batch_size, seqlen_k, nheads_kv, head_dim)
-        v: (batch_size, seqlen_k, nheads_kv, head_dim_v)
+        k: (batch_size, seqlen_k, nheads, head_dim)
+        v: (batch_size, seqlen_k, nheads, head_dim_v)
         qv: (batch_size, seqlen_q, nheads, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
@@ -365,7 +416,6 @@ def attention_ref(
     if upcast:
         q, k, v = q.float(), k.float(), v.float()
         qv = qv.float() if qv is not None else None
-        s_aux = s_aux.float() if s_aux is not None else None
     if q_descale is not None:
         q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
         q = (q.float() * q_descale).to(q.dtype)
@@ -389,6 +439,7 @@ def attention_ref(
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
         scores.masked_fill_(rearrange(~key_padding_mask, "b s -> b 1 1 s"), float("-inf"))
+    local_mask = None
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
             seqlen_q,
@@ -403,6 +454,18 @@ def attention_ref(
             cp_rank=cp_rank,
             cp_tot_seqlen_k=cp_tot_seqlen_k,
         )
+    if attention_chunk > 0:
+        chunk_mask = construct_chunk_mask(
+            seqlen_q,
+            seqlen_k,
+            attention_chunk,
+            query_padding_mask,
+            key_padding_mask,
+            key_leftpad=key_leftpad,
+            device=q.device,
+        )
+        local_mask = torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+    if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
@@ -422,7 +485,7 @@ def attention_ref(
     if key_padding_mask is not None:
         attention = attention.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
     # Some rows might be completely masked out so we fill them with zero instead of NaN
-    if window_size[0] >= 0 or window_size[1] >= 0:
+    if local_mask is not None:
         attention = attention.masked_fill(torch.all(local_mask, dim=-1, keepdim=True), 0.0)
     dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling

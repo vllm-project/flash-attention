@@ -135,6 +135,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     // Local window size
     int window_size_left, window_size_right;
+    int attention_chunk;
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;
@@ -151,8 +152,7 @@ struct Flash_fwd_params : public Qkv_params {
     bool pack_gqa;
 
     int * __restrict__ tile_count_semaphore;
-    // int * __restrict__ num_m_blocks_ptr;
-    int * __restrict__ prepare_seqlen_q_ptr;
+    int * __restrict__ num_m_blocks_ptr;
     // int * __restrict__ num_n_blocks_ptr;
     int * __restrict__ num_splits_dynamic_ptr;
     int * __restrict__ varlen_batch_idx_ptr; // virtual -> actual

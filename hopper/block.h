@@ -15,6 +15,7 @@ struct BlockMN {
             SeqlenInfo_t const& seqlen_info,
             int const m_block, int const bidb, int const split_idx, int const num_splits,
             int const window_size_left, int const window_size_right,
+            cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod) {
 
         int seqlen_k = seqlen_info.seqlen_k;
@@ -25,8 +26,13 @@ struct BlockMN {
         if constexpr (Is_local) {
             int m_idx_min = m_block * kBlockM;
             if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+            int const n_idx = m_idx_min + seqlen_k - seqlen_q;
             // unlike previously, we don't divide by kBlockN because we want offset for seqlen_k
-            n_offset = std::max(int(0), m_idx_min + seqlen_k - seqlen_q - window_size_left);
+            int n_idx_left = n_idx - window_size_left;
+            if (attention_chunk_divmod.divisor > 0) {
+                n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
+            }
+            n_offset = std::max(int(0), n_idx_left);
             // Subtract n_offset from seqlen_k for subsequent calculations such as n_block_max
             // This is the actual seqlen_k processed for this m_block
             seqlen_k -= n_offset;
@@ -42,6 +48,10 @@ struct BlockMN {
             // cp_world_size is guaranteed to be greater than 0
             int tot_seqlen_k = (Is_local) ? seqlen_k : seqlen_info.tot_seqlen_k;
             int n_token_max = m_idx_max + tot_seqlen_k - seqlen_q + window_size_right;
+            if (Is_local && attention_chunk_divmod.divisor > 0) {
+                int const n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+                n_token_max = std::min(n_token_max, flash::round_up(attention_chunk_divmod, n_idx));
+            }
             if (seqlen_info.cp_world_size > 1 && !Is_local) {
                 n_token_max = cute::ceil_div(n_token_max - seqlen_info.cp_rank, seqlen_info.cp_world_size);
             }
@@ -73,11 +83,12 @@ struct BlockMN {
             SeqlenInfo_t const& seqlen_info,
             int const m_block, int const bidb, int const split_idx, int const num_splits,
             int const window_size_left, int const window_size_right,
+            cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod) {
         // TODO: check logic with n_offset
         auto [n_block_min, n_block_max, n_offset] = get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, num_splits,
-            window_size_left, window_size_right, qhead_per_khead_divmod);
+            window_size_left, window_size_right, attention_chunk_divmod, qhead_per_khead_divmod);
         int const idx_k_new_min = std::max(n_block_min * kBlockN + n_offset - seqlen_info.seqlen_k_og, 0);
         int const idx_k_new_max = std::min(n_block_max * kBlockN + n_offset - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
         int const n_block_new_min = idx_k_new_min / kBlockN;
@@ -106,6 +117,40 @@ struct BlockMN {
             m_block_min = std::max(m_block_min, (n_block * kBlockN + seqlen_q - seqlen_k - window_size_right) / kBlockM);
         }
         return {m_block_min, m_block_max};
+    }
+
+    // If we have separate iterations with causal or local masking at the start, where do we stop
+    static
+    CUTLASS_DEVICE
+    int get_n_block_min_causal_local_mask(
+            SeqlenInfo_t const& seqlen_info,
+            int const m_block, int const n_block_min, int const window_size_right,
+            cutlass::FastDivmod const& attention_chunk_divmod,
+            cutlass::FastDivmod const& qhead_per_khead_divmod) {
+        int const m_idx_min = !PackGQA ? m_block * kBlockM : qhead_per_khead_divmod.divide(m_block * kBlockM);
+        int const n_idx = m_idx_min + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+        int n_idx_right = !Is_local ? n_idx : n_idx + window_size_right;
+        if (Is_local && attention_chunk_divmod.divisor > 0) {
+            n_idx_right = std::min(n_idx_right, flash::round_up(attention_chunk_divmod, n_idx));
+        }
+        return std::max(n_block_min, n_idx_right / kBlockN);
+    }
+
+    // If we have separate iterations with local masking at the end, where do we stop the non-masked iterations
+    static
+    CUTLASS_DEVICE
+    int get_n_block_min_before_local_mask(
+            SeqlenInfo_t const& seqlen_info,
+            int const m_block, int const n_block_min, int const window_size_left,
+            cutlass::FastDivmod const& attention_chunk_divmod,
+            cutlass::FastDivmod const& qhead_per_khead_divmod) {
+        int const m_idx_max = !PackGQA ? (m_block + 1) * kBlockM : qhead_per_khead_divmod.divide((m_block + 1) * kBlockM - 1) + 1;
+        int const n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q;
+        int n_idx_left = !Is_local ? n_idx : n_idx - window_size_left;
+        if (Is_local && attention_chunk_divmod.divisor > 0) {
+            n_idx_left = std::max(n_idx_left, flash::round_down(attention_chunk_divmod, n_idx));
+        }
+        return !Is_local ? n_block_min : std::max(n_block_min, cute::ceil_div(n_idx_left, kBlockN));
     }
 
 };

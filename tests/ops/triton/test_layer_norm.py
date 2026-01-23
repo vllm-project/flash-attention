@@ -16,6 +16,8 @@ from flash_attn.ops.triton.layer_norm import (
 is_sm8x = torch.cuda.get_device_capability("cuda")[0] >= 8
 
 
+# @pytest.mark.parametrize("zero_centered_weight", [False, True])
+@pytest.mark.parametrize("zero_centered_weight", [False])
 @pytest.mark.parametrize("has_weight1", [False, True])
 # @pytest.mark.parametrize("has_weight1", [True])
 @pytest.mark.parametrize("has_x1", [False, True])
@@ -54,6 +56,7 @@ def test_layer_norm(
     has_rowscale,
     has_x1,
     has_weight1,
+    zero_centered_weight,
 ):
     if has_rowscale and has_x1:
         pytest.skip("Not supported")
@@ -145,6 +148,7 @@ def test_layer_norm(
         rowscale=rowscale,
         prenorm=prenorm,
         residual_in_fp32=residual_in_fp32,
+        zero_centered_weight=zero_centered_weight,
         is_rms_norm=is_rms_norm,
         return_dropout_mask=True,
     )
@@ -162,6 +166,7 @@ def test_layer_norm(
         dropout_p=dropout_p,
         rowscale=rowscale,
         prenorm=prenorm,
+        zero_centered_weight=zero_centered_weight,
         dropout_mask=dropout_mask,
         dropout_mask1=dropout_mask1,
     )
@@ -177,6 +182,7 @@ def test_layer_norm(
         dropout_p=dropout_p,
         rowscale=rowscale,
         prenorm=prenorm,
+        zero_centered_weight=zero_centered_weight,
         dropout_mask=dropout_mask,
         dropout_mask1=dropout_mask1,
         upcast=True,

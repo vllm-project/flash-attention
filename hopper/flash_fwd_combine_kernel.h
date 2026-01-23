@@ -139,7 +139,6 @@ public:
 
     // Device side arguments
     struct Arguments {
-        int b;
         ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
@@ -159,7 +158,6 @@ public:
 
     // Kernel entry point API
     struct CollectiveParams {
-        int b;
         ElementPartial const* const ptr_O_partial;
         ShapeOPartial const shape_O_partial;
         StrideOPartial const stride_O_partial;
@@ -184,7 +182,6 @@ public:
     to_underlying_arguments(Arguments const& args) {
         assert(get<1>(args.shape_LSE_partial) <= kMaxSplits);
         return {
-            args.b,
             args.ptr_O_partial,
             args.shape_O_partial,
             args.stride_O_partial,
@@ -434,24 +431,24 @@ public:
         Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o_partial.data()), SmemLayoutO{});
 
         int const thread_idx = threadIdx.x;
-
-        BlockCoord block_coord = tile_scheduler.get_block_coord(kernel_params.scheduler_params);
-
-        int const m_block = block_coord.block_m;
-        int const k_block = block_coord.block_k;
-        int const maybe_virtual_batch = block_coord.bidb;
-        if (maybe_virtual_batch >= params.b) { return; }
+        int const m_block = blockIdx.x;
+        int const k_block = blockIdx.y;
+        int const maybe_virtual_batch = blockIdx.z;
         int const batch = params.varlen_batch_idx_ptr ? params.varlen_batch_idx_ptr[maybe_virtual_batch] : maybe_virtual_batch;
-        
+        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
+
+        if (params.semaphore_to_reset && threadIdx.x == 0 && blockIdx.x == gridDim.x - 1 && blockIdx.y == gridDim.y - 1 && blockIdx.z == gridDim.z - 1) {
+            cutlass::arch::wait_on_dependent_grids();
+            *params.semaphore_to_reset = 0;
+        }
+        if (num_splits <= 1) { return; }
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{batch, size<0>(params.shape_LSE_partial), params.cu_seqlens, params.seqused};
         int const offset = seqlen_info.offset;
         int const seqlen = seqlen_info.seqlen;
         int max_idx = seqlen * get<2>(params.shape_LSE_partial);
-
-        if (m_block >= cute::ceil_div(max_idx, Int<kBlockM>{})) { return; }
-
-        int const num_splits = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[maybe_virtual_batch] : get<1>(params.shape_LSE_partial);
-        if (num_splits <= 1) { return; }
+        if constexpr (Varlen) {
+            if (m_block * kBlockM >= max_idx) { return; }
+        }
 
         cutlass::FastDivmod seqlen_divmod_dynamic(seqlen);
 

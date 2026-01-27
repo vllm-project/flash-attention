@@ -61,6 +61,12 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_descale_batch_stride;
     index_t v_descale_head_stride;
 
+    // For FP8 output quantization
+    float * __restrict__ o_scale_ptr;
+
+    // FP8 output dtype flag
+    bool fp8_output;
+
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
     int total_q, total_k, total_knew;
@@ -223,7 +229,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool FP8_Output = false>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>

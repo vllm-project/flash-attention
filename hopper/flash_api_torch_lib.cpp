@@ -42,6 +42,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> &k_descale_,  // (b, h_k)
         std::optional<at::Tensor> &v_descale_,  // (b, h_k)
+        std::optional<at::Tensor> &o_scale_,    // scalar or (1,), output quantization scale for FP8 output
         float const softmax_scale,
         bool is_causal,
         int window_size_left,
@@ -113,6 +114,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  q_descale,"
             "    Tensor?  k_descale,"
             "    Tensor?  v_descale,"
+            "    Tensor?  o_scale,"
             "    float    softmax_scale,"
             "    bool     is_causal,"
             "    int      window_size_left,"

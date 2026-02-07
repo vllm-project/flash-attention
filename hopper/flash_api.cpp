@@ -630,7 +630,8 @@ mha_fwd_get_scheduler_metadata(
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
     bool const use_prepare_varlen = true;
-    params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
+    // we don't know when the main kernel was called so don't rely on it running right after
+    params.prepare_varlen_pdl = false;
     // set to use in split heuristic
     params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
 

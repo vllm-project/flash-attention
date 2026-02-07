@@ -169,6 +169,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     if (Varlen && !params.skip_scheduler_metadata_computation) {
         prepare_varlen_num_blocks(params, stream, PackGQA, kBlockM, kBlockN, Arch >= 90 && params.prepare_varlen_pdl /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
+    } else {
+        // we don't know when the scheduler kernel was called so don't rely on it running right before
+        params.prepare_varlen_pdl = false; 
     }
 
     int device;

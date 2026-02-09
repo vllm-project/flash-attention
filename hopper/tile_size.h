@@ -18,7 +18,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             if (headdim_v == 512) {
                 return {64, 64, false, false};
             } else if (headdim_v == 256) {
-                return {128, 112, true, false};
+                return {128, 96, true, false};
             } else {
                 if (use_one_mma_wg) {
                     return {64, 192, true, true};

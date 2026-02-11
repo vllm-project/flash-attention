@@ -19,6 +19,7 @@
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
 
+import os
 import math
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
@@ -30,6 +31,14 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+
+
+if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
+
+    # Patch to dump ptx and then use system ptxas to compile to cubin
+    cute_dsl_ptxas.patch()
+
 
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor
@@ -504,10 +513,10 @@ def _flash_attn_fwd(
         )
 
     _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        out if not is_split_kv else out_partial,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out.detach() if not is_split_kv else out_partial,
         lse_partial if is_split_kv else lse,
         softmax_scale,
         current_stream,
@@ -595,6 +604,13 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
+        is_varlen = (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        )
+        assert not is_varlen, "varlen backward is not yet supported on sm90"
     else:
         m_block_size = 128
         n_block_size = 128
@@ -1075,9 +1091,9 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     _flash_attn_bwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
+        q.detach(),
+        k.detach(),
+        v.detach(),
         dout,
         lse_log2,
         dpsum,

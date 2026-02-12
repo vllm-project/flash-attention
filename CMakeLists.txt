@@ -249,6 +249,16 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         "hopper/instantiations/flash_fwd_hdim192_128_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
+    # FP8 output quantization kernel files
+    file(GLOB FA3_FP8OUT_GEN_SRCS
+        "hopper/instantiations/flash_fwd_hdim64_e4m3_*fp8out_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim96_e4m3_*fp8out_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim128_e4m3_*fp8out_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim192_e4m3_*fp8out_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim192_128_e4m3_*fp8out_sm90.cu"
+        "hopper/instantiations/flash_fwd_hdim256_e4m3_*fp8out_sm90.cu")
+    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8OUT_GEN_SRCS})
+
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS})
 
     # For CUDA we set the architectures on a per file basis

@@ -59,6 +59,26 @@ void run_mha_fwd_sparse_<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params_spar
 
 }} // namespace FLASH_NAMESPACE"""
 
+def get_fwd_tree_template() -> str:
+    return NAMESPACE_INCLUDE + """#include "flash_fwd_tree_launch_template.h"
+
+namespace FLASH_NAMESPACE {{
+
+template<>
+void run_mha_fwd_tree_<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params_tree &params, cudaStream_t stream) {{
+    run_mha_fwd_tree_hdim{HEAD_DIM}<{DTYPE}>(params, stream);
+}}
+
+}} // namespace FLASH_NAMESPACE"""
+
+def get_fwd_split_tree_template() -> str:
+    return NAMESPACE_INCLUDE + """#include "flash_fwd_tree_launch_template.h"
+
+namespace FLASH_NAMESPACE {{
+
+template void run_mha_fwd_splitkv_dispatch_tree<{DTYPE}, {HEAD_DIM}>(Flash_fwd_params_tree &params, cudaStream_t stream);
+
+}} // namespace FLASH_NAMESPACE"""
 
 @dataclass
 class Kernel:
@@ -75,6 +95,8 @@ class Kernel:
             "bwd": get_bwd_template,
             "fwd_split": get_fwd_split_template,
             "fwd_sparse": get_fwd_sparse_template,
+            "fwd_tree": get_fwd_tree_template,
+            "fwd_tree_split": get_fwd_split_tree_template,
         }
         template_func = template_funcs[self.direction]
         return template_func().format(
@@ -94,6 +116,9 @@ def get_all_kernels() -> List[Kernel]:
     # For sparse only generate HEAD_DIM=128 for now since this the only one we use currently 
     for dtype, is_causal, sm in itertools.product(DTYPE_MAP.keys(), IS_CAUSAL, SM):
         yield Kernel(sm=sm, dtype=dtype, head_dim=128, is_causal=is_causal, direction="fwd_sparse")
+    for direction in ["fwd_tree", "fwd_tree_split"]:
+        for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
+            yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=True, direction=direction) 
 
 def write_kernel(kernel: Kernel, autogen_dir: Path) -> None:
     prelude = """// Copyright (c) 2024, Tri Dao.

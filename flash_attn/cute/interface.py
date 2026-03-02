@@ -314,7 +314,7 @@ def _flash_attn_fwd(
     # uneven KV smem layout already uses ~128KB for KV, and the float32 O
     # buffer pushes the total past the SM100 228KB SMEM limit.
     if compute_capability in [10, 11] and head_dim != head_dim_v
-        num_splits = min(num_splits, 1)
+        num_splits = 1
 
     is_split_kv = num_splits > 1
     if is_split_kv:

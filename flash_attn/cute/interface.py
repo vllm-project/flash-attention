@@ -309,6 +309,13 @@ def _flash_attn_fwd(
             128,
         )
 
+    # SplitKV uses float32 partial output, which doubles the O buffer size
+    # in shared memory. For diff-headdim configs like MLA's (192, 128), the
+    # uneven KV smem layout already uses ~128KB for KV, and the float32 O
+    # buffer pushes the total past the SM100 228KB SMEM limit.
+    if compute_capability in [10, 11] and head_dim != head_dim_v
+        num_splits = min(num_splits, 1)
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)

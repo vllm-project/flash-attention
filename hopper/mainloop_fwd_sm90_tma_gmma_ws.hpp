@@ -1243,9 +1243,19 @@ struct CollectiveMainloopFwdSm90 {
             // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
             // For interval-based two-level accumulation
-            [[maybe_unused]] auto tOrO_accum = cute::make_fragment_like(tOrO);
-            [[maybe_unused]] auto accum_scale = cute::make_tensor_like(scores_scale);
+            using AccumFragment_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_fragment_like(tOrO)),
+                cute::array<float, 0>>;
+            using AccumScale_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_tensor_like(scores_scale)),
+                cute::array<float, 0>>;
+            [[maybe_unused]] AccumFragment_t tOrO_accum{};
+            [[maybe_unused]] AccumScale_t accum_scale{};
             if constexpr (UseIntervalTwoLevel) {
+                tOrO_accum = cute::make_fragment_like(tOrO);
+                accum_scale = cute::make_tensor_like(scores_scale);
                 cute::clear(tOrO_accum);
                 cute::fill(accum_scale, 1.0f);
             }
@@ -1386,9 +1396,19 @@ struct CollectiveMainloopFwdSm90 {
 
             warp_scheduler_barrier_sync();
 
-            [[maybe_unused]] auto tOrO_accum_no_overlap = cute::make_fragment_like(tOrO);
-            [[maybe_unused]] auto accum_scale_no_overlap = cute::make_tensor_like(softmax.row_max);
+            using AccumFragmentNoOverlap_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_fragment_like(tOrO)),
+                cute::array<float, 0>>;
+            using AccumScaleNoOverlap_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_tensor_like(softmax.row_max)),
+                cute::array<float, 0>>;
+            [[maybe_unused]] AccumFragmentNoOverlap_t tOrO_accum_no_overlap{};
+            [[maybe_unused]] AccumScaleNoOverlap_t accum_scale_no_overlap{};
             if constexpr (UseIntervalTwoLevel) {
+                tOrO_accum_no_overlap = cute::make_fragment_like(tOrO);
+                accum_scale_no_overlap = cute::make_tensor_like(softmax.row_max);
                 cute::clear(tOrO_accum_no_overlap);
                 cute::fill(accum_scale_no_overlap, 1.0f);
             }

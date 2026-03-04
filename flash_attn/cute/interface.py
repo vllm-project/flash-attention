@@ -313,8 +313,10 @@ def _flash_attn_fwd(
     # in shared memory. For diff-headdim configs like MLA's (192, 128), the
     # uneven KV smem layout already uses ~128KB for KV, and the float32 O
     # buffer pushes the total past the SM100 228KB SMEM limit.
-    if compute_capability in [10, 11] and head_dim != head_dim_v
-        num_splits = 1
+    # Reducing n_block_size to 64 shrinks KV SMEM from ~128KB to ~72KB,
+    # bringing the total under the 228KB limit.
+    if compute_capability in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+        n_block_size = 64
 
     is_split_kv = num_splits > 1
     if is_split_kv:

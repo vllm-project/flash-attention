@@ -296,12 +296,12 @@ def _flash_attn_fwd(
     else:
         q_stage = 1
 
+    m_block_size_effective = q_stage * m_block_size
+    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
+    num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
+    total_mblocks = batch_size * num_head_kv * num_m_blocks
     if num_splits < 1:
-        m_block_size_effective = q_stage * m_block_size
-        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
-        num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
-        total_mblocks = batch_size * num_head_kv * num_m_blocks
         num_splits = num_splits_heuristic(
             total_mblocks,
             torch.cuda.get_device_properties(device).multi_processor_count,
@@ -310,13 +310,16 @@ def _flash_attn_fwd(
         )
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory. For diff-headdim configs like MLA's (192, 128), the
-    # uneven KV smem layout already uses ~128KB for KV, and the float32 O
-    # buffer pushes the total past the SM100 228KB SMEM limit.
-    # Reducing n_block_size to 64 shrinks KV SMEM from ~128KB to ~72KB,
-    # bringing the total under the 228KB limit.
+    # in shared memory, causing OOM for diff-headdim (192, 128)
     if compute_capability in [10, 11] and head_dim != head_dim_v and num_splits > 1:
         n_block_size = 64
+        num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
+        num_splits = num_splits_heuristic(
+            total_mblocks,
+            torch.cuda.get_device_properties(device).multi_processor_count,
+            num_n_blocks,
+            128,
+        )
 
     is_split_kv = num_splits > 1
     if is_split_kv:

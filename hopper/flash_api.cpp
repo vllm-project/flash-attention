@@ -911,11 +911,16 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     TORCH_CHECK(head_size_v % alignment == 0, "head_size_v should be a multiple of " + std::to_string(alignment));
 
     auto opts = q.options();
-    auto out_type = q_type == at::ScalarType::Float8_e4m3fn ? at::ScalarType::BFloat16 : q_type;
+    auto out_type = q_type == at::ScalarType::Float8_e4m3fn
+        ? (o_scale_.has_value() ? at::ScalarType::Float8_e4m3fn : at::ScalarType::BFloat16)
+        : q_type;
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.scalar_type() == out_type, "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
+        TORCH_CHECK(out.scalar_type() == out_type,
+            o_scale_.has_value()
+                ? "When o_scale is provided with FP8 input, output must have dtype FP8 (e4m3)"
+                : "For FP16/BF16 input, output must have the same dtype as inputs. For FP8 input, output must have dtype BF16");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         if (!is_varlen_q) {
@@ -1769,3 +1774,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 }
 
 #endif
+

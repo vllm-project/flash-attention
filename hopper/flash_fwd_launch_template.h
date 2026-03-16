@@ -27,12 +27,13 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, int kBlockH=1>
+          bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, bool FP8_Output, int kBlockH=1>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
-    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
+    static_assert(!FP8_Output || Is_FP8, "FP8 output requires FP8 input");
     static constexpr bool FP8_TransposeV = Is_FP8 && !V_colmajor;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
     using ElementS = cutlass::bfloat16_t;
@@ -146,7 +147,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.softmax_lseaccum_ptr),
         {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, params.h * seqlen_q * batch_q},  // stride_LSE_partial
         params.h_k,
-        params.cu_seqlens_q, params.seqused_q
+        params.cu_seqlens_q, params.seqused_q, params.o_scale_ptr
     };
 
     int qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
@@ -205,11 +206,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool FP8_Output>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
-    using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+    // If fp8, use fp8 if output is explicitly in fp8 (o_scale provided), otherwise use bf16 
+    using _T_out_fp8 = std::conditional_t<FP8_Output, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
+    // Use T if not fp8
+    using T_out = std::conditional_t<Is_FP8, _T_out_fp8, T>;
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
@@ -231,7 +235,11 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                                     // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
                                     // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
                                     static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
+                                    BOOL_SWITCH(params.fp8_output, FP8_Output_param, [&] {
+                                        // Only allow FP8 output when input is also FP8
+                                        static constexpr bool FP8_Output_final = Is_FP8 && FP8_Output_param;
+                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, FP8_Output_final, kBlockH>(params, stream);
+                                    });
                                 });
                             });
                         });

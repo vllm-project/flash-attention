@@ -63,7 +63,7 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // Prefill tiles — two-level accumulation needs smaller tiles to reduce
             // register pressure from the separate fp32 accumulator (tOrO_accum).
             // Currently just optimized for causal case.
-#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+#if FLASHATTENTION_FP8_TWO_LEVEL_INTERVAL >= 1
             if (headdim <= 64) {
                 return {192, 128, true, true};
             } else if (headdim <= 96) {

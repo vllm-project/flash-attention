@@ -1,7 +1,7 @@
 # Tests for sparse mask utilities (flash_attn.cute.topk_mask)
 #
-# Verifies that dense_mask_to_block_sparse + topk_mask_mod correctly
-# implement token-level sparse attention via FA4's mask_mod interface.
+# Verifies that dense_mask correctly implements token-level sparse
+# attention via FA4's dense_mask interface.
 
 import math
 
@@ -13,14 +13,12 @@ try:
     from flash_attn.cute.topk_mask import (
         topk_to_dense_mask,
         dense_mask_to_block_sparse,
-        topk_mask_mod,
     )
 except (ImportError, ModuleNotFoundError):
     from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
     from vllm.vllm_flash_attn.cute.topk_mask import (
         topk_to_dense_mask,
         dense_mask_to_block_sparse,
-        topk_mask_mod,
     )
 
 
@@ -179,9 +177,8 @@ TOPK_VALUES = [32, 64, 128]
 @pytest.mark.parametrize("topk", TOPK_VALUES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
-    """Verify FA4 with top-k mask matches dense PyTorch reference."""
+    """Verify FA4 with dense_mask matches dense PyTorch reference."""
     B, nheads, nheads_kv, headdim = 2, 4, 4, 128
-    tile_m, tile_n = SPARSE_TILE_M, SPARSE_TILE_N
     topk = min(topk, seqlen_k)
     device = "cuda"
     scale = 1.0 / math.sqrt(headdim)
@@ -193,17 +190,12 @@ def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
     topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
 
     dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
-    block_sparse = dense_mask_to_block_sparse(dense_mask, seqlen_q, seqlen_k, tile_m, tile_n)
 
     out_tuple = _flash_attn_fwd(
         q, k, v,
         softmax_scale=scale,
         causal=False,
-        mask_mod=topk_mask_mod,
-        aux_tensors=[dense_mask],
-        block_sparse_tensors=block_sparse,
-        m_block_size=M_BLOCK_SIZE,
-        n_block_size=N_BLOCK_SIZE,
+        dense_mask=dense_mask,
     )
     out_kernel = out_tuple[0]
     out_ref = compute_reference(q, k, v, topk_indices, scale)
@@ -224,9 +216,8 @@ def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 512)])
 @pytest.mark.parametrize("nheads,nheads_kv", [(8, 2), (4, 1)])
 def test_topk_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
-    """Verify top-k mask works with GQA (mask broadcasts across heads)."""
+    """Verify dense_mask works with GQA (mask broadcasts across heads)."""
     B, headdim, topk = 2, 128, 64
-    tile_m, tile_n = SPARSE_TILE_M, SPARSE_TILE_N
     dtype, device = torch.bfloat16, "cuda"
     scale = 1.0 / math.sqrt(headdim)
 
@@ -237,17 +228,12 @@ def test_topk_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
     topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
 
     dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
-    block_sparse = dense_mask_to_block_sparse(dense_mask, seqlen_q, seqlen_k, tile_m, tile_n)
 
     out_tuple = _flash_attn_fwd(
         q, k, v,
         softmax_scale=scale,
         causal=False,
-        mask_mod=topk_mask_mod,
-        aux_tensors=[dense_mask],
-        block_sparse_tensors=block_sparse,
-        m_block_size=M_BLOCK_SIZE,
-        n_block_size=N_BLOCK_SIZE,
+        dense_mask=dense_mask,
     )
     out_kernel = out_tuple[0]
     out_ref = compute_reference(q, k, v, topk_indices, scale)
@@ -269,7 +255,6 @@ def test_topk_mask_non_aligned_seqlen():
     B, seqlen_q, seqlen_k = 1, 300, 500
     nheads = nheads_kv = 4
     headdim, topk = 128, 32
-    tile_m, tile_n = SPARSE_TILE_M, SPARSE_TILE_N
     dtype, device = torch.bfloat16, "cuda"
     scale = 1.0 / math.sqrt(headdim)
 
@@ -280,17 +265,12 @@ def test_topk_mask_non_aligned_seqlen():
     topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
 
     dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
-    block_sparse = dense_mask_to_block_sparse(dense_mask, seqlen_q, seqlen_k, tile_m, tile_n)
 
     out_tuple = _flash_attn_fwd(
         q, k, v,
         softmax_scale=scale,
         causal=False,
-        mask_mod=topk_mask_mod,
-        aux_tensors=[dense_mask],
-        block_sparse_tensors=block_sparse,
-        m_block_size=M_BLOCK_SIZE,
-        n_block_size=N_BLOCK_SIZE,
+        dense_mask=dense_mask,
     )
     out_kernel = out_tuple[0]
     out_ref = compute_reference(q, k, v, topk_indices, scale)
@@ -304,7 +284,7 @@ def test_topk_mask_non_aligned_seqlen():
 
 
 # ---------------------------------------------------------------------------
-# Varlen tests (mask_mod + block_sparse with cu_seqlens)
+# Varlen tests (dense_mask with cu_seqlens)
 # ---------------------------------------------------------------------------
 
 
@@ -319,11 +299,10 @@ def test_topk_mask_non_aligned_seqlen():
 ])
 @pytest.mark.parametrize("topk", [32, 64])
 def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
-    """Verify mask_mod + block_sparse works with varlen (cu_seqlens)."""
+    """Verify dense_mask works with varlen (cu_seqlens)."""
     B = len(seqlens_q)
     nheads = nheads_kv = 4
     headdim = 128
-    tile_m, tile_n = SPARSE_TILE_M, SPARSE_TILE_N
     dtype, device = torch.bfloat16, "cuda"
     scale = 1.0 / math.sqrt(headdim)
 
@@ -343,7 +322,6 @@ def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
     cu_seqlens_k = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_k), 0)),
                                 dtype=torch.int32, device=device)
 
-    # Build per-sequence topk indices and padded dense mask
     topk_indices_list = []
     dense_mask_padded = torch.zeros(B, max_seqlen_q, max_seqlen_k,
                                     dtype=torch.int32, device=device)
@@ -355,9 +333,6 @@ def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
         seq_dense = topk_to_dense_mask(idx.unsqueeze(0), sk)
         dense_mask_padded[b, :sq, :sk] = seq_dense[0]
 
-    block_sparse = dense_mask_to_block_sparse(dense_mask_padded, max_seqlen_q, max_seqlen_k,
-                                              tile_m, tile_n)
-
     out_tuple = _flash_attn_fwd(
         q_packed, k_packed, v_packed,
         cu_seqlens_q=cu_seqlens_q,
@@ -366,11 +341,7 @@ def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
         max_seqlen_k=max_seqlen_k,
         softmax_scale=scale,
         causal=False,
-        mask_mod=topk_mask_mod,
-        aux_tensors=[dense_mask_padded],
-        block_sparse_tensors=block_sparse,
-        m_block_size=M_BLOCK_SIZE,
-        n_block_size=N_BLOCK_SIZE,
+        dense_mask=dense_mask_padded,
     )
     out_kernel = out_tuple[0]
 

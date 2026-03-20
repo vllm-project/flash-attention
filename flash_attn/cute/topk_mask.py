@@ -32,7 +32,7 @@ def topk_to_dense_mask(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tenso
 
 
 @cute.jit
-def topk_mask_mod(
+def dense_mask_mod(
     batch: cute.TensorSSA,
     head: cute.TensorSSA,
     q_idx: cute.TensorSSA,

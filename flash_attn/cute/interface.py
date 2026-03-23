@@ -120,7 +120,6 @@ def _flash_attn_fwd(
     score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
-    dense_mask: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -133,9 +132,6 @@ def _flash_attn_fwd(
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
-        dense_mask: Optional (B, Q, K) int32 tensor. If provided, block_sparse_tensors
-            are derived automatically using the kernel's tile sizes. Cannot be used
-            together with block_sparse_tensors.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -259,10 +255,7 @@ def _flash_attn_fwd(
 
     assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
-    assert block_sparse_tensors is None or dense_mask is None, (
-        "block_sparse_tensors and dense_mask cannot be used together"
-    )
-    use_block_sparsity = block_sparse_tensors is not None or dense_mask is not None
+    use_block_sparsity = block_sparse_tensors is not None
 
     if mask_mod is None:
         if causal:
@@ -302,29 +295,6 @@ def _flash_attn_fwd(
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
     else:
         q_stage = 1
-
-    if dense_mask is not None:
-        from flash_attn.cute.topk_mask import (
-            dense_mask_to_block_sparse,
-            dense_mask_mod,
-        )
-
-        block_sparse_tensors = dense_mask_to_block_sparse(
-            dense_mask,
-            max_seqlen_q,
-            max_seqlen_k,
-            tile_m=q_stage * m_block_size,
-            tile_n=n_block_size,
-        )
-        if mask_mod is not None:
-            raise ValueError(
-                "dense_mask sets mask_mod automatically; "
-                "cannot be used together with an explicit mask_mod"
-            )
-        mask_mod = dense_mask_mod
-        if aux_tensors is None:
-            aux_tensors = []
-        aux_tensors = [dense_mask] + list(aux_tensors)
 
     m_block_size_effective = q_stage * m_block_size
     seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))

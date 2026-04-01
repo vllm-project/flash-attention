@@ -52,10 +52,10 @@ def dense_mask_mod(
     aux_tensors[0] must be a (B, Q, ceil(K / 32)) int32 tensor produced by
     ``pack_mask``.  Bit *j* of word *i* indicates position ``i * 32 + j``.
     """
-    packed = aux_tensors[0]
+    dense_mask = aux_tensors[0]
     word_idx = kv_idx[0] >> 5      # kv_idx // 32
     bit_idx = kv_idx[0] & 31       # kv_idx % 32
-    word = utils.scalar_to_ssa(packed[batch[0], q_idx[0], word_idx], cutlass.Int32)
+    word = utils.scalar_to_ssa(dense_mask[batch[0], q_idx[0], word_idx], cutlass.Int32)
     one = utils.scalar_to_ssa(1, cutlass.Int32)
     bit = (word >> bit_idx) & one
     zero = utils.scalar_to_ssa(0, cutlass.Int32)
@@ -69,33 +69,36 @@ def dense_mask_to_block_sparse(
     tile_m: int = 128,
     tile_n: int = 128,
 ) -> BlockSparseTensorsTorch:
-    """Derive block sparsity tensors from a dense (B, Q, K) int32 mask.
+    """Derive block sparsity tensors from a bit-packed (B, Q, ceil(K/32)) mask.
 
-    For each (batch, q_tile, kv_tile), checks whether any entries are nonzero.
+    For each (batch, q_tile, kv_tile), checks whether any words are nonzero.
     Tiles with no nonzero entries are skipped by the kernel.
 
     Args:
-        dense_mask: (B, Q, K) int32 mask (1 = attend, 0 = skip).
+        dense_mask: (B, Q, ceil(K/32)) int32 bit-packed mask from ``pack_mask``.
         max_seqlen_q: Maximum query sequence length (for padding).
         max_seqlen_k: Maximum KV sequence length (for padding).
         tile_m: Query tile size (must match kernel tile_m).
         tile_n: KV tile size (must match kernel tile_n).
+            Must be a multiple of 32.
 
     Returns:
         BlockSparseTensorsTorch with mask_block_cnt and mask_block_idx.
         Head dimension is 1 (broadcasts across heads).
     """
+    assert tile_n % 32 == 0, f"tile_n must be a multiple of 32, got {tile_n}"
     B = dense_mask.shape[0]
+    words_per_tile = tile_n // 32
     num_m_blocks = ceildiv(max_seqlen_q, tile_m)
     num_n_blocks = ceildiv(max_seqlen_k, tile_n)
 
     padded_q = num_m_blocks * tile_m
-    padded_k = num_n_blocks * tile_n
+    padded_words = num_n_blocks * words_per_tile
     dm = F.pad(dense_mask,
-               (0, padded_k - dense_mask.shape[2],
+               (0, padded_words - dense_mask.shape[2],
                 0, padded_q - dense_mask.shape[1]))
-    # (B, num_m_blocks, tile_m, num_n_blocks, tile_n)
-    dm = dm.reshape(B, num_m_blocks, tile_m, num_n_blocks, tile_n)
+    # (B, num_m_blocks, tile_m, num_n_blocks, words_per_tile)
+    dm = dm.reshape(B, num_m_blocks, tile_m, num_n_blocks, words_per_tile)
     tile_active = (dm != 0).any(dim=4).any(dim=2)  # (B, num_m, num_n)
 
     # mask_block_cnt: (B, 1, num_m) — count of active KV tiles per Q tile

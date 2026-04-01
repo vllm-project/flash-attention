@@ -52,8 +52,8 @@ def _flash_attn_fwd_with_dense_mask(
     sq = max_seqlen_q if max_seqlen_q is not None else seqlen_q
     sk = max_seqlen_k if max_seqlen_k is not None else seqlen_k
     tile_m = _get_tile_m(sq, nheads, nheads_kv)
-    bs = dense_mask_to_block_sparse(dense_mask, sq, sk, tile_m, N_BLOCK_SIZE)
-    packed = pack_mask(dense_mask)
+    dense_mask_packed = pack_mask(dense_mask)
+    bs = dense_mask_to_block_sparse(dense_mask_packed, sq, sk, tile_m, N_BLOCK_SIZE)
     return _flash_attn_fwd(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q,
@@ -64,7 +64,7 @@ def _flash_attn_fwd_with_dense_mask(
         causal=False,
         mask_mod=dense_mask_mod,
         block_sparse_tensors=bs,
-        aux_tensors=[packed],
+        aux_tensors=[dense_mask_packed],
     )
 
 
@@ -165,18 +165,19 @@ class TestDenseMaskToBlockSparse:
         """Active tile count should match tiles with any selected tokens."""
         B, Q, k, seqlen_k = 1, 128, 16, 512
         tile_m, tile_n = 128, 128
-        dense_mask = generate_dense_mask(B, Q, seqlen_k, k)
+        dense_mask_unpacked = generate_dense_mask(B, Q, seqlen_k, k)
+        dense_mask = pack_mask(dense_mask_unpacked)
         bs = dense_mask_to_block_sparse(dense_mask, Q, seqlen_k, tile_m, tile_n)
 
         active_tiles = set()
-        for kv_idx in dense_mask[0].nonzero(as_tuple=False)[:, 1].tolist():
+        for kv_idx in dense_mask_unpacked[0].nonzero(as_tuple=False)[:, 1].tolist():
             active_tiles.add(kv_idx // tile_n)
 
         assert bs.mask_block_cnt[0, 0, 0].item() == len(active_tiles)
 
     def test_no_full_blocks(self):
         """full_block_cnt and full_block_idx should be None."""
-        dense_mask = generate_dense_mask(1, 64, 256, 8)
+        dense_mask = pack_mask(generate_dense_mask(1, 64, 256, 8))
         bs = dense_mask_to_block_sparse(dense_mask, 64, 256, 64, 128)
         assert bs.full_block_cnt is None
         assert bs.full_block_idx is None
@@ -184,7 +185,7 @@ class TestDenseMaskToBlockSparse:
     def test_empty_mask(self):
         """If no tokens are selected, no tiles should be active."""
         B, Q, seqlen_k = 1, 128, 256
-        dense_mask = torch.zeros(B, Q, seqlen_k, dtype=torch.int32, device="cuda")
+        dense_mask = pack_mask(torch.zeros(B, Q, seqlen_k, dtype=torch.int32, device="cuda"))
         bs = dense_mask_to_block_sparse(dense_mask, Q, seqlen_k, 128, 128)
         assert (bs.mask_block_cnt == 0).all()
 

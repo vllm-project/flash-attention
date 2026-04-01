@@ -11,12 +11,14 @@ import torch
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
     from flash_attn.cute.topk_mask import (
+        pack_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
     )
 except (ImportError, ModuleNotFoundError):
     from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
     from vllm.vllm_flash_attn.cute.topk_mask import (
+        pack_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
     )
@@ -51,6 +53,7 @@ def _flash_attn_fwd_with_dense_mask(
     sk = max_seqlen_k if max_seqlen_k is not None else seqlen_k
     tile_m = _get_tile_m(sq, nheads, nheads_kv)
     bs = dense_mask_to_block_sparse(dense_mask, sq, sk, tile_m, N_BLOCK_SIZE)
+    packed = pack_mask(dense_mask)
     return _flash_attn_fwd(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q,
@@ -61,7 +64,7 @@ def _flash_attn_fwd_with_dense_mask(
         causal=False,
         mask_mod=dense_mask_mod,
         block_sparse_tensors=bs,
-        aux_tensors=[dense_mask],
+        aux_tensors=[packed],
     )
 
 

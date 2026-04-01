@@ -15,6 +15,29 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+def pack_mask(dense_mask: torch.Tensor) -> torch.Tensor:
+    """Bit-pack a dense bool/int mask into int32 words.
+
+    Args:
+        dense_mask: (B, Q, K) tensor with nonzero = attend.
+
+    Returns:
+        (B, Q, ceil(K / 32)) int32 tensor where bit *j* of word *i* indicates
+        whether position ``i * 32 + j`` is attended to.
+    """
+    B, Q, K = dense_mask.shape
+    # Pad K to a multiple of 32
+    pad_k = (32 - K % 32) % 32
+    if pad_k:
+        dm = F.pad(dense_mask, (0, pad_k))
+    else:
+        dm = dense_mask
+    dm = (dm != 0).view(B, Q, -1, 32).to(torch.int32)
+    # bit j contributes (1 << j)
+    shifts = torch.arange(32, device=dense_mask.device, dtype=torch.int32)
+    return (dm << shifts).sum(dim=-1, dtype=torch.int32)
+
+
 @cute.jit
 def dense_mask_mod(
     batch: cute.TensorSSA,
@@ -24,15 +47,19 @@ def dense_mask_mod(
     seqlen_info,
     aux_tensors: list,
 ) -> cute.TensorSSA:
-    """Mask mod that reads from a dense int32 mask.
+    """Mask mod that reads from a bit-packed int32 mask.
 
-    aux_tensors[0] must be a (B, Q, K) int32 tensor with 1 at selected
-    positions and 0 elsewhere.
+    aux_tensors[0] must be a (B, Q, ceil(K / 32)) int32 tensor produced by
+    ``pack_mask``.  Bit *j* of word *i* indicates position ``i * 32 + j``.
     """
-    mask = aux_tensors[0]
-    val = utils.scalar_to_ssa(mask[batch[0], q_idx[0], kv_idx[0]], cutlass.Int32)
+    packed = aux_tensors[0]
+    word_idx = kv_idx[0] >> 5      # kv_idx // 32
+    bit_idx = kv_idx[0] & 31       # kv_idx % 32
+    word = utils.scalar_to_ssa(packed[batch[0], q_idx[0], word_idx], cutlass.Int32)
+    one = utils.scalar_to_ssa(1, cutlass.Int32)
+    bit = (word >> bit_idx) & one
     zero = utils.scalar_to_ssa(0, cutlass.Int32)
-    return val != zero
+    return bit != zero
 
 
 def dense_mask_to_block_sparse(

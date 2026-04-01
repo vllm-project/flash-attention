@@ -11,14 +11,12 @@ import torch
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
     from flash_attn.cute.topk_mask import (
-        topk_to_dense_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
     )
 except (ImportError, ModuleNotFoundError):
     from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
     from vllm.vllm_flash_attn.cute.topk_mask import (
-        topk_to_dense_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
     )
@@ -76,21 +74,23 @@ def reset_torch_state():
     torch.cuda.empty_cache()
 
 
-def generate_topk_indices(B, seqlen_q, seqlen_k, k, device="cuda"):
-    """Generate random top-k indices: (B, seqlen_q, k) with unique indices per (B, Q)."""
+def generate_dense_mask(B, seqlen_q, seqlen_k, k, device="cuda"):
+    """Generate random dense mask with k active positions per query row.
+
+    Returns:
+        (B, seqlen_q, seqlen_k) int32 tensor with exactly min(k, seqlen_k) ones per row.
+    """
     k = min(k, seqlen_k)
-    topk_indices = torch.stack([
-        torch.stack([
-            torch.randperm(seqlen_k, device=device)[:k].sort().values
-            for _ in range(seqlen_q)
-        ])
-        for _ in range(B)
-    ]).to(torch.int32)
-    return topk_indices
+    mask = torch.zeros(B, seqlen_q, seqlen_k, dtype=torch.int32, device=device)
+    for b in range(B):
+        for q in range(seqlen_q):
+            indices = torch.randperm(seqlen_k, device=device)[:k]
+            mask[b, q, indices] = 1
+    return mask
 
 
-def compute_reference(q, k, v, topk_indices, scale):
-    """Compute reference attention output with top-k masking using dense PyTorch ops."""
+def compute_reference(q, k, v, dense_mask, scale):
+    """Compute reference attention output with dense masking using dense PyTorch ops."""
     B, seqlen_q, nheads, headdim = q.shape
     _, seqlen_k, nheads_kv, headdim_v = v.shape
 
@@ -105,9 +105,8 @@ def compute_reference(q, k, v, topk_indices, scale):
 
     scores = torch.matmul(q_ref, k_ref.transpose(-1, -2)) * scale
 
-    dense_mask = torch.zeros(B, 1, seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
-    dense_mask.scatter_(3, topk_indices.unsqueeze(1).expand(-1, 1, -1, -1).long(), True)
-    scores.masked_fill_(~dense_mask, float("-inf"))
+    bool_mask = dense_mask.unsqueeze(1).bool()
+    scores.masked_fill_(~bool_mask, float("-inf"))
 
     all_masked = scores.eq(float("-inf")).all(dim=-1, keepdim=True)
     probs = scores.softmax(dim=-1)
@@ -118,8 +117,8 @@ def compute_reference(q, k, v, topk_indices, scale):
 
 
 def compute_reference_varlen(q_packed, k_packed, v_packed, cu_seqlens_q, cu_seqlens_k,
-                             topk_indices_list, scale):
-    """Compute reference for varlen: per-sequence SDPA with topk mask."""
+                             dense_mask_padded, scale):
+    """Compute reference for varlen: per-sequence SDPA with dense mask."""
     B = len(cu_seqlens_q) - 1
     outputs = []
     for b in range(B):
@@ -140,10 +139,8 @@ def compute_reference_varlen(q_packed, k_packed, v_packed, cu_seqlens_q, cu_seql
 
         scores = torch.matmul(q_b, k_b.transpose(-1, -2)) * scale
 
-        topk_idx = topk_indices_list[b]
-        dense_mask = torch.zeros(1, 1, sq, sk, dtype=torch.bool, device=q_packed.device)
-        dense_mask.scatter_(3, topk_idx.unsqueeze(0).unsqueeze(0).long(), True)
-        scores.masked_fill_(~dense_mask, float("-inf"))
+        bool_mask = dense_mask_padded[b, :sq, :sk].unsqueeze(0).unsqueeze(0).bool()
+        scores.masked_fill_(~bool_mask, float("-inf"))
 
         all_masked = scores.eq(float("-inf")).all(dim=-1, keepdim=True)
         probs = scores.softmax(dim=-1)
@@ -165,20 +162,18 @@ class TestDenseMaskToBlockSparse:
         """Active tile count should match tiles with any selected tokens."""
         B, Q, k, seqlen_k = 1, 128, 16, 512
         tile_m, tile_n = 128, 128
-        topk = generate_topk_indices(B, Q, seqlen_k, k)
-        dense_mask = topk_to_dense_mask(topk, seqlen_k)
+        dense_mask = generate_dense_mask(B, Q, seqlen_k, k)
         bs = dense_mask_to_block_sparse(dense_mask, Q, seqlen_k, tile_m, tile_n)
 
         active_tiles = set()
-        for idx in topk[0].flatten().tolist():
-            active_tiles.add(idx // tile_n)
+        for kv_idx in dense_mask[0].nonzero(as_tuple=False)[:, 1].tolist():
+            active_tiles.add(kv_idx // tile_n)
 
         assert bs.mask_block_cnt[0, 0, 0].item() == len(active_tiles)
 
     def test_no_full_blocks(self):
         """full_block_cnt and full_block_idx should be None."""
-        topk = generate_topk_indices(1, 64, 256, 8)
-        dense_mask = topk_to_dense_mask(topk, 256)
+        dense_mask = generate_dense_mask(1, 64, 256, 8)
         bs = dense_mask_to_block_sparse(dense_mask, 64, 256, 64, 128)
         assert bs.full_block_cnt is None
         assert bs.full_block_idx is None
@@ -224,15 +219,13 @@ def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
     q = torch.randn(B, seqlen_q, nheads, headdim, dtype=dtype, device=device)
     k = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
     v = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
-    topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
-
-    dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
+    dense_mask = generate_dense_mask(B, seqlen_q, seqlen_k, topk, device=device)
 
     out_tuple = _flash_attn_fwd_with_dense_mask(
         q, k, v, dense_mask, seqlen_q, seqlen_k, scale, nheads, nheads_kv,
     )
     out_kernel = out_tuple[0]
-    out_ref = compute_reference(q, k, v, topk_indices, scale)
+    out_ref = compute_reference(q, k, v, dense_mask, scale)
 
     cute_error = (out_kernel.float() - out_ref).abs().max().item()
     print(f"\ntop-k={topk} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}, D={headdim}")
@@ -259,15 +252,13 @@ def test_topk_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
     q = torch.randn(B, seqlen_q, nheads, headdim, dtype=dtype, device=device)
     k = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
     v = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
-    topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
-
-    dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
+    dense_mask = generate_dense_mask(B, seqlen_q, seqlen_k, topk, device=device)
 
     out_tuple = _flash_attn_fwd_with_dense_mask(
         q, k, v, dense_mask, seqlen_q, seqlen_k, scale, nheads, nheads_kv,
     )
     out_kernel = out_tuple[0]
-    out_ref = compute_reference(q, k, v, topk_indices, scale)
+    out_ref = compute_reference(q, k, v, dense_mask, scale)
 
     cute_error = (out_kernel.float() - out_ref).abs().max().item()
     print(f"\nGQA top-k={topk} @ Q={seqlen_q}, K={seqlen_k}, H={nheads}/{nheads_kv}")
@@ -293,15 +284,13 @@ def test_topk_mask_non_aligned_seqlen():
     q = torch.randn(B, seqlen_q, nheads, headdim, dtype=dtype, device=device)
     k = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
     v = torch.randn(B, seqlen_k, nheads_kv, headdim, dtype=dtype, device=device)
-    topk_indices = generate_topk_indices(B, seqlen_q, seqlen_k, topk, device=device)
-
-    dense_mask = topk_to_dense_mask(topk_indices, seqlen_k)
+    dense_mask = generate_dense_mask(B, seqlen_q, seqlen_k, topk, device=device)
 
     out_tuple = _flash_attn_fwd_with_dense_mask(
         q, k, v, dense_mask, seqlen_q, seqlen_k, scale, nheads, nheads_kv,
     )
     out_kernel = out_tuple[0]
-    out_ref = compute_reference(q, k, v, topk_indices, scale)
+    out_ref = compute_reference(q, k, v, dense_mask, scale)
 
     cute_error = (out_kernel.float() - out_ref).abs().max().item()
     print(f"\nNon-aligned Q={seqlen_q}, K={seqlen_k}, top-k={topk}")
@@ -350,15 +339,11 @@ def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
     cu_seqlens_k = torch.tensor([0] + list(torch.cumsum(torch.tensor(seqlens_k), 0)),
                                 dtype=torch.int32, device=device)
 
-    topk_indices_list = []
     dense_mask_padded = torch.zeros(B, max_seqlen_q, max_seqlen_k,
                                     dtype=torch.int32, device=device)
     for b in range(B):
         sq, sk = seqlens_q[b], seqlens_k[b]
-        actual_topk = min(topk, sk)
-        idx = generate_topk_indices(1, sq, sk, actual_topk, device=device)[0]
-        topk_indices_list.append(idx)
-        seq_dense = topk_to_dense_mask(idx.unsqueeze(0), sk)
+        seq_dense = generate_dense_mask(1, sq, sk, topk, device=device)
         dense_mask_padded[b, :sq, :sk] = seq_dense[0]
 
     out_tuple = _flash_attn_fwd_with_dense_mask(
@@ -372,7 +357,7 @@ def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
 
     out_ref = compute_reference_varlen(q_packed, k_packed, v_packed,
                                        cu_seqlens_q.tolist(), cu_seqlens_k.tolist(),
-                                       topk_indices_list, scale)
+                                       dense_mask_padded, scale)
 
     cute_error = (out_kernel.float() - out_ref).abs().max().item()
     print(f"\nVarlen topk={topk} seqlens_q={seqlens_q} seqlens_k={seqlens_k}")

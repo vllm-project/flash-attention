@@ -15,22 +15,6 @@ def ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def topk_to_dense_mask(topk_indices: torch.Tensor, seqlen_k: int) -> torch.Tensor:
-    """Convert top-k index tensor to dense int32 mask.
-
-    Args:
-        topk_indices: (B, Q, k) int32 tensor of selected KV positions.
-        seqlen_k: Total KV sequence length.
-
-    Returns:
-        (B, Q, seqlen_k) int32 tensor with 1 at selected positions, 0 elsewhere.
-    """
-    B, Q, k = topk_indices.shape
-    mask = torch.zeros(B, Q, seqlen_k, dtype=torch.int32, device=topk_indices.device)
-    mask.scatter_(2, topk_indices.long(), 1)
-    return mask
-
-
 @cute.jit
 def dense_mask_mod(
     batch: cute.TensorSSA,

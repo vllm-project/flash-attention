@@ -335,17 +335,7 @@ def _flash_attn_fwd(
         or seqused_k is not None
     )
 
-    if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
-
     if use_block_sparsity:
-        if is_varlen:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
             pack_gqa = False
@@ -359,8 +349,17 @@ def _flash_attn_fwd(
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
     if block_sparse_tensors is not None:
-        if seqlen_q is None:
-            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        # In varlen mode, seqlen_q is None and seqlen_k is total_k (not max).
+        # Use max_seqlen_q/k for block_sparse normalization instead.
+        # Caller must pad block_sparse_tensors to max dimensions.
+        if is_varlen:
+            bs_seqlen_q = max_seqlen_q
+            bs_seqlen_k = max_seqlen_k
+        else:
+            bs_seqlen_q = seqlen_q
+            bs_seqlen_k = seqlen_k
+        if bs_seqlen_q is None:
+            raise ValueError("Block sparsity requires seqlen_q or max_seqlen_q to be known.")
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -369,8 +368,8 @@ def _flash_attn_fwd(
             block_sparse_tensors,
             batch_size=batch_size,
             num_head=num_head,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
+            seqlen_q=bs_seqlen_q,
+            seqlen_k=bs_seqlen_k,
             block_size=(m_block_size, n_block_size),
             q_stage=q_stage,
         )

@@ -174,7 +174,9 @@ def produce_block_sparse_loads(
         curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
-        curr_full_block_idx = None
+        # Use mask_block_idx as a dummy tensor for code generation.
+        # curr_full_block_cnt == 0 ensures it is never accessed at runtime.
+        curr_full_block_idx = curr_mask_block_idx
 
     mask_empty = curr_mask_block_cnt == 0
     full_empty = curr_full_block_cnt == 0
@@ -555,7 +557,9 @@ def produce_block_sparse_loads_sm100(
         curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
-        curr_full_block_idx = None
+        # Use mask_block_idx as a dummy tensor for code generation.
+        # curr_full_block_cnt == 0 ensures it is never accessed at runtime.
+        curr_full_block_idx = curr_mask_block_idx
 
     mask_empty = curr_mask_block_cnt == 0
     full_empty = curr_full_block_cnt == 0
@@ -783,7 +787,9 @@ def softmax_block_sparse_sm100(
         curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
-        curr_full_block_idx = None
+        # Use mask_block_idx as a dummy tensor for code generation.
+        # curr_full_block_cnt == 0 ensures it is never accessed at runtime.
+        curr_full_block_idx = curr_mask_block_idx
 
     total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
 

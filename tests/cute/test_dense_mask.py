@@ -1,4 +1,4 @@
-# Tests for sparse mask utilities (flash_attn.cute.topk_mask)
+# Tests for sparse mask utilities (flash_attn.cute.dense_mask)
 #
 # Verifies that dense_mask correctly implements token-level sparse
 # attention via FA4's mask_mod + block_sparse_tensors interface.
@@ -10,14 +10,14 @@ import torch
 
 try:
     from flash_attn.cute.interface import _flash_attn_fwd
-    from flash_attn.cute.topk_mask import (
+    from flash_attn.cute.dense_mask import (
         pack_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
     )
 except (ImportError, ModuleNotFoundError):
     from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
-    from vllm.vllm_flash_attn.cute.topk_mask import (
+    from vllm.vllm_flash_attn.cute.dense_mask import (
         pack_mask,
         dense_mask_to_block_sparse,
         dense_mask_mod,
@@ -212,7 +212,7 @@ TOPK_VALUES = [32, 64, 128]
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS)
 @pytest.mark.parametrize("topk", TOPK_VALUES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
+def test_dense_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
     """Verify FA4 with dense_mask matches dense PyTorch reference."""
     B, nheads, nheads_kv, headdim = 2, 4, 4, 128
     topk = min(topk, seqlen_k)
@@ -246,7 +246,7 @@ def test_topk_mask_correctness(seqlen_q, seqlen_k, topk, dtype):
 )
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 512)])
 @pytest.mark.parametrize("nheads,nheads_kv", [(8, 2), (4, 1)])
-def test_topk_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
+def test_dense_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
     """Verify mask_mod + block_sparse works with GQA (mask broadcasts across heads)."""
     B, headdim, topk = 2, 128, 64
     dtype, device = torch.bfloat16, "cuda"
@@ -276,7 +276,7 @@ def test_topk_mask_gqa(seqlen_q, seqlen_k, nheads, nheads_kv):
     not torch.cuda.is_available() or COMPUTE_CAPABILITY < 9,
     reason="Requires SM90+ GPU",
 )
-def test_topk_mask_non_aligned_seqlen():
+def test_dense_mask_non_aligned_seqlen():
     """Test with sequence lengths not divisible by tile sizes."""
     B, seqlen_q, seqlen_k = 1, 300, 500
     nheads = nheads_kv = 4
@@ -319,7 +319,7 @@ def test_topk_mask_non_aligned_seqlen():
     ([300, 400], [500, 800]),
 ])
 @pytest.mark.parametrize("topk", [32, 64])
-def test_topk_mask_varlen(seqlens_q, seqlens_k, topk):
+def test_dense_mask_varlen(seqlens_q, seqlens_k, topk):
     """Verify dense_mask works with varlen (cu_seqlens)."""
     B = len(seqlens_q)
     nheads = nheads_kv = 4

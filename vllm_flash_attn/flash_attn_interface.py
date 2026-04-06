@@ -159,6 +159,7 @@ def flash_attn_varlen_func(
     q_descale=None,
     k_descale=None,
     v_descale=None,
+    o_scale=None,
     num_splits: int = 0,
     # Version selector
     fa_version: int = DEFAULT_FA_VERSION,
@@ -291,6 +292,7 @@ def flash_attn_varlen_func(
             None,             # leftpad_k
             None, None, None, # rotary_cos, rotary_sin, seqlens_rotary
             q_descale, k_descale, v_descale,
+            o_scale,          # output scale for FP8 quantization
             softmax_scale,
             causal,
             real_window_size[0], real_window_size[1],

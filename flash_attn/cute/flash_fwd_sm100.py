@@ -2649,60 +2649,31 @@ class FlashAttentionForwardSm100:
             use_2cta_instrs=self.use_2cta_instrs,
         )
 
-        if cutlass.const_expr(self.m_block_size < 128):
-            # For m_block < 128, x2 TMEM/smem atoms require alignment that
-            # logical_divide + indexing loses. Use composition + manual iterator
-            # advancement instead (same pattern as correction_rescale).
-            tOtO_comp = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
-            tOcO_comp = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
-            tOsO_comp = cute.composition(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOtO_comp = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_comp = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOsO_comp = cute.composition(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
 
-            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_comp)
-            thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
-                self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
-            )
-            tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
+        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_comp)
+        thr_tmem_load = tiled_tmem_load.get_slice(tidx)
+        smem_copy_atom = sm100_utils_basic.get_smem_store_op(
+            self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
+        )
+        tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
-            tOtO_t2r = thr_tmem_load.partition_S(tOtO_comp)
-            tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_comp).shape
-            tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_comp)
+        tOtO_t2r = thr_tmem_load.partition_S(tOtO_comp)
+        tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_comp).shape
+        tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_comp)
 
-            for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
-                tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
-                tOsO_r2s_i = cute.make_tensor(tOsO_s2r.iterator + i * corr_tile_size, tOsO_s2r.layout)
-                tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
-                cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
-                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
-                    )
-                copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
-        else:
-            tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
-            tOcO_i = cute.logical_divide(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
-            tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
-
-            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
-            thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-            smem_copy_atom = sm100_utils_basic.get_smem_store_op(
-                self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
-            )
-            tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
-
-            tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
-            tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
-            tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-            for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
-                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-                tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-                tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
-                    )
-                copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+        for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
+            tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
+            tOsO_r2s_i = cute.make_tensor(tOsO_s2r.iterator + i * corr_tile_size, tOsO_s2r.layout)
+            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
+            cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
+            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                )
+            copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):

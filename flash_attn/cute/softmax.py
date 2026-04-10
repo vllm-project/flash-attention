@@ -11,7 +11,7 @@ from cutlass import Float32
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
-from flash_attn.cute.cute_dsl_utils import ParamsBase
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
@@ -134,9 +134,15 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                )
+                # if all scores are masked (row_max=-inf), exp2(sink - (-inf)) overflows
+                # set row_max/row_sum so the sink is the sole softmax contributor (matching SM100 logic)
+                if row_max[r] == -Float32.inf:
+                    row_max[r] = sink_val_cur * (LOG2_E / scale_log2)
+                    row_sum[r] = Float32(1.0)
+                else:
+                    row_sum[r] += cute.math.exp2(
+                        sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
+                    )
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -239,10 +245,9 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         acc_S_row_converted: cute.Tensor,
-        e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[int] = 16,
-        e2e_res: cutlass.Constexpr[int] = 4,
-        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -257,12 +262,14 @@ class SoftmaxSm100(Softmax):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                 # acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
-                if cutlass.const_expr(not e2e):
+                if cutlass.const_expr(ex2_emu_freq == 0):
                     acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                     acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                 else:
                     if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
                     ):
                         acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                         acc_S_row_frg[k + 1, j] = cute.math.exp2(

@@ -91,19 +91,26 @@ _TUNING_CONFIG = {
 
 
 def _tmem_ld_op(m_block_size, repetition):
-    """Select TMEM load op matching the accumulator layout for the given m_block_size."""
+    """Select TMEM load op matching the accumulator data-path count for the given m_block_size.
+
+    M>=128 (1CTA) uses 32 data paths → Ld32x32bOp(Rep(R)).
+    M=64  (1CTA) uses 16 data paths → Ld16x32bx2Op(Rep(R/2)).
+    The x2 suffix means each rep loads 2×32b = 64b per data path, so Rep halves.
+    """
     if m_block_size >= 128:
         return tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(repetition))
     else:
-        return tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(repetition))
+        assert repetition % 2 == 0, f"Repetition {repetition} must be even for 16x32bx2"
+        return tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(repetition // 2))
 
 
 def _tmem_st_op(m_block_size, repetition):
-    """Select TMEM store op matching the accumulator layout for the given m_block_size."""
+    """Select TMEM store op matching the accumulator data-path count for the given m_block_size."""
     if m_block_size >= 128:
         return tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(repetition))
     else:
-        return tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(repetition))
+        assert repetition % 2 == 0, f"Repetition {repetition} must be even for 16x32bx2"
+        return tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(repetition // 2))
 
 
 class FlashAttentionForwardSm100:
@@ -1835,21 +1842,20 @@ class FlashAttentionForwardSm100:
 
         if cutlass.const_expr(self.m_block_size >= 128):
             tmem_store_scale_atom = cute.make_copy_atom(
-                _tmem_st_op(self.m_block_size, 1), Float32
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), Float32
             )
             thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(
                 tidx
             )
             tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         else:
-            # Dead code: scale is always written via sScale, not TMEM
             thr_tmem_store_scale = thr_tmem_load
             tStScale_r2t = tStS_t2r
         tmem_store_atom = cute.make_copy_atom(
             _tmem_st_op(self.m_block_size, 16), Float32
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
-        tStP_r2t = thr_tmem_store.partition_D(tStP)
+        tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -2287,14 +2293,12 @@ class FlashAttentionForwardSm100:
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
         if cutlass.const_expr(self.m_block_size >= 128):
             tmem_load_v_atom = cute.make_copy_atom(
-                _tmem_ld_op(self.m_block_size, 1), self.qk_acc_dtype
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype
             )
             thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
-
             tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
             tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
         else:
-            # Dead code: scale is always read via sScale, not TMEM
             thr_tmem_load_vec = None
             tStScales_t2r = [None] * self.q_stage
             tSrScale_t2r_shape = (1,)
@@ -2639,36 +2643,39 @@ class FlashAttentionForwardSm100:
         tOsO = thr_mma.get_slice(0).partition_C(sO)
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
 
-        epi_subtile = (self.epi_tile[0], corr_tile_size)
-        tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
-            self.mma_tiler_pv,
-            self.o_layout,
-            self.o_dtype,
-            self.pv_acc_dtype,
-            epi_subtile,
-            use_2cta_instrs=self.use_2cta_instrs,
-        )
+        tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_i = cute.logical_divide(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
 
-        tOtO_comp = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
-        tOcO_comp = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
-        tOsO_comp = cute.composition(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
-
-        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_comp)
+        if cutlass.const_expr(self.m_block_size >= 128):
+            epi_subtile = (self.epi_tile[0], corr_tile_size)
+            tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
+                self.mma_tiler_pv,
+                self.o_layout,
+                self.o_dtype,
+                self.pv_acc_dtype,
+                epi_subtile,
+                use_2cta_instrs=self.use_2cta_instrs,
+            )
+        else:
+            tmem_copy_atom = cute.make_copy_atom(
+                _tmem_ld_op(self.m_block_size, corr_tile_size), self.pv_acc_dtype
+            )
+        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
         thr_tmem_load = tiled_tmem_load.get_slice(tidx)
         smem_copy_atom = sm100_utils_basic.get_smem_store_op(
             self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
         )
         tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
-        tOtO_t2r = thr_tmem_load.partition_S(tOtO_comp)
-        tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_comp).shape
-        tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_comp)
-
+        tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
+        tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
+        tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
-            tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
-            tOsO_r2s_i = cute.make_tensor(tOsO_s2r.iterator + i * corr_tile_size, tOsO_s2r.layout)
-            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
-            cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
+            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+            tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
+            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)

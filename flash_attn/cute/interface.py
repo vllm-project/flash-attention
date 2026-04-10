@@ -479,6 +479,11 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 128, True, True)
             else:
                 fwd_cfg = FwdConfig(128, 64, True, True)
+        elif arch // 10 in [10, 11]:
+            _max_sq = max_seqlen_q if max_seqlen_q is not None else (seqlen_q if cu_seqlens_q is None else total_q)
+            _eff_sq = _max_sq * qhead_per_kvhead
+            if _eff_sq <= 64:
+                fwd_cfg = FwdConfig(64, 128, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:

@@ -993,8 +993,11 @@ def declare_ptx_smem_desc(
 
 
 @cute.jit
-def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc") -> None:
-    idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
+def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc", n_override: Optional[int] = None) -> None:
+    if const_expr(n_override is not None):
+        idesc = const_expr(sm100_desc.mma_op_to_idesc_override_n(op, n_override))
+    else:
+        idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
     llvm.inline_asm(
         None,
         [],
@@ -1011,7 +1014,6 @@ def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc")
 def gemm_ptx_precomputed_varname(
     acc_tmem_addr: Int32,
     smem_desc_start_b: Int32,
-    # idesc: int,
     smem_desc_base_b: int,
     tCrB_layout: cute.Layout,
     smem_var_name_prefix: str,
@@ -1019,71 +1021,93 @@ def gemm_ptx_precomputed_varname(
     smem_offset: int,
     zero_init: bool | Boolean = False,
     cta_group: int = 1,
+    swap_AB: bool = False,
+    smem_desc_start_a: Optional[Int32] = None,
+    smem_desc_base_a: Optional[int] = None,
+    tCrA_layout: Optional[cute.Layout] = None,
 ) -> None:
-    is_ts = False
-    num_k_tile = cute.size(tCrB_layout.shape[2])
-    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
-    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+    """Precomputed GEMM with named PTX variables for the static operand's descriptor.
 
-    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    Standard: A is precomputed (via smem_var_name_prefix), B is runtime (smem_desc_start_b).
+    swap_AB: B is precomputed (via smem_var_name_prefix), A is runtime (smem_desc_start_a).
+    """
+    # Unify: "static" = precomputed operand (named PTX vars), "runtime" = per-call operand
+    # Standard: static=A, runtime=B.  swap_AB: static=B, runtime=A.
+    # PTX MMA always takes: [tmem], desc_A, desc_B, idesc, pred
+    if const_expr(swap_AB):
+        runtime_layout = tCrA_layout
+        runtime_base = smem_desc_base_a
+        runtime_start = smem_desc_start_a
+        static_label, runtime_label = "b", "a"  # static is B, runtime is A
+    else:
+        runtime_layout = tCrB_layout
+        runtime_base = smem_desc_base_b
+        runtime_start = smem_desc_start_b
+        static_label, runtime_label = "a", "b"  # static is A, runtime is B
+
+    num_k_tile = cute.size(runtime_layout.shape[2])
+    runtime_base_lo, runtime_hi = i64_to_i32x2(runtime_base)
+    offsets = [cute.crd2idx((0, 0, k), runtime_layout) for k in range(num_k_tile)]
+    runtime_start_lo = Int32(runtime_base_lo | runtime_start)
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
-    if const_expr(not is_ts):
-        llvm.inline_asm(
-            None,
-            [
-                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-                Int32(not zero_init).ir_value(),
-                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-            ],
-            "{\n\t"
-            ".reg .pred leader_thread;\n\t"
-            ".reg .pred p;\n\t"
-            # ".reg .b32 idesc;\n\t"
-            ".reg .b32 tmem_acc;\n\t"
-            ".reg .b32 smem_desc_b_lo_start;\n\t"
-            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
-            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
-            # ".reg .b64 smem_desc_b;\n\t"
-            f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
-            "elect.sync _|leader_thread, -1;\n\t"
-            # f"mov.b32 idesc, {hex(idesc)};\n\t"
-            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
-            f"mov.b32 tmem_acc, $2;\n\t"
-            "mov.b32 smem_desc_b_lo_start, $0;\n\t"
-            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-            f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_0;\n\t"
-            f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
-            f"mov.b64 {smem_var_name_prefix}_0, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-            f"mov.b64 smem_desc_b_0, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
-            + "".join(
-                (
-                    f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
-                    f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
-                    f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-                    f"mov.b64 smem_desc_b_{k}, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                )
-                for k in range(1, num_k_tile)
+
+    # PTX: static operand loaded from named vars + offset, runtime operand built per k-tile
+    s, r = static_label, runtime_label  # short aliases for PTX register names
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(runtime_start_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        f".reg .b32 smem_desc_{r}_lo_start;\n\t"
+        f".reg .b32 smem_desc_{s}_lo, smem_desc_{r}_lo;\n\t"
+        f".reg .b32 smem_desc_{s}_hi, smem_desc_{r}_hi;\n\t"
+        f".reg .b64 smem_desc_{r}_<{num_k_tile}>;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 tmem_acc, $2;\n\t"
+        f"mov.b32 smem_desc_{r}_lo_start, $0;\n\t"
+        f"mov.b32 smem_desc_{r}_hi, {hex(runtime_hi)};\n\t"
+        # Load static operand descriptor from named PTX vars
+        f"mov.b64 {{smem_desc_{s}_lo, smem_desc_{s}_hi}}, {smem_var_name_prefix}_0;\n\t"
+        f"add.s32 smem_desc_{s}_lo, smem_desc_{s}_lo, {smem_offset};\n\t"
+        f"mov.b64 {smem_var_name_prefix}_0, {{smem_desc_{s}_lo, smem_desc_{s}_hi}};\n\t"
+        # Build runtime operand descriptor for k-tile 0
+        f"mov.b64 smem_desc_{r}_0, {{smem_desc_{r}_lo_start, smem_desc_{r}_hi}};\n\t"
+        + "".join(
+            (
+                f"mov.b64 {{smem_desc_{s}_lo, smem_desc_{s}_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                f"add.s32 smem_desc_{s}_lo, smem_desc_{s}_lo, {smem_offset};\n\t"
+                f"add.s32 smem_desc_{r}_lo, smem_desc_{r}_lo_start, {hex(offsets[k])};\n\t"
+                f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_{s}_lo, smem_desc_{s}_hi}};\n\t"
+                f"mov.b64 smem_desc_{r}_{k}, {{smem_desc_{r}_lo, smem_desc_{r}_hi}};\n\t"
             )
-            + "setp.ne.b32 p, $1, 0;\n\t"
-            # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b, idesc, {pred_str};\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
-            + "".join(
-                (
-                    # f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
-                    # f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
-                    # f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                    # f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
-                    # f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, idesc, 1;\n\t"
-                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, {idesc_var_name}, 1;\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
-                )
-                for k in range(1, num_k_tile)
-            )
-            + "}\n",
-            "r,r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
+            for k in range(1, num_k_tile)
         )
+        + "setp.ne.b32 p, $1, 0;\n\t"
+        # MMA instructions: [tmem], desc_A, desc_B, idesc, pred
+        # swap_AB: static=B (smem_var_name_prefix), runtime=A (smem_desc_a)
+        # standard: static=A (smem_var_name_prefix), runtime=B (smem_desc_b)
+        + (
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a_0, {smem_var_name_prefix}_0, {idesc_var_name}, {pred_str};\n\t"
+            if const_expr(swap_AB) else
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
+        )
+        + "".join(
+            (
+                f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a_{k}, {smem_var_name_prefix}_{k}, {idesc_var_name}, 1;\n\t"
+                if const_expr(swap_AB) else
+                f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
+            )
+            for k in range(1, num_k_tile)
+        )
+        + "}\n",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )

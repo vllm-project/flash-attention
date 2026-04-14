@@ -325,6 +325,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    swap_AB: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -426,7 +427,9 @@ def _flash_attn_fwd(
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
+        # swap_AB disables pack_gqa: Q is small (decode) and pack_gqa's multi-dim
+        # stride is incompatible with B-operand TMA descriptor
+        pack_gqa = qhead_per_kvhead > 1 and not swap_AB
 
     out_torch_dtype = q.dtype
     device = q.device
@@ -636,6 +639,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
+        swap_AB,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -743,6 +747,7 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
                 use_clc_scheduler=requested_use_clc_scheduler,
+                swap_AB=swap_AB,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity

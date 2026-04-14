@@ -23,6 +23,7 @@ class NamedBarrierFwdSm100(enum.IntEnum):
     SoftmaxStatsW5 = enum.auto()
     SoftmaxStatsW6 = enum.auto()
     SoftmaxStatsW7 = enum.auto()
+    SoftmaxCrossWarp = enum.auto()
 
 
 class NamedBarrierBwd(enum.IntEnum):

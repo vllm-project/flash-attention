@@ -174,6 +174,17 @@ def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
     )
 
 
+def mma_op_to_idesc_override_n(op: cute.nvgpu.tcgen05.mma.MmaOp, new_N: int):
+    """Build instruction descriptor with overridden N dimension."""
+    if new_N < 8 or new_N > 256 or (new_N & 7):
+        raise ValueError(f"N must be a multiple of 8 in 8…256, got {new_N}")
+    idesc = mma_op_to_idesc(op)
+    n_dim_new = new_N >> 3
+    idesc &= ~(0x3F << 17)  # clear n_dim bits [17:23)
+    idesc |= (n_dim_new & 0x3F) << 17
+    return idesc & 0xFFFF_FFFF
+
+
 class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
     SWIZZLE_NONE = 0  # (a.k.a. “INTERLEAVE” in older docs)
     SWIZZLE_128B_BASE32B = 1

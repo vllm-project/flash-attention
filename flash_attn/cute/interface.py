@@ -310,6 +310,7 @@ def _flash_attn_fwd(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    dynamic_causal: Optional[torch.Tensor] = None,
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
@@ -610,7 +611,8 @@ def _flash_attn_fwd(
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
-        causal,
+        causal or dynamic_causal is not None,
+        dynamic_causal is not None,
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
@@ -653,6 +655,11 @@ def _flash_attn_fwd(
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
         ]
+        dynamic_causal_tensor = (
+            to_cute_tensor(dynamic_causal, assumed_align=4, leading_dim=0)
+            if dynamic_causal is not None
+            else None
+        )
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
             if page_table is not None
@@ -703,7 +710,7 @@ def _flash_attn_fwd(
                 head_dim,
                 head_dim_v,
                 qhead_per_kvhead,
-                is_causal=causal,
+                is_causal=causal or dynamic_causal is not None,
                 is_local=local,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
@@ -785,6 +792,7 @@ def _flash_attn_fwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            dynamic_causal_tensor,
             page_table_tensor,
             window_size_left,
             window_size_right,
@@ -811,6 +819,7 @@ def _flash_attn_fwd(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
+            dynamic_causal,
             page_table,
             window_size_left,
             window_size_right,

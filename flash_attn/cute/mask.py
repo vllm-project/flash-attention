@@ -108,6 +108,7 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    dynamic_causal: Optional[Int32] = None
 
     @property
     def seqlen_q(self) -> Int32:
@@ -254,6 +255,11 @@ class AttentionMask:
                                 mma_m_idx, r % threads_per_row, width=threads_per_row
                             )
                         col_limit_right = row_idx + causal_row_offset
+                        if const_expr(self.dynamic_causal is not None):
+                            col_limit_right = (
+                                col_limit_right if self.dynamic_causal
+                                else seqlenk_col_limit
+                            )
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         if const_expr(not r2p):

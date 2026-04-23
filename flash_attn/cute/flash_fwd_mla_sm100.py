@@ -718,6 +718,7 @@ class FlashAttentionMLAForwardSm100:
             ),
             cluster=self.cluster_shape_mnk,
             smem=SharedStorage.size_in_bytes(),
+            stream=stream,
         )
 
     @cute.kernel
@@ -1426,6 +1427,8 @@ class FlashAttentionMLAForwardSm100:
 
             if const_expr(self.is_causal):
                 seqlen_k_limit = m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+            elif const_expr(self.is_topk_gather):
+                seqlen_k_limit = mK.shape[0]
             else:
                 seqlen_k_limit = seqlen.seqlen_k
             cpasync_gather_kv_manager = CpasyncGatherKVManager.create(

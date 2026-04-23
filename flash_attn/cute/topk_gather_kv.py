@@ -205,6 +205,8 @@ class CpasyncGatherKVManager(ParamsBase):
             if const_expr(not self.disable_bitmask):
                 row_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
                 tPrRowValid[i] = row_valid
+                if not row_valid:
+                    topk_idx = Int32(0)
             if const_expr(not transpose):
                 tPrXPtr[i] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
             else:

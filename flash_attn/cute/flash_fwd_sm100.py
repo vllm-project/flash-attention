@@ -139,7 +139,19 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        is_supported_arch = (
+            Arch.sm_100 <= self.arch <= Arch.sm_100f
+            or Arch.sm_103 <= self.arch <= Arch.sm_103f
+            or Arch.sm_110 <= self.arch <= Arch.sm_110f
+        )
+        # CUDA 12.9 and older use sm_101* for Thor; CUDA 13.0+
+        # renames the same target family to sm_110*.
+        if hasattr(Arch, "sm_101") and hasattr(Arch, "sm_101f"):
+            is_supported_arch = (
+                is_supported_arch
+                or Arch.sm_101 <= self.arch <= Arch.sm_101f
+            )
+        assert is_supported_arch, "Only SM 10.x and 11.x are supported"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape

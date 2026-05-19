@@ -390,12 +390,14 @@ def test_fp8_output_validation_errors():
     out_fp8 = torch.empty(2, 64, 4, 128, dtype=torch.float8_e4m3fn, device=device)
     scale = _scale_t(0.5, device)
 
-    # FP8 output without output_scale -> AssertionError
-    with pytest.raises(AssertionError, match="no output_scale was provided"):
+    # FP8 `out` without output_scale: caught downstream by _validate_tensor
+    # (out_torch_dtype falls back to bf16, so the fp8 buffer dtype mismatches).
+    with pytest.raises(AssertionError, match="out dtype"):
         _flash_attn_fwd(q, k, v, out=out_fp8, _arch=100)
 
-    # output_scale as a Python float -> AssertionError
-    with pytest.raises(AssertionError, match="must be a torch.Tensor"):
+    # Non-tensor output_scale is rejected by the shared CUDA-device check,
+    # same as any other tensor arg (e.g. q_descale) given a Python float.
+    with pytest.raises(AttributeError):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=0.5, _arch=100)
 
     # output_scale wrong dtype -> AssertionError

@@ -1052,6 +1052,9 @@ def _flash_attn_fwd(
             v_call = v_call.view(torch.uint8)
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
+        out_call = out.detach()
+        if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            out_call = out_call.view(torch.uint8)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
@@ -1063,7 +1066,7 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
-                out.detach(),
+                out_call,
                 lse,
                 softmax_scale,
                 cu_seqlens_q,
@@ -1080,7 +1083,7 @@ def _flash_attn_fwd(
                 q_call,
                 k_call,
                 v_call,
-                out.detach() if not is_split_kv else out_partial,
+                out_call if not is_split_kv else out_partial,
                 lse_partial if is_split_kv else lse,
                 softmax_scale,
                 cu_seqlens_q,

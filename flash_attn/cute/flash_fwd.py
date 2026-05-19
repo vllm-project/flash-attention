@@ -56,6 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        output_quant_key: Optional[cutlass.Constexpr[str]] = None,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -75,6 +76,10 @@ class FlashAttentionForwardBase:
             Callable signature: ``score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Any``
         :param mask_mod: A callable that takes the attention scores and returns a boolean representing whether that score should be masked.
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
+        :param output_quant_key: compile-time tag represents specialized fused quant output in epilogue.
+            Used as a tag in compile_key. Inspired by quant keys in vLLM and derived from output scales args.
+            Supported: ``"kFp8StaticTensorSym"`` (per-tensor static FP8 e4m3fn)
+            TODO: ``"kFp8Dynamic128Sym"``, ``"kFp8Dynamic64Sym"``, ``"kNvfp4Dynamic"``
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -98,6 +103,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.output_quant_key = output_quant_key
         self.qk_acc_dtype = Float32
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -604,6 +610,12 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.output_quant_key is None, (
+            f"Fused quant output not implemented for {type(self).__name__}"
+        )
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -665,6 +677,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        output_scale: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -762,6 +775,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            output_scale,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -801,6 +815,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        output_scale: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()

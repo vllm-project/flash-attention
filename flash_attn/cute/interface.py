@@ -323,6 +323,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -334,8 +335,12 @@ def _flash_attn_fwd(
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
+            FP8 (e4m3fn) dtype is selected automatically when `output_scale` is set.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
+            FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
+            dequant = out_fp8 * output_scale. SM100/SM110 only.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
@@ -416,6 +421,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 page_table,
                 learnable_sink,
+                output_scale,
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
@@ -435,7 +441,21 @@ def _flash_attn_fwd(
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
-    out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    if output_scale is not None:
+        assert output_scale.dtype == torch.float32, "output_scale must be float32"
+        assert output_scale.numel() == 1, "output_scale must be a scalar (numel == 1) tensor"
+        assert output_scale.device == q.device, "output_scale must be on the same device as q"
+        assert block_sparse_tensors is None, "fused FP8 output + block sparsity not supported yet"
+        assert page_table is None, "fused FP8 output + paged KV not supported yet"
+        out_torch_dtype = torch.float8_e4m3fn
+        # Derived output quant key for use as tag in compile_key.
+        # The tag values are inspired by vLLM. More support will be added for keys:
+        # kFp8Dynamic128Sym, kFp8Dynamic64Sym, kNvfp4Dynamic
+        output_quant_key = "kFp8StaticTensorSym"
+        output_scale = output_scale.reshape(1)
+    else:
+        out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
+        output_quant_key = None
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -724,6 +744,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        output_quant_key,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -733,11 +754,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
+            output_scale_tensor, # 1d scalar tensor
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -812,6 +834,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                output_quant_key=output_quant_key,
             )
         elif arch // 10 == 9:
             fa_fwd = FlashAttentionForwardSm90(
@@ -835,8 +858,15 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                # SplitKV: forward writes FP32 partials, combine does the fold.
+                output_quant_key=output_quant_key if not is_split_kv else None,
             )
         elif arch // 10 in [10, 11]:
+            if output_quant_key is not None:
+                assert qv is None, "fused FP8 output + MLA (qv) not supported yet"
+                assert not use_dedicated_hd256_kernel, (
+                    "fused FP8 output + head_dim=256 kernel not supported yet"
+                )
             if qv is not None:
                 fa_fwd = FlashAttentionMLAForwardSm100(
                     is_causal=causal,
@@ -879,37 +909,60 @@ def _flash_attn_fwd(
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
 
-                flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
-                )
-
-                fa_fwd = flash_fwd_obj_cls(
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    is_split_kv=is_split_kv,
-                    pack_gqa=pack_gqa,
-                    m_block_size=tile_m,
-                    n_block_size=tile_n,
-                    q_stage=q_stage,
-                    is_persistent=not causal
-                        and not local
-                        and cu_seqlens_q is None
-                        and seqused_q is None
-                        and not is_split_kv,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
-                    is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=use_clc_scheduler,
-                )
+                if use_dedicated_hd256_kernel:
+                    fa_fwd = BlackwellFusedMultiHeadAttentionForward(
+                        head_dim,
+                        head_dim_v,
+                        qhead_per_kvhead=qhead_per_kvhead,
+                        is_causal=causal,
+                        is_local=local,
+                        is_split_kv=is_split_kv,
+                        pack_gqa=pack_gqa,
+                        m_block_size=tile_m,
+                        n_block_size=tile_n,
+                        q_stage=q_stage,
+                        is_persistent=not causal
+                            and not local
+                            and cu_seqlens_q is None
+                            and seqused_q is None
+                            and not is_split_kv,
+                        score_mod=score_mod,
+                        mask_mod=mask_mod,
+                        has_aux_tensors=aux_tensors is not None,
+                        paged_kv_non_tma=page_size not in [None, tile_n],
+                        is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                        q_subtile_factor=q_subtile_factor,
+                        use_2cta_instrs=use_2cta_instrs,
+                        use_clc_scheduler=use_clc_scheduler,
+                    )
+                else:
+                    fa_fwd = FlashAttentionForwardSm100(
+                        head_dim,
+                        head_dim_v,
+                        qhead_per_kvhead=qhead_per_kvhead,
+                        is_causal=causal,
+                        is_local=local,
+                        is_split_kv=is_split_kv,
+                        pack_gqa=pack_gqa,
+                        m_block_size=tile_m,
+                        n_block_size=tile_n,
+                        q_stage=q_stage,
+                        is_persistent=not causal
+                            and not local
+                            and cu_seqlens_q is None
+                            and seqused_q is None
+                            and not is_split_kv,
+                        score_mod=score_mod,
+                        mask_mod=mask_mod,
+                        has_aux_tensors=aux_tensors is not None,
+                        paged_kv_non_tma=page_size not in [None, tile_n],
+                        is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                        q_subtile_factor=q_subtile_factor,
+                        use_2cta_instrs=use_2cta_instrs,
+                        use_clc_scheduler=use_clc_scheduler,
+                        # SplitKV: forward writes FP32 partials, combine does the fold.
+                        output_quant_key=output_quant_key if not is_split_kv else None,
+                    )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -931,6 +984,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                output_quant_key=output_quant_key,
             )
         else:
             raise ValueError(
@@ -981,6 +1035,11 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.insert(-3, descale_tensors_tensor)
+            # TODO: thread output_scale into the hd256 (BlackwellFusedMultiHeadAttentionForward)
+            # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there
+            # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
+            if not use_dedicated_hd256_kernel:
+                compile_args.insert(-1, output_scale_tensor)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
     if not is_fake_mode():
@@ -1048,6 +1107,9 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            # See the TODO above: hd256/MLA kernels don't take output_scale yet.
+            if not use_dedicated_hd256_kernel:
+                call_args.append(output_scale)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1057,6 +1119,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            output_scale=output_scale,
         )
     return out, lse
 
@@ -1936,6 +1999,8 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        out: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1956,6 +2021,8 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            out=out,
+            output_scale=output_scale,
         )
         ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
@@ -2031,6 +2098,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        out: Optional[torch.Tensor] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2057,6 +2126,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            out=out,
+            output_scale=output_scale,
         )
         ctx.save_for_backward(
             q,
@@ -2140,6 +2211,8 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2162,6 +2235,8 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        out,
+        output_scale,
     )
 
 
@@ -2191,6 +2266,8 @@ def flash_attn_varlen_func(
     score_mod_bwd: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    out: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -2232,12 +2309,14 @@ def flash_attn_varlen_func(
         score_mod_bwd,
         aux_tensors,
         return_lse,
+        out,
+        output_scale,
     )
 
 
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
-    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx, output_quant_key,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -2250,6 +2329,7 @@ def _compile_fwd_combine(
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
+        output_quant_key=output_quant_key,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -2282,11 +2362,13 @@ def _compile_fwd_combine(
     mNumSplitsDynamic = None  # Not parametrized in compile_key
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
+    output_scale = fake_tensor(Float32, (1,), divisibility=1) if output_quant_key is not None else None
 
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
+        output_scale,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -2302,6 +2384,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2327,6 +2410,13 @@ def _flash_attn_fwd_combine(
     assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
         "out_partial must be fp16, bf16, or fp32"
     )
+
+    if output_scale is not None:
+        # Derived output quant key for use in compile_key and const_expr.
+        output_quant_key = "kFp8StaticTensorSym"
+    else:
+        output_quant_key = None
+
     if not is_fake_mode():
         assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
     # Determine if this is variable length based on dimensions
@@ -2370,6 +2460,7 @@ def _flash_attn_fwd_combine(
         seqused is not None,
         lse is not None,
         varlen_batch_idx is not None,
+        output_quant_key,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -2380,6 +2471,7 @@ def _flash_attn_fwd_combine(
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
+            output_scale,
         )
 
 

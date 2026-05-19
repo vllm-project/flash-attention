@@ -22,7 +22,7 @@ from flash_attn.cute.testing import (
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_FP8_SM_SUPPORTED = (
     torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] == 10
+    and torch.cuda.get_device_capability()[0] in (10, 11)
 )
 
 skip_if_no_fp8_sm = pytest.mark.skipif(
@@ -414,9 +414,9 @@ def test_fp8_output_validation_errors():
         _flash_attn_fwd(q, k, v, out=bf16_out, output_scale=scale, _arch=100)
 
     # SM80 / SM90 / SM120 reject FP8 output in each forward class's __init__.
-    with pytest.raises(AssertionError, match="FP8 output not implemented"):
+    with pytest.raises(AssertionError, match="Fused quant output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=80)
-    with pytest.raises(AssertionError, match="FP8 output not implemented"):
+    with pytest.raises(AssertionError, match="Fused quant output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=90)
-    with pytest.raises(AssertionError, match="FP8 output not implemented"):
+    with pytest.raises(AssertionError, match="Fused quant output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, output_scale=scale, _arch=120)

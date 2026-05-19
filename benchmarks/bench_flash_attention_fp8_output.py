@@ -108,7 +108,7 @@ def main():
     args = parser.parse_args()
 
     cap = torch.cuda.get_device_capability()
-    if cap[0] != 10:
+    if cap[0] not in (10, 11):
         raise SystemExit(
             f"Fused FP8 output requires SM100/SM110 (Blackwell). "
             f"Detected sm{cap[0]}{cap[1]}; aborting."

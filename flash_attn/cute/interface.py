@@ -560,7 +560,12 @@ def _flash_attn_fwd(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
-    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
+    if local:
+        win_right = max_seqlen_k if window_size_right is None else window_size_right
+        win_left = max_seqlen_k if window_size_left is None else window_size_left
+        seqlen_k_loaded = max(0, min(max_seqlen_k, win_right + win_left + 1 + tile_m))
+    else:
+        seqlen_k_loaded = max_seqlen_k
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n

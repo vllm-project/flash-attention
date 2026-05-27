@@ -534,7 +534,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const float softcap,
                const bool return_softmax,
                int num_splits,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               const std::string &kv_cache_layout = "NHC") {
+    TORCH_CHECK(kv_cache_layout == "NHC" || kv_cache_layout == "HNC",
+                "kv_cache_layout must be 'NHC' or 'HNC'");
+    const bool kv_layout_hnc = kv_cache_layout == "HNC";
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -575,13 +579,17 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
     const int head_size = sizes[2];
-    const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+    const int num_heads_k = !paged_KV
+        ? k.size(1)
+        : (kv_layout_hnc ? k.size(1) : k.size(2));
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
-    const int page_block_size = !paged_KV ? 1 : k.size(1);
+    const int page_block_size = !paged_KV
+        ? 1
+        : (kv_layout_hnc ? k.size(2) : k.size(1));
     TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
@@ -616,8 +624,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
         CHECK_SHAPE(v, total_k, num_heads_k, head_size);
     } else {
-        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
-        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        if (kv_layout_hnc) {
+            CHECK_SHAPE(k, num_blocks, num_heads_k, page_block_size, head_size);
+            CHECK_SHAPE(v, num_blocks, num_heads_k, page_block_size, head_size);
+        } else {
+            CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
+            CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        }
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
@@ -698,6 +711,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         params.block_table_batch_stride = block_table.stride(0);
         params.k_batch_stride = k.stride(0);
         params.v_batch_stride = v.stride(0);
+        if (kv_layout_hnc) {
+            params.k_row_stride = k.stride(-2);
+            params.k_head_stride = k.stride(-3);
+            params.v_row_stride = v.stride(-2);
+            params.v_head_stride = v.stride(-3);
+        }
     }
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
@@ -766,18 +785,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         int64_t lse_size_before[] = {num_heads, batch_size, max_seqlen_q};
         int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
-        
-        
+
+
         if (params.num_splits > 1){
-            // When KV-split is enabled (num_splits > 1), LSE is first computed partially through lse_accum tensors. Then, an additional kernel, combine_attn_seqk_parallel, reduces these partials into the final LSE. 
+            // When KV-split is enabled (num_splits > 1), LSE is first computed partially through lse_accum tensors. Then, an additional kernel, combine_attn_seqk_parallel, reduces these partials into the final LSE.
             // This kernel produces LSE in a [seqlen_q, h, b] layout which can be directly used as it is already in the canonical form.
-            softmax_lse = softmax_lse.reshape(lse_size_after); 
+            softmax_lse = softmax_lse.reshape(lse_size_after);
         }else{
             // The standard forward kernel produces LSE in a [b, h, seqlen_q] layout.
             // It must be transposed to the canonical [seqlen_q, h, b] layout.
             softmax_lse = softmax_lse.reshape(lse_size_before).transpose(1, 2).reshape(lse_size_after);
         }
-        
+
     }
 
     return {out, softmax_lse};

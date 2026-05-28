@@ -708,6 +708,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
                                p_dropout, num_splits, get_num_sm(get_current_device()), opts);
+    } else if (paged_KV) {
+        TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
+        params.num_splits = num_splits;
     }
 
     if (leftpad_k_.has_value()) {

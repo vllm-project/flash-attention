@@ -55,6 +55,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 def _parse_arch_str(arch_str):
@@ -257,6 +258,11 @@ torch2cute_dtype_map = {
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
+        return 1
+    # Avoid ZeroDivisionError when batch_size or seqlen_q is 0. The empty-Q
+    # early-exit in _flash_attn_fwd handles correctness for those shapes; this
+    # guard just keeps the heuristic safe if called in other contexts.
+    if total_mblocks == 0:
         return 1
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
@@ -477,7 +483,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
-    if seqlen_k == 0:
+    if seqlen_k == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             lse.fill_(float("-inf"))
@@ -502,7 +508,7 @@ def _flash_attn_fwd(
     )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
-    requested_disable_2cta = utils._get_disable_2cta_default()
+    requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -547,7 +553,7 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if arch // 10 == 10:
+    if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
@@ -592,8 +598,8 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (SM100 only)
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
+    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     if softcap is not None:
@@ -621,23 +627,14 @@ def _flash_attn_fwd(
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
-    if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
-
     if use_block_sparsity:
-        if is_varlen:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
-        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
+        head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
+        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
             pack_gqa = False
-        if is_split_kv:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
+        if cu_seqlens_q is not None:
+            assert block_sparse_tensors.cu_total_m_blocks is not None, (
+                "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
             )
 
     # See get_broadcast_dims for why this is needed in compile key
@@ -645,8 +642,6 @@ def _flash_attn_fwd(
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
     if block_sparse_tensors is not None:
-        if seqlen_q is None:
-            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -726,6 +721,8 @@ def _flash_attn_fwd(
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1029,18 +1026,22 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                current_stream,
             ]
             if arch // 10 in [10, 11]:
-                compile_args.insert(-3, descale_tensors_tensor)
+                compile_args.append(descale_tensors_tensor)
+            compile_args.extend([
+                sparse_tensors,
+                cute_aux_tensors,
+            ])
             # TODO: thread output_scale into the hd256 (BlackwellFusedMultiHeadAttentionForward)
             # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there
             # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
             if not use_dedicated_hd256_kernel:
-                compile_args.insert(-1, output_scale_tensor)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+                compile_args.append(output_scale_tensor)
+            compile_args.append(current_stream)
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *compile_args, options="--enable-tvm-ffi"
+            )
 
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
@@ -1103,6 +1104,8 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.mask_block_idx,
                     normalized_block_sparse_tensors.full_block_cnt,
                     normalized_block_sparse_tensors.full_block_idx,
+                    normalized_block_sparse_tensors.cu_total_m_blocks,
+                    normalized_block_sparse_tensors.cu_block_idx_offsets,
                     normalized_block_sparse_tensors.dq_write_order,
                     normalized_block_sparse_tensors.dq_write_order_full,
                 )
@@ -1397,7 +1400,7 @@ def _flash_attn_bwd(
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
 
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
@@ -1487,7 +1490,7 @@ def _flash_attn_bwd(
         )
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
-    elif score_mod is not None:
+    if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
@@ -1929,6 +1932,8 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.mask_block_idx,
                 normalized_block_sparse_tensors.full_block_cnt,
                 normalized_block_sparse_tensors.full_block_idx,
+                normalized_block_sparse_tensors.cu_total_m_blocks,
+                normalized_block_sparse_tensors.cu_block_idx_offsets,
                 normalized_block_sparse_tensors.dq_write_order,
                 normalized_block_sparse_tensors.dq_write_order_full,
             )
@@ -2099,6 +2104,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         score_mod_bwd: Optional[Callable] = None,
+        mask_mod: Optional[Callable] = None,
+        block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
@@ -2126,6 +2133,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
@@ -2267,6 +2276,8 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
@@ -2310,6 +2321,8 @@ def flash_attn_varlen_func(
         deterministic,
         score_mod,
         score_mod_bwd,
+        mask_mod,
+        block_sparse_tensors,
         aux_tensors,
         return_lse,
         out,

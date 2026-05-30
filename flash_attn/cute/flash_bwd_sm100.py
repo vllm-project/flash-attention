@@ -1010,6 +1010,16 @@ class FlashAttentionBackwardSm100:
             min_blocks_per_mp=1,
         )
 
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+        return partial(
+            AttentionMask,
+            self.tile_m,
+            self.tile_n * self.cta_group_size,
+            swap_AB=True,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+
     @cute.kernel
     def kernel(
         self,
@@ -1413,14 +1423,7 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.tile_m,
-            self.tile_n * self.cta_group_size,
-            swap_AB=True,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-        )
+        AttentionMaskCls = self._generate_attention_mask_cls(window_size_left, window_size_right)
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
@@ -3432,13 +3435,10 @@ class FlashAttentionBackwardSm100:
         seqlen,
         m_block: Int32,
         n_block: Int32,
-        n_block_global_max: Int32,
     ) -> Int32:
         lock_value = n_block
         if const_expr(self.spt):
-            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(
-                seqlen, m_block, n_block_global_max
-            )
+            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(seqlen, m_block)
             lock_value = n_block_max_for_m_block - 1 - n_block
         if const_expr(self.use_block_sparsity):
             assert blocksparse_tensors is not None
@@ -3528,7 +3528,6 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             delay_semaphore_release = not self.tile_hdim == 192 and not self.use_block_sparsity
-            n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
             curr_q_cnt = Int32(0)
             curr_q_idx = None
@@ -3627,7 +3626,6 @@ class FlashAttentionBackwardSm100:
                                 seqlen,
                                 m_block,
                                 n_block_cta_group,
-                                n_block_global_max,
                             )
                             barrier.wait_eq(
                                 mdQ_semaphore_cur[(m_block, None)].iterator,

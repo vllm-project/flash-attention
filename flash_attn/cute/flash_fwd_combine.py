@@ -69,7 +69,10 @@ class FlashAttentionForwardCombine:
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters."""
         if dtype not in [
-            cutlass.Float16, cutlass.BFloat16, cutlass.Float32, cutlass.Float8E4M3FN,
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float32,
+            cutlass.Float8E4M3FN,
         ]:
             return False
         if dtype_partial not in [cutlass.Float16, cutlass.BFloat16, Float32]:

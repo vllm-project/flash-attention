@@ -741,6 +741,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
+        bool only_qv,
         int const sm_margin,
         std::optional<const at::Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
@@ -1111,6 +1112,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+    TORCH_CHECK(!only_qv || q_v_.has_value(), "only_qv requires q_v to be provided");
+    params.only_qv = only_qv;
 
     if (rotary_cos_.has_value()) {
         TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");

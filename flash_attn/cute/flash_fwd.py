@@ -677,6 +677,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mDynamicCausal: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
@@ -830,6 +831,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, num_head, batch_size, _ = work_tile.tile_idx
 
+        psc = mDynamicCausal[batch_size] if const_expr(mDynamicCausal is not None) else None
         block_info = BlockInfo(
             self.tile_m,
             self.tile_n,
@@ -1051,6 +1053,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            dynamic_causal=psc,
         )
         mask_fn = partial(
             mask.apply_mask,

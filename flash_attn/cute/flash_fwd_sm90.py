@@ -176,6 +176,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mDynamicCausal: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
@@ -386,6 +387,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mDynamicCausal,
             mPageTable,
             tma_atom_Q,
             tma_atom_K,
@@ -434,6 +436,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mDynamicCausal: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
@@ -598,6 +601,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
+        self._mDynamicCausal = mDynamicCausal
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         # Cluster wait before starting
@@ -795,8 +799,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     n_block_min, n_block_max = block_info.get_n_block_min_max(
                         seqlen, m_block, split_idx, num_splits
                     )
-                    # if cute.arch.thread_idx()[0] == 0:
-                    #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
+                    if const_expr(self._mDynamicCausal is not None):
+                        psc_producer = self._mDynamicCausal[batch_idx]
+                        if not psc_producer:
+                            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
                     # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
                     # gracefully (fills zeros), but cp.async would crash on
@@ -1099,7 +1105,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
-            mask = AttentionMaskCls(seqlen)
+            psc = self._mDynamicCausal[batch_idx] if const_expr(self._mDynamicCausal is not None) else None
+            mask = AttentionMaskCls(seqlen, dynamic_causal=psc)
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=batch_idx,
@@ -1129,6 +1136,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
             )
+            if const_expr(self._mDynamicCausal is not None):
+                if not psc:
+                    n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
             n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
@@ -1173,6 +1183,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                         seqlen, m_block, n_block_min
                     )
+                    if const_expr(self._mDynamicCausal is not None):
+                        if not psc:
+                            n_block_min_causal_local_mask = n_block_min
                     # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_causal_local_mask = {}", n_block_min_causal_local_mask)
                     for n_tile in cutlass.range(
                         n_block_max - n_block_min_causal_local_mask, unroll=1

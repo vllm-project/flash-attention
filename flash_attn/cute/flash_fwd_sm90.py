@@ -802,7 +802,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if const_expr(self._mDynamicCausal is not None):
                         psc_producer = self._mDynamicCausal[batch_idx]
                         if not psc_producer:
-                            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                            # Mirror the consumer's bidirectional split range so the
+                            # producer loads exactly the K/V blocks the consumer
+                            # processes. Any divergence here deadlocks the pipeline.
+                            n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                            if const_expr(self.is_split_kv):
+                                num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
+                                n_block_min = split_idx * num_n_blocks_per_split
+                                n_block_max = cutlass.min(
+                                    n_block_min + num_n_blocks_per_split, n_block_max_full
+                                )
+                            else:
+                                n_block_min = Int32(0)
+                                n_block_max = n_block_max_full
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
                     # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
                     # gracefully (fills zeros), but cp.async would crash on
@@ -1137,8 +1149,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 seqlen, m_block, split_idx, num_splits
             )
             if const_expr(self._mDynamicCausal is not None):
+                # Per-sequence causal: psc == 0 means this sequence is processed
+                # bidirectionally. get_n_block_min_max may have applied a causal
+                # upper bound (when the kernel is compiled causal) and, for
+                # split-KV, partitioned that (possibly causal) range. For a
+                # bidirectional sequence each split must instead own a DISJOINT
+                # slice of the FULL key range. Recompute [n_block_min, n_block_max)
+                # over the full range here, and IDENTICALLY on the producer side
+                # (see the K/V load loop), so the pipeline block counts agree -- a
+                # producer/consumer mismatch deadlocks the kernel (GPU spins).
+                # The previous code only reset n_block_max to the global max while
+                # leaving n_block_min at its split offset, so splits overlapped and
+                # keys were double-counted -> corrupted softmax (rel_err ~0.33).
                 if not psc:
-                    n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                    if const_expr(self.is_split_kv):
+                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
+                        n_block_min = split_idx * num_n_blocks_per_split
+                        n_block_max = cutlass.min(
+                            n_block_min + num_n_blocks_per_split, n_block_max_full
+                        )
+                    else:
+                        n_block_min = Int32(0)
+                        n_block_max = n_block_max_full
             n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:

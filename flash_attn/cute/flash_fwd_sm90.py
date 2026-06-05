@@ -1117,7 +1117,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
-            psc = self._mDynamicCausal[batch_idx] if const_expr(self._mDynamicCausal is not None) else None
+            psc = (
+                self._mDynamicCausal[batch_idx]
+                if const_expr(self._mDynamicCausal is not None)
+                else None
+            )
             mask = AttentionMaskCls(seqlen, dynamic_causal=psc)
             mask_fn = partial(
                 mask.apply_mask,

@@ -281,8 +281,7 @@ class AttentionMask:
                         col_limit_right = row_idx + causal_row_offset
                         if const_expr(self.dynamic_causal is not None):
                             col_limit_right = (
-                                col_limit_right if self.dynamic_causal
-                                else seqlenk_col_limit
+                                col_limit_right if self.dynamic_causal else seqlenk_col_limit
                             )
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)

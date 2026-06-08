@@ -687,6 +687,13 @@ class AttentionMask:
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
             if const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset + 1
+                # Per-request dynamic causal: for bidirectional sequences
+                # (psc == 0), drop the causal column clip so the row attends
+                # to the full (seqlen-bounded) KV. Mirrors the SM90 path.
+                if const_expr(self.dynamic_causal is not None):
+                    col_limit_right = (
+                        col_limit_right if self.dynamic_causal else seqlenk_col_limit
+                    )
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 # if cute.arch.thread_idx()[0] % 32 == 0:

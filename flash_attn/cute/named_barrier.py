@@ -10,6 +10,14 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    # FP8-KV consumer-side dequant (flash_fwd_sm90.py). DequantK: cooperative
+    # 256-thread sync so the full fp16 K tile is visible to both MMA warpgroups
+    # before the (redundant) QK WGMMA. DequantV0/DequantV1: per-warpgroup
+    # 128-thread sync (each WG dequants only its own hdimv-half of V for PV), so
+    # the two WGs use distinct barrier ids and never cross-synchronize.
+    DequantK = enum.auto()
+    DequantV0 = enum.auto()
+    DequantV1 = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

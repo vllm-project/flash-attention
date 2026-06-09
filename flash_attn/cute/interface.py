@@ -324,6 +324,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    fp8_kv_dequant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -392,7 +393,16 @@ def _flash_attn_fwd(
     assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if fp8_kv_dequant:
+        # FP8-KV in-place dequant probe: fp16 Q + fp8 e4m3 K/V (dequantized in-kernel
+        # to fp16 for precision), bf16/fp16 O. Only the SM90 path.
+        assert q.dtype == torch.float16, "fp8_kv_dequant requires fp16 Q (compute is fp16)"
+        assert k.dtype == v.dtype == torch.float8_e4m3fn, (
+            "fp8_kv_dequant requires fp8 e4m3 K/V"
+        )
+        assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
+    else:
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -483,7 +493,7 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
-    if is_fp8:
+    if is_fp8 or fp8_kv_dequant:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
                 _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
@@ -492,7 +502,21 @@ def _flash_attn_fwd(
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
+    if fp8_kv_dequant and q_descale is None:
+        # fp16 Q has no q-scale, but materialize an identity (1.0) q_descale so the
+        # per-(batch, kv_head) DescaleTensors struct has all three fields present.
+        # The SM90 mma folds q*k into the score scale, so an identity q is a no-op there.
+        _ref_descale = k_descale if k_descale is not None else v_descale
+        q_descale = (
+            torch.ones_like(_ref_descale)
+            if _ref_descale is not None
+            else torch.ones((batch_size, num_head_kv), dtype=torch.float32, device=device)
+        )
+
     dtype = torch2cute_dtype_map[q.dtype]
+    kv_dtype = torch2cute_dtype_map[k.dtype] if fp8_kv_dequant else dtype
+    if fp8_kv_dequant:
+        assert arch // 10 == 9, "fp8_kv_dequant is an SM90-only forward (compute capability 9.x)"
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -532,6 +556,11 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if fp8_kv_dequant:
+        # Producer-side dequant uses a full-tile fp8 staging buffer; freeing sP via
+        # RS-mode PV keeps smem within budget at d=512 (~224 KB), and intra-WG
+        # overlap is preserved (the real fast path).
+        mma_pv_is_rs = True
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
@@ -745,6 +774,7 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         output_quant_key,
+        fp8_kv_dequant,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -860,6 +890,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
+                kv_dtype=kv_dtype, # K/V storage dtype 
+                fp8_kv_dequant=fp8_kv_dequant, # opt into the in-kernel fp8->fp16 dequant path
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -1035,6 +1067,12 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.insert(-3, descale_tensors_tensor)
+            elif arch // 10 == 9:
+                # SM90 always takes the descale slot (None unless fp8_kv_dequant) so
+                # the trailing positional args (output_scale, stream) stay aligned.
+                # Inserted before the output_scale insert below => __call__ order is
+                # (..., aux_tensors, descale_tensors, output_scale, stream).
+                compile_args.insert(-1, descale_tensors_tensor)
             # TODO: thread output_scale into the hd256 (BlackwellFusedMultiHeadAttentionForward)
             # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there
             # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
@@ -1052,6 +1090,11 @@ def _flash_attn_fwd(
             v_call = v_call.view(torch.uint8)
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
+        elif fp8_kv_dequant:
+            # FP8-KV dequant: Q is fp16 but K/V are fp8 e4m3 -- apply the same uint8
+            # FFI workaround to K/V only (the compiled kernel takes them as uint8).
+            k_call = k_call.view(torch.uint8)
+            v_call = v_call.view(torch.uint8)
         out_call = out.detach()
         if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             out_call = out_call.view(torch.uint8)
@@ -1110,6 +1153,10 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            # SM90 descale slot (mirrors the compile_args insert): after aux_tensors,
+            # before output_scale. None unless fp8_kv_dequant.
+            if arch // 10 == 9:
+                call_args.append(descale_tensors)
             # See the TODO above: hd256/MLA kernels don't take output_scale yet.
             if not use_dedicated_hd256_kernel:
                 call_args.append(output_scale)

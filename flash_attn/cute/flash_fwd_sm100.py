@@ -379,10 +379,6 @@ class FlashAttentionForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        # Per-request causal flag (int32, one entry per batch: 1=causal,
-        # 0=bidirectional). Same positional slot as the SM90 kernel so the
-        # shared interface positional arg list aligns across arches.
-        mDynamicCausal: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
@@ -755,7 +751,6 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
-            mDynamicCausal,
             mPageTable,
             tma_atom_Q,
             tma_atom_K,
@@ -816,7 +811,6 @@ class FlashAttentionForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
-        mDynamicCausal: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
@@ -1096,9 +1090,6 @@ class FlashAttentionForwardSm100:
         AttentionMaskCls = self._generate_attention_mask_cls(
             window_size_left, window_size_right
         )
-        # Stash the per-request causal flag so every warp method (load, mma,
-        # softmax, correction, epilogue) can read it via self.
-        self._mDynamicCausal = mDynamicCausal
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
 
@@ -1484,35 +1475,9 @@ class FlashAttentionForwardSm100:
             )
 
             if const_expr(not self.use_block_sparsity):
-                psc = (
-                    self._mDynamicCausal[batch_idx]
-                    if const_expr(self._mDynamicCausal is not None)
-                    else None
-                )
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
-                if const_expr(self._mDynamicCausal is not None):
-                    # Per-sequence causal: psc == 0 means this sequence is
-                    # processed bidirectionally. get_n_block_min_max may have
-                    # applied a causal upper bound (the kernel is compiled
-                    # causal) and, for split-KV, partitioned that range. For a
-                    # bidirectional sequence each split must instead own a
-                    # DISJOINT slice of the FULL key range. Recompute it here --
-                    # IDENTICALLY in every warp (load/mma/softmax/correction/
-                    # epilogue) -- so the pipeline block counts agree; a
-                    # mismatch deadlocks the kernel.
-                    if not psc:
-                        n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.n_block_size)
-                        if const_expr(self.is_split_kv):
-                            num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                            n_block_min = split_idx * num_n_blocks_per_split
-                            n_block_max = cutlass.min(
-                                n_block_min + num_n_blocks_per_split, n_block_max_full
-                            )
-                        else:
-                            n_block_min = Int32(0)
-                            n_block_max = n_block_max_full
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
@@ -1715,28 +1680,7 @@ class FlashAttentionForwardSm100:
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
-                psc = (
-                    self._mDynamicCausal[batch_idx]
-                    if const_expr(self._mDynamicCausal is not None)
-                    else None
-                )
-                n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, split_idx, num_splits
-                )
-                if const_expr(self._mDynamicCausal is not None):
-                    # Bidirectional (psc == 0) full-range widening; must match
-                    # the load warp exactly (see there) or the pipeline hangs.
-                    if not psc:
-                        n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.n_block_size)
-                        if const_expr(self.is_split_kv):
-                            num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                            n_block_min = split_idx * num_n_blocks_per_split
-                            n_block_max = cutlass.min(
-                                n_block_min + num_n_blocks_per_split, n_block_max_full
-                            )
-                        else:
-                            n_block_min = Int32(0)
-                            n_block_max = n_block_max_full
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
                 block_iter_count = n_block_max - n_block_min
                 if const_expr(not self.is_split_kv):
                     process_tile = True
@@ -2015,30 +1959,9 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
-            psc = (
-                self._mDynamicCausal[batch_idx]
-                if const_expr(self._mDynamicCausal is not None)
-                else None
-            )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            if const_expr(self._mDynamicCausal is not None):
-                # Bidirectional (psc == 0) full-range widening; must match
-                # the load warp exactly (see there) or the pipeline hangs.
-                if not psc:
-                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.n_block_size)
-                    if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                        n_block_min = split_idx * num_n_blocks_per_split
-                        n_block_max = cutlass.min(
-                            n_block_min + num_n_blocks_per_split, n_block_max_full
-                        )
-                    else:
-                        n_block_min = Int32(0)
-                        n_block_max = n_block_max_full
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
-            mask = AttentionMaskCls(seqlen, dynamic_causal=psc)
+            mask = AttentionMaskCls(seqlen)
             shared_mask_kwargs = dict(
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 thr_mma=thr_mma_qk,
@@ -2518,28 +2441,7 @@ class FlashAttentionForwardSm100:
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
-            psc = (
-                self._mDynamicCausal[batch_idx]
-                if const_expr(self._mDynamicCausal is not None)
-                else None
-            )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            if const_expr(self._mDynamicCausal is not None):
-                # Bidirectional (psc == 0) full-range widening; must match
-                # the load warp exactly (see there) or the pipeline hangs.
-                if not psc:
-                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.n_block_size)
-                    if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                        n_block_min = split_idx * num_n_blocks_per_split
-                        n_block_max = cutlass.min(
-                            n_block_min + num_n_blocks_per_split, n_block_max_full
-                        )
-                    else:
-                        n_block_min = Int32(0)
-                        n_block_max = n_block_max_full
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             if const_expr(self.is_split_kv):
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -2990,28 +2892,7 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            psc = (
-                self._mDynamicCausal[batch_idx]
-                if const_expr(self._mDynamicCausal is not None)
-                else None
-            )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            if const_expr(self._mDynamicCausal is not None):
-                # Bidirectional (psc == 0) full-range widening; must match
-                # the load warp exactly (see there) or the pipeline hangs.
-                if not psc:
-                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.n_block_size)
-                    if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
-                        n_block_min = split_idx * num_n_blocks_per_split
-                        n_block_max = cutlass.min(
-                            n_block_min + num_n_blocks_per_split, n_block_max_full
-                        )
-                    else:
-                        n_block_min = Int32(0)
-                        n_block_max = n_block_max_full
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
             has_work = const_expr(self.use_block_sparsity or not self.is_split_kv) or n_block_min < n_block_max
 
             if has_work:

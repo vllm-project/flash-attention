@@ -307,6 +307,7 @@ def _flash_attn_fwd(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    dynamic_causal: Optional[torch.Tensor] = None,
     softcap: Optional[float] = None,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
@@ -432,6 +433,8 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if dynamic_causal is not None:
+        assert arch // 10 == 9, "dynamic_causal is only supported on SM90 (Hopper)."
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
@@ -559,7 +562,12 @@ def _flash_attn_fwd(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
-    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
+    if local:
+        win_right = max_seqlen_k if window_size_right is None else window_size_right
+        win_left = max_seqlen_k if window_size_left is None else window_size_left
+        seqlen_k_loaded = max(0, min(max_seqlen_k, win_right + win_left + 1 + tile_m))
+    else:
+        seqlen_k_loaded = max_seqlen_k
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -758,6 +766,11 @@ def _flash_attn_fwd(
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale)
         ]
+        dynamic_causal_tensor = (
+            to_cute_tensor(dynamic_causal, assumed_align=4, leading_dim=0)
+            if dynamic_causal is not None
+            else None
+        )
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
             if page_table is not None
@@ -1002,6 +1015,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
+                dynamic_causal_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
                 window_size_left,
@@ -1022,6 +1036,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
+                dynamic_causal_tensor,
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
@@ -1074,6 +1089,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+                dynamic_causal,
                 gather_kv_indices,
                 page_table,
                 window_size_left,
@@ -1091,6 +1107,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+                dynamic_causal,
                 page_table,
                 window_size_left,
                 window_size_right,

@@ -261,10 +261,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             # FP8-KV dequant: Q/O are fp16 (self.dtype) but K/V are fp8 e4m3, which
             # the symmetric _check_type forbids. The interface already validated
-            # fp16 Q + fp8 e4m3 K/V; only re-assert the compute dtype here.
-            assert mQ.element_type == self.dtype and mO.element_type == self.dtype, (
-                "fp8_kv_dequant expects fp16 Q and O (compute dtype)"
-            )
+            # fp16 Q + fp8 e4m3 K/V; only re-assert the compute dtype here. Mirror
+            # _check_type's SplitKV handling for O: in SplitKV the kernel writes the
+            # fp32 partial accumulator (mO is Float32), combined to the final fp16 O
+            # by the combine kernel; otherwise O is the fp16 compute dtype.
+            assert mQ.element_type == self.dtype, "fp8_kv_dequant expects fp16 Q (compute dtype)"
+            if const_expr(self.is_split_kv):
+                assert mO.element_type == Float32, (
+                    "fp8_kv_dequant SplitKV expects Float32 O (partial accumulator)"
+                )
+            else:
+                assert mO.element_type == self.dtype, (
+                    "fp8_kv_dequant expects fp16 O (compute dtype)"
+                )
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 

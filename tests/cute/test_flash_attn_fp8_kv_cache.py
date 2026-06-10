@@ -62,6 +62,7 @@ def _cute_dequant_paged_attention(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     softmax_scale: float = GEMMA4_SOFTMAX_SCALE,
+    num_splits: int = 1,
 ) -> torch.Tensor:
     """Run the SM90 fp16-Q + fp8-KV-cache dequant forward (fp16 Q + fp8 paged K/V -> fp16 O).
 
@@ -94,6 +95,7 @@ def _cute_dequant_paged_attention(
         max_seqlen_q=max(query_lens),
         max_seqlen_k=max(kv_lens),
         page_table=page_table,
+        num_splits=num_splits,
         fp8_kv_dequant=True,
     )
     if isinstance(out, (tuple, list)):
@@ -558,6 +560,88 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     )
     torch.testing.assert_close(
         cute_output, triton_output, atol=FP8_KV_ATOL, rtol=FP8_KV_RTOL, check_dtype=False
+    )
+
+
+# SplitKV bar for the dequant kernel vs its own num_splits=1 output. SplitKV is a
+# reduction reordering of the SAME math (the combine kernel merges the fp32 partials),
+# so the two should agree far tighter than the FP8 oracle bar -- but the partials are
+# stored/combined in fp32 and the non-split path accumulates in-register, so allow a
+# small fp32-combine slack rather than near-exact.
+SPLITKV_SELF_ATOL = SPLITKV_SELF_RTOL = 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference():
+    """SplitKV variant of the fp16-Q + fp8-KV dequant forward.
+
+    Forces num_splits=2 on the long-KV decode case (gemma4_offline_lockstep_decode,
+    kv~=28000 -> enough n-blocks to actually split). This exercises the SplitKV path
+    on the dequant kernel, which writes the fp32 partial accumulator (mO is Float32)
+    that the combine kernel merges to the final fp16 O -- the path the hardcoded
+    `assert mO.element_type == self.dtype` previously made impossible to compile.
+
+    Gates:
+      (a) the SplitKV output is finite;
+      (b) it matches the SAME fp32 reference at the SAME FP8 bar (FP8_KV_*) as the
+          non-split test;
+      (c) it is close to the num_splits=1 cute output (SplitKV is just a reduction
+          reordering of identical math).
+    """
+    if _cute_flash_attn_fwd is None:
+        pytest.skip("FA4 CuTe interface is not importable in this environment")
+
+    # Long-KV decode case forces multiple n-blocks per sequence so num_splits=2 splits.
+    attention_case = next(
+        c for c in ATTENTION_CASES if c.id == "gemma4_offline_lockstep_decode"
+    )
+    scale_case = SCALE_CASES[0]  # default unity scales (matches the non-split smoke)
+
+    ins = _build_case_inputs(attention_case, scale_case)
+    query_lens = ins["query_lens"]
+    kv_lens = ins["kv_lens"]
+    k_scale, v_scale = ins["k_scale"], ins["v_scale"]
+    q16 = ins["query"].half()
+    q_scale_one = torch.tensor(1.0, device=ins["query"].device, dtype=torch.float32)
+
+    # fp32 reference (same builder as the non-split test).
+    reference_output = _reference_paged_fp8_attention(
+        q16, ins["key_dense_fp8"], ins["value_dense_fp8"],
+        query_lens, kv_lens, q_scale_one, k_scale, v_scale,
+    )
+
+    # The dequant kernel with num_splits=2 (the previously-impossible SplitKV path)
+    # and its num_splits=1 counterpart on identical inputs.
+    cute_split = _cute_dequant_paged_attention(
+        q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
+        query_lens, kv_lens, ins["page_table"], k_scale, v_scale, num_splits=2,
+    )
+    cute_nosplit = _cute_dequant_paged_attention(
+        q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
+        query_lens, kv_lens, ins["page_table"], k_scale, v_scale, num_splits=1,
+    )
+
+    sr = _divergence(cute_split, reference_output)
+    ss = _divergence(cute_split, cute_nosplit)
+    warnings.warn(
+        f"[fp8-kv splitkv {attention_case.id}/{scale_case.id}] divergence "
+        f"(FP8 bar atol=rtol={FP8_KV_ATOL}, self bar atol=rtol={SPLITKV_SELF_ATOL}):\n"
+        f"    SplitKV vs Reference     [GATED]: max_abs={sr[0]:.4f} max_rel={sr[1]:.3f} mean_abs={sr[2]:.4f}\n"
+        f"    SplitKV vs num_splits=1  [GATED]: max_abs={ss[0]:.4f} max_rel={ss[1]:.3f} mean_abs={ss[2]:.4f}",
+        stacklevel=2,
+    )
+
+    # (a) finite.
+    assert torch.isfinite(cute_split.float()).all(), "non-finite values in SplitKV output"
+    # (b) matches the fp32 reference at the SAME existing FP8 bar.
+    torch.testing.assert_close(
+        cute_split, reference_output, atol=FP8_KV_ATOL, rtol=FP8_KV_RTOL, check_dtype=False
+    )
+    # (c) close to the num_splits=1 cute output (same math, reduction reordered).
+    torch.testing.assert_close(
+        cute_split, cute_nosplit, atol=SPLITKV_SELF_ATOL, rtol=SPLITKV_SELF_RTOL,
+        check_dtype=False,
     )
 
 

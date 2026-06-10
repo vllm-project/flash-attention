@@ -561,6 +561,12 @@ def _flash_attn_fwd(
         # RS-mode PV keeps smem within budget at d=512 (~224 KB), and intra-WG
         # overlap is preserved (the real fast path).
         mma_pv_is_rs = True
+        # GUARD: the SM90 fp8-KV-dequant producer is TMA-only (no cp.async fallback).A paged page_size != tile_n therefore
+        # gives use_tma_KV=False -> a None TMA atom -> a clear error.
+        assert page_size == tile_n, (
+            f"FA4 SM90 fp8-KV-dequant requires the paged-KV page_size == tile_n ({tile_n}); "
+            f"got page_size={page_size}. "
+        )
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:

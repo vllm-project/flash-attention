@@ -840,8 +840,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # dequants in lockstep over the single staging buffer: K[max-1]
             # prologue, then per loop iter K[n] then V[n_prev], then V[min]
             # epilogue (one staging slot => producer/consumer ping-pong). Assumes
-            # the supported TMA paged config (page_size == tile_n => use_tma_KV)
-            # the interface enforces for this path.
+            # the supported TMA paged config (page_size == tile_n => use_tma_KV),
+            # which the interface ENFORCES via the `assert page_size == tile_n` guard
+            # in the fp8_kv_dequant branch of interface.py (so a wrong page_size fails
+            # there with a clear message instead of a None-TMA-atom crash here).
             stage_full_bar = pipeline_stage.sync_object_full.get_barrier(0)
             # Unique names (q_prod_phase_fp8 / tile_scheduler_fp8 / work_tile_fp8) so
             # the symmetric producer's loop-carried q_producer_phase/tile_scheduler/

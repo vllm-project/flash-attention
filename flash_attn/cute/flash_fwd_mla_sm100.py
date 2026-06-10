@@ -361,6 +361,7 @@ class FlashAttentionMLAForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
         mSeqUsedQ: Optional[cute.Tensor] = None,  # (b)
         mSeqUsedK: Optional[cute.Tensor] = None,  # (b)
+        mDynamicCausal: Optional[cute.Tensor] = None,
         mIndexTopk: Optional[
             cute.Tensor
         ] = None,  # (b, s_q, topk) or (total_q, topk) if there is cu_seqlens_q

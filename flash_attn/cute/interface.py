@@ -712,6 +712,7 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         causal,
+        dynamic_causal is not None,
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,

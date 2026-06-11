@@ -161,8 +161,16 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), \
-            "Only SM 10.x and 11.x are supported"
+        # Arch.is_family_of requires suffix in ["a","f"], but the runtime arch
+        # reported by get_arch_enum() has no suffix (e.g. sm_103, not sm_103f).
+        # Fall back to a major-version check so GB300 (sm_103) is accepted.
+        _is_sm10x_or_11x = (
+            self.arch.is_family_of(Arch.sm_100f)
+            or self.arch.is_family_of(Arch.sm_110f)
+            or self.arch.major in (10, 11)
+        )
+        assert _is_sm10x_or_11x, \
+            f"Only SM 10.x and 11.x are supported, got {self.arch}"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -199,7 +207,7 @@ class FlashAttentionForwardSm100:
         # The flag gates ex2 emulation; sm_103 (B300) has fast hardware ex2 and later
         # Blackwell variants are assumed to inherit this, so forward-inclusion is correct
         # despite the literal `is_sm103` name.
-        is_sm103 = self.arch.is_family_of(Arch.sm_103f)
+        is_sm103 = self.arch.is_family_of(Arch.sm_103f) or (self.arch.major == 10 and self.arch.minor >= 3)
         self.is_sm103 = is_sm103
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103

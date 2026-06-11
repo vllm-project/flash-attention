@@ -69,9 +69,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
-        # FP8-KV in-place dequant: K/V are stored fp8 (kv_dtype) in HBM and
-        # dequantized to the fp16 compute dtype (self.dtype) by the consumer MMA
-        # warpgroups before each MMA reads them. self.dtype == compute == O dtype (fp16).
+        # FP8-KV in-kernel dequant path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
         self.fp8_kv_dequant = fp8_kv_dequant
         self.kv_dtype = kv_dtype if kv_dtype is not None else self.dtype
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -150,10 +148,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
         if const_expr(self.fp8_kv_dequant):
-            # FP8-KV in-place dequant: one fp8 staging buffer (sStage) fed by TMA
-            # and dequantized by the consumer MMA warpgroups into the fp16 sK/sV
-            # buffers (above, already self.dtype == fp16). Its own num_stages=1 TMA
-            # pipeline (full + empty = 2 mbarriers) gates HBM->sStage. RS PV => no sP.
+            # sStage: the fp8 staging buffer; its num_stages=1 TMA pipeline gates GMEM->sStage.
             sStage_struct = cute.struct.Align[
                 cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sStage_layout)],
                 self.buffer_align_bytes,
@@ -213,7 +208,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        # FP8-KV dequant: per-(batch, kv_head) f32 q/k/v descales 
+        # FP8-KV: per-(batch, kv_head) f32 q/k/v descales (any may be None).
         descale_tensors=None,
         output_scale: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -234,8 +229,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 is_split_kv=self.is_split_kv,
             )
         else:
-            # FP8-KV dequant: Q/O are fp16 (self.dtype) but K/V are fp8 e4m3, 
-            # Use a separate branch to avoid contaminate _check_type.
+            # FP8-KV: Q/O are fp16 but K/V are fp8, which the symmetric _check_type rejects.
             assert mQ.element_type == self.dtype, "fp8_kv_dequant expects fp16 Q (compute dtype)"
             if const_expr(self.is_split_kv):
                 assert mO.element_type == Float32, (
@@ -299,10 +293,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
-        # FP8-KV dequant: the MMA reads sK/sV as the fp16 compute dtype (self.dtype),
-        # NOT mK/mV.element_type (fp8). The fp8 bytes land in the separate sStage
-        # buffer; the consumer MMA warpgroups dequantize sStage -> fp16 sK/sV before
-        # each MMA.
+        # FP8-KV: sK/sV use the fp16 compute dtype (the dequant target), not mK/mV's fp8.
         kv_layout_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, stage)
@@ -314,11 +305,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (mQ.element_type, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
-        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves
-        # K and V). A singleton stage (stage=1) lets the TMA copy fn be built once
-        # and indexed by (src_idx=page, dst_idx=0) inside the producer loop -- the
-        # symmetric path's pattern -- instead of rebuilding a per-page copy fn in
-        # the dynamic loop (which the DSL cannot loop-carry). cosize is unchanged.
+        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V). 
         self.sStage_layout = None
         if const_expr(self.fp8_kv_dequant):
             self.sStage_layout = sm90_utils.make_smem_layout(
@@ -368,10 +355,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
         if const_expr(self.use_tma_KV):
-            # FP8-KV dequant: TMA targets the fp8 sStage box (not the fp16 sK/sV
-            # buffers), so the bytes from HBM land in sStage; the producer then
-            # dequantizes into sK/sV. sStage_layout is the (tile_n, tile_hdim) fp8
-            # tile and serves both K and V (tile_hdim == tile_hdimv).
+            # FP8-KV: K and V from GMEM land in sStage for the consumer to dequant(instead of sK/sV)
             sK_tma_box = cute.select(
                 self.sStage_layout if const_expr(self.fp8_kv_dequant) else self.sK_layout,
                 mode=[0, 1],
@@ -582,18 +566,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         pipeline_stage = None
         if const_expr(self.fp8_kv_dequant):
-            # FP8-KV CONSUMER-side dequant: the producer only TMAs fp8 K/V tiles
-            # HBM -> the single fp8 staging buffer (sStage). The 256 MMA consumer
-            # threads then dequantize sStage -> the consumer-private fp16 sK/sV
-            # right before each WGMMA, ordered by NamedBarrierFwd.Dequant* (K is a
-            # cooperative 256-thread pass; V is per-warpgroup). So there is no
-            # producer-armed fp16 K/V pipeline -- only the staging pipeline.
             pipeline_k = None
             pipeline_v = None
-            # Staging TMA pipeline: warp 0 issues fp8 HBM->sStage; the 256 MMA
-            # threads (8 warps) consume it. consumer_group is sized in WARPS (8)
-            # because PipelineTmaAsync.consumer_release signals lane0-per-warp
-            # (is_signalling_thread), so 8 arrives match arrive_count == 8.
             pipeline_stage = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_Stage.data_ptr(),
                 num_stages=1,
@@ -658,7 +632,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-        # FP8-KV dequant: the fp8 staging buffer (TMA dst, dequant src).
+        # fp8 staging buffer (TMA dst, dequant src).
         sStage = None
         if const_expr(self.fp8_kv_dequant):
             sStage = storage.sStage.get_tensor(
@@ -762,9 +736,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 aux_tensors,
                 fastdiv_mods,
                 num_splits,
-                # FP8-KV consumer-side dequant: the consumer needs the fp8 staging
-                # buffer (sStage), the (non-transposed) fp16 sV write target, and the
-                # staging pipeline to wait/release. None for the symmetric path.
+                # FP8-KV dequant inputs (sV/sStage/pipeline_stage; None otherwise).
                 sV=sV if const_expr(self.fp8_kv_dequant) else None,
                 sStage=sStage,
                 pipeline_stage=pipeline_stage,
@@ -791,10 +763,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         TileSchedulerCls: Callable,
         num_splits: Int32 = Int32(1),
     ):
-        """FP8-KV producer: warp 0 TMAs fp8 K/V tiles HBM -> the single fp8 staging
-        buffer (sStage) and arms the staging pipeline; the consumer MMA warpgroups
-        dequant sStage -> fp16 sK/sV before each WGMMA (see mma()/*_fp8). 
-        TMA-only (page_size == tile_n, enforced in interface.py) for now."""
+        """FP8-KV producer: warp 0 TMAs fp8 K/V tiles from GMEM -> the single staging buffer
+        sStage, staggered to match the consumer's intra-WG overlap."""
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
         stage_full_bar = pipeline_stage.sync_object_full.get_barrier(0)
@@ -1231,10 +1201,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_tensors: Optional[list],
         fastdiv_mods=None,
         num_splits: Int32 = Int32(1),
-        # FP8-KV consumer-side dequant: sV is the (non-transposed) fp16 V write
-        # target, sStage the fp8 staging buffer (TMA dst / dequant src), and
-        # pipeline_stage the staging pipeline the consumer waits/releases. All
-        # None on the symmetric (bf16/fp16) path.
+        # FP8-KV dequant inputs (None on the non-fp8 path): sV (fp16 V write target),
+        # sStage, pipeline_stage.
         sV: Optional[cute.Tensor] = None,
         sStage: Optional[cute.Tensor] = None,
         pipeline_stage: Optional[pipeline.PipelineAsync] = None,

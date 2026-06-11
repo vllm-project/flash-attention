@@ -566,6 +566,11 @@ def _flash_attn_fwd(
             f"FA4 SM90 fp8-KV-dequant requires the paged-KV page_size == tile_n ({tile_n}); "
             f"got page_size={page_size}. "
         )
+        # Currently in this path we use one sStage buffer for both K and V, it needs more changes if head_dim != head_dim_v.
+        assert head_dim == head_dim_v, (
+            f"FA4 SM90 fp8-KV-dequant requires head_dim == head_dim_v (one staging buffer "
+            f"serves K and V); got head_dim={head_dim}, head_dim_v={head_dim_v}."
+        )
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:

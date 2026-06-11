@@ -503,9 +503,8 @@ def _flash_attn_fwd(
         )
 
     if fp8_kv_dequant and q_descale is None:
-        # fp16 Q has no q-scale, but materialize an identity (1.0) q_descale so the
-        # per-(batch, kv_head) DescaleTensors struct has all three fields present.
-        # The SM90 mma folds q*k into the score scale, so an identity q is a no-op there.
+        # fp16 Q has no q-scale; materialize an identity (1.0) q_descale so the
+        # DescaleTensors struct has all three fields present (identity q is a no-op).
         _ref_descale = k_descale if k_descale is not None else v_descale
         q_descale = (
             torch.ones_like(_ref_descale)
@@ -557,12 +556,12 @@ def _flash_attn_fwd(
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
     if fp8_kv_dequant:
-        # Producer-side dequant uses a full-tile fp8 staging buffer; freeing sP via
-        # RS-mode PV keeps smem within budget at d=512 (~224 KB), and intra-WG
-        # overlap is preserved (the real fast path).
+        # Force RS-mode PV: frees sP for the fp8 staging buffer, keeping smem within
+        # budget at d=512 while preserving intra-WG overlap.
         mma_pv_is_rs = True
-        # GUARD: the SM90 fp8-KV-dequant producer is TMA-only (no cp.async fallback).A paged page_size != tile_n therefore
-        # gives use_tma_KV=False -> a None TMA atom -> a clear error.
+        # The SM90 fp8-KV-dequant producer is TMA-only (no cp.async fallback): a paged
+        # page_size != tile_n gives use_tma_KV=False -> a None TMA atom. Assert here so
+        # it fails with a clear message instead of crashing later.
         assert page_size == tile_n, (
             f"FA4 SM90 fp8-KV-dequant requires the paged-KV page_size == tile_n ({tile_n}); "
             f"got page_size={page_size}. "
@@ -896,8 +895,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
-                kv_dtype=kv_dtype, # K/V storage dtype 
-                fp8_kv_dequant=fp8_kv_dequant, # opt into the in-kernel fp8->fp16 dequant path
+                kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
+                fp8_kv_dequant=fp8_kv_dequant,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -1074,10 +1073,8 @@ def _flash_attn_fwd(
             if arch // 10 in [10, 11]:
                 compile_args.insert(-3, descale_tensors_tensor)
             elif arch // 10 == 9:
-                # SM90 always takes the descale slot (None unless fp8_kv_dequant) so
-                # the trailing positional args (output_scale, stream) stay aligned.
-                # Inserted before the output_scale insert below => __call__ order is
-                # (..., aux_tensors, descale_tensors, output_scale, stream).
+                # SM90 always takes the descale slot (None unless fp8_kv_dequant), kept
+                # before the output_scale insert so the trailing positional args align.
                 compile_args.insert(-1, descale_tensors_tensor)
             # TODO: thread output_scale into the hd256 (BlackwellFusedMultiHeadAttentionForward)
             # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there

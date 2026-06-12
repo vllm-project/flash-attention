@@ -801,8 +801,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mV_cur = mV[None, None, head_idx_kv, None]
             gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
             gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
-            # Staging TMA copy fns into the (single-stage) fp8 sStage, built once per
-            # tile; called with src_idx=page, dst_idx=0 in the loop below.
+
             stage_copy_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), gK, sStage
             )
@@ -1245,7 +1244,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
 
-        # FP8-KV consumer-side dequant setup: 
+        # FP8-KV MMA WGs side dequant setup: 
         # K: cooperative 256-thread(2 WGs) copy of the full tile; 
         # V: each WG copies only its own hdimv-half. 
         dequant_params = None

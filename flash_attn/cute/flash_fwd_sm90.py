@@ -293,14 +293,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
-        # FP8-KV: sK/sV use the fp16 compute dtype (the dequant target), not mK/mV's fp8.
-        kv_layout_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
+        # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
+        # dequant target (self.dtype), not mK/mV's fp8 source.
+        sK_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
+        sV_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mV.element_type
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, stage)
             for dtype, shape, stage in [
                 (mQ.element_type, (self.tile_m, self.tile_hdim), None),
-                (kv_layout_dtype, (self.tile_n, self.tile_hdim), self.num_stages),
-                (kv_layout_dtype, (self.tile_n, self.tile_hdimv), self.num_stages),
+                (sK_dtype, (self.tile_n, self.tile_hdim), self.num_stages),
+                (sV_dtype, (self.tile_n, self.tile_hdimv), self.num_stages),
                 # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
                 (mQ.element_type, (self.tile_m, self.tile_hdimv), None),
             ]
@@ -781,7 +783,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
 
-            # Q stays fp16 (no dequant); load it via TMA like the symmetric path.
+            # Q stays fp16 (no dequant)
             load_Q = None
             pack_gqa = None
             if const_expr(self.use_tma_Q):

@@ -56,6 +56,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         is_split_kv: bool = False,
+        kv_dtype=None,
+        fp8_kv_dequant: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -67,6 +69,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
+        # FP8-KV in-kernel dequant path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
+        self.fp8_kv_dequant = fp8_kv_dequant
+        self.kv_dtype = kv_dtype if kv_dtype is not None else self.dtype
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
@@ -142,6 +147,27 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
+        if const_expr(self.fp8_kv_dequant):
+            # sStage: the fp8 staging buffer; its num_stages=1 TMA pipeline gates GMEM->sStage.
+            sStage_struct = cute.struct.Align[
+                cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sStage_layout)],
+                self.buffer_align_bytes,
+            ]
+            mbar_ptr_Stage_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
+
+            @cute.struct
+            class SharedStorageQKVDequant:
+                mbar_ptr_Q: mbar_ptr_Q_struct
+                mbar_ptr_K: mbar_ptr_K_struct
+                mbar_ptr_V: mbar_ptr_V_struct
+                mbar_ptr_Stage: mbar_ptr_Stage_struct
+                sV: sV_struct
+                sQ: sQ_struct
+                sK: sK_struct
+                sStage: sStage_struct
+
+            return SharedStorageQKVDequant
+
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: mbar_ptr_Q_struct
@@ -182,22 +208,37 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # FP8-KV: per-(batch, kv_head) f32 q/k/v descales (any may be None).
+        descale_tensors=None,
         output_scale: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         """Configures and launches the flash attention kernel.
 
-        mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
+        mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout
+        (except the fp8-KV dequant path: fp16 Q + fp8 e4m3 K/V -> fp16 O):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        self._check_type(
-            *(
-                t.element_type if t is not None else None
-                for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
-            ),
-            is_split_kv=self.is_split_kv,
-        )
+        if const_expr(not self.fp8_kv_dequant):
+            self._check_type(
+                *(
+                    t.element_type if t is not None else None
+                    for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+                ),
+                is_split_kv=self.is_split_kv,
+            )
+        else:
+            # FP8-KV: Q/O are fp16 but K/V are fp8, which the symmetric _check_type rejects.
+            assert mQ.element_type == self.dtype, "fp8_kv_dequant expects fp16 Q (compute dtype)"
+            if const_expr(self.is_split_kv):
+                assert mO.element_type == Float32, (
+                    "fp8_kv_dequant SplitKV expects Float32 O (partial accumulator)"
+                )
+            else:
+                assert mO.element_type == self.dtype, (
+                    "fp8_kv_dequant expects fp16 O (compute dtype)"
+                )
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
@@ -252,16 +293,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
+        # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
+        # dequant target (self.dtype), not mK/mV's fp8 source.
+        sK_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
+        sV_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mV.element_type
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
-            sm90_utils.make_smem_layout(mX.element_type, LayoutEnum.ROW_MAJOR, shape, stage)
-            for mX, shape, stage in [
-                (mQ, (self.tile_m, self.tile_hdim), None),
-                (mK, (self.tile_n, self.tile_hdim), self.num_stages),
-                (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
+            sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, stage)
+            for dtype, shape, stage in [
+                (mQ.element_type, (self.tile_m, self.tile_hdim), None),
+                (sK_dtype, (self.tile_n, self.tile_hdim), self.num_stages),
+                (sV_dtype, (self.tile_n, self.tile_hdimv), self.num_stages),
                 # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
-                (mQ, (self.tile_m, self.tile_hdimv), None),
+                (mQ.element_type, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
+        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V). 
+        self.sStage_layout = None
+        if const_expr(self.fp8_kv_dequant):
+            self.sStage_layout = sm90_utils.make_smem_layout(
+                self.kv_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdim), 1
+            )
         self.sP_layout = None
         if const_expr(not self.mma_pv_is_rs):
             self.sP_layout = sm90_utils.make_smem_layout(
@@ -306,17 +357,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
         if const_expr(self.use_tma_KV):
+            # FP8-KV: K and V from GMEM land in sStage for the consumer to dequant(instead of sK/sV)
+            sK_tma_box = cute.select(
+                self.sStage_layout if const_expr(self.fp8_kv_dequant) else self.sK_layout,
+                mode=[0, 1],
+            )
+            sV_tma_box = cute.select(
+                self.sStage_layout if const_expr(self.fp8_kv_dequant) else self.sV_layout,
+                mode=[0, 1],
+            )
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
+                sK_tma_box,
                 (self.tile_n, self.tile_hdim),
                 1,  # No mcast for now
             )
             tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mV,
-                cute.select(self.sV_layout, mode=[0, 1]),
+                sV_tma_box,
                 (self.tile_n, self.tile_hdimv),
                 1,  # No mcast for now
             )
@@ -402,6 +462,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
+            self.sStage_layout,
             self.gmem_tiled_copy_Q,
             self.gmem_tiled_copy_K,
             self.gmem_tiled_copy_V,
@@ -415,6 +476,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             aux_tensors,
             fastdiv_mods,
             output_scale,
+            descale_tensors,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -450,6 +512,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
+        sStage_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_K: cute.TiledCopy,
         gmem_tiled_copy_V: cute.TiledCopy,
@@ -463,6 +526,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
         output_scale: Optional[cute.Tensor] = None,
+        descale_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -480,6 +544,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = ThreadCooperativeGroup(1)
         load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
+        load_warps = ThreadCooperativeGroup(self.num_threads_per_warp_group // cute.arch.WARP_SIZE)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
         if const_expr(self.use_tma_Q):
             pipeline_q = pipeline_custom.PipelineTmaAsync.create(
@@ -501,7 +566,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 syncwarp_before_release=False,
             )
 
-        if const_expr(self.use_tma_KV):
+        pipeline_stage = None
+        if const_expr(self.fp8_kv_dequant):
+            pipeline_k = None
+            pipeline_v = None
+            pipeline_stage = pipeline_custom.PipelineTmaAsync.create(
+                barrier_storage=storage.mbar_ptr_Stage.data_ptr(),
+                num_stages=1,
+                producer_group=tma_warp,
+                consumer_group=mma_warps,
+                tx_count=self.tma_copy_bytes["K"],
+                defer_sync=True,
+            )
+        elif const_expr(self.use_tma_KV):
             pipeline_k = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
@@ -557,6 +634,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+        # fp8 staging buffer (TMA dst, dequant src).
+        sStage = None
+        if const_expr(self.fp8_kv_dequant):
+            sStage = storage.sStage.get_tensor(
+                sStage_layout.outer, swizzle=sStage_layout.inner
+            )
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
 
@@ -617,6 +700,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 num_splits,
+                sStage,
+                pipeline_stage,
             )
 
         else:  # Consumer
@@ -653,7 +738,128 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 aux_tensors,
                 fastdiv_mods,
                 num_splits,
+                # FP8-KV dequant inputs (sV/sStage/pipeline_stage; None otherwise).
+                sV=sV if const_expr(self.fp8_kv_dequant) else None,
+                sStage=sStage,
+                pipeline_stage=pipeline_stage,
+                descale_tensors=descale_tensors,
             )
+
+    @cute.jit
+    def load_fp8(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        sQ: cute.Tensor,
+        sStage: cute.Tensor,
+        tma_atom_Q: Optional[cute.CopyAtom],
+        tma_atom_K: Optional[cute.CopyAtom],
+        tma_atom_V: Optional[cute.CopyAtom],
+        pipeline_q: pipeline.PipelineAsync,
+        pipeline_stage: pipeline.PipelineAsync,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        mPageTable: Optional[cute.Tensor],
+        block_info: BlockInfo,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+        num_splits: Int32 = Int32(1),
+    ):
+        """FP8-KV producer: warp 0 TMAs fp8 K/V tiles from GMEM -> the single staging buffer
+        sStage, staggered to match the consumer's intra-WG overlap."""
+        warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        tidx, _, _ = cute.arch.thread_idx()
+        stage_full_bar = pipeline_stage.sync_object_full.get_barrier(0)
+        q_producer_phase = Int32(1)
+        # Staging producer phase (num_stages=1): toggles once per staged tile.
+        stage_producer_phase = Int32(1)
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            head_idx_kv = (
+                head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            )
+
+            # Q stays fp16 (no dequant)
+            load_Q = None
+            pack_gqa = None
+            if const_expr(self.use_tma_Q):
+                gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+                load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
+                )
+            else:
+                pack_gqa = PackGQA(
+                    self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                )
+
+            # Paged TMA tiles, keeping the page dimension indexable (page_idx).
+            mK_cur = mK[None, None, head_idx_kv, None]
+            mV_cur = mV[None, None, head_idx_kv, None]
+            gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
+            gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
+
+            stage_copy_K, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_K, 0, cute.make_layout(1), gK, sStage
+            )
+            stage_copy_V, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_V, 0, cute.make_layout(1), gV, sStage
+            )
+
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, num_splits
+            )
+
+            # ---- Prologue emit: stage K[n_block_max - 1] (warp 0 only) ----
+            if warp_idx_in_wg == 0:
+                page_idx = mPageTable[batch_idx, n_block_max - 1]
+                pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
+                stage_copy_K(src_idx=page_idx, dst_idx=0, tma_bar_ptr=stage_full_bar)
+                stage_producer_phase ^= 1
+
+            # Q load (warp 0 for TMA, all 128 for pack_gqa cp.async).
+            if const_expr(self.use_tma_Q):
+                if warp_idx_in_wg == 0:
+                    pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                    load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                    q_producer_phase ^= 1
+            else:
+                pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
+                cute.arch.cp_async_commit_group()
+                pipeline_q.producer_commit_w_index(0)
+                q_producer_phase ^= 1
+
+            # ---- Mainloop + epilogue: stage K[n] then V[n_prev], then V[min]. All TMA
+            # staging is warp-0 only; the other producer warps just advance the tile
+            # scheduler in lockstep below. ----
+            if warp_idx_in_wg == 0:
+                for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                    n_block_prev = n_block_max - i - 1
+                    n_block = n_block_prev - 1
+                    page_idx = mPageTable[batch_idx, n_block]
+                    page_idx_prev = mPageTable[batch_idx, n_block_prev]
+                    # stage K[n]
+                    pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
+                    stage_copy_K(src_idx=page_idx, dst_idx=0, tma_bar_ptr=stage_full_bar)
+                    stage_producer_phase ^= 1
+                    # stage V[n_prev]
+                    pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
+                    stage_copy_V(src_idx=page_idx_prev, dst_idx=0, tma_bar_ptr=stage_full_bar)
+                    stage_producer_phase ^= 1
+
+                # ---- Epilogue emit: stage V[n_block_min] ----
+                page_idx = mPageTable[batch_idx, n_block_min]
+                pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
+                stage_copy_V(src_idx=page_idx, dst_idx=0, tma_bar_ptr=stage_full_bar)
+                stage_producer_phase ^= 1
+
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
     def load(
@@ -677,9 +883,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         num_splits: Int32 = Int32(1),
+        sStage: Optional[cute.Tensor] = None,
+        pipeline_stage: Optional[pipeline.PipelineAsync] = None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
+
+        if const_expr(self.fp8_kv_dequant):
+            # fp8_kv_dequant path uses different load logic, separate from the non-fp8 path.
+            self.load_fp8(
+                mQ, mK, mV, sQ, sStage,
+                tma_atom_Q, tma_atom_K, tma_atom_V,
+                pipeline_q, pipeline_stage, gmem_tiled_copy_Q, mPageTable,
+                block_info, SeqlenInfoCls, TileSchedulerCls, num_splits,
+            )
+            return
 
         # TMA: only warp 0 loads. cp_async: all warps load.
         # When not use_tma_Q, all 128 producer threads participate in Q loading.
@@ -984,6 +1202,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_tensors: Optional[list],
         fastdiv_mods=None,
         num_splits: Int32 = Int32(1),
+        # FP8-KV dequant inputs (None on the non-fp8 path): sV (fp16 V write target),
+        # sStage, pipeline_stage.
+        sV: Optional[cute.Tensor] = None,
+        sStage: Optional[cute.Tensor] = None,
+        pipeline_stage: Optional[pipeline.PipelineAsync] = None,
+        descale_tensors=None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1020,6 +1244,36 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
 
+        # FP8-KV MMA WGs side dequant setup: 
+        # K: cooperative 256-thread(2 WGs) copy of the full tile; 
+        # V: each WG copies only its own hdimv-half. 
+        dequant_params = None
+        if const_expr(self.fp8_kv_dequant):
+            sStage2 = sStage[None, None, 0]
+            sK2 = sK[None, None, 0]
+            sV2 = sV[None, None, 0]
+            half = const_expr(min(256, self.tile_hdimv))
+            VEC = const_expr(8)  # 8 fp16 == 128-bit store; 8 fp8 == 64-bit load
+            tiled_copy_K = copy_utils.tiled_copy_2d(
+                self.dtype, self.tile_hdim // VEC, self.num_mma_threads, num_copy_elems=VEC
+            )
+            tiled_copy_V = copy_utils.tiled_copy_2d(
+                self.dtype, half // VEC, self.num_threads_per_warp_group, num_copy_elems=VEC
+            )
+            thr_copy_K = tiled_copy_K.get_slice(tidx)
+            thr_copy_V = tiled_copy_V.get_slice(tidx % self.num_threads_per_warp_group)
+            # WG-local hdimv-half sub-views (tile coord (0, warp_group_idx)).
+            gStage_V = cute.local_tile(sStage2, (self.tile_n, half), (0, warp_group_idx))
+            gV = cute.local_tile(sV2, (self.tile_n, half), (0, warp_group_idx))
+            dequant_params = SimpleNamespace(
+                pipeline_stage=pipeline_stage,
+                warp_group_idx=warp_group_idx,
+                tStage_K=thr_copy_K.partition_S(sStage2),
+                tsK=thr_copy_K.partition_D(sK2),
+                tStage_V=thr_copy_V.partition_S(gStage_V),
+                tsV=thr_copy_V.partition_D(gV),
+            )
+
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         softmax = Softmax.create(
@@ -1033,10 +1287,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             scores_scale = cute.make_rmem_tensor_like(softmax.row_max, Float32)
 
+        # FP8-KV uses separate *_fp8 consumer functions (selected via const_expr) so the
+        # generic functions stay unchanged.
         mma_one_n_block_all = partial(
-            self.mma_one_n_block_intrawg_overlap
-            if const_expr(self.intra_wg_overlap)
-            else self.mma_one_n_block,
+            self.mma_one_n_block_intrawg_overlap_fp8
+            if const_expr(self.fp8_kv_dequant)
+            else (
+                self.mma_one_n_block_intrawg_overlap
+                if const_expr(self.intra_wg_overlap)
+                else self.mma_one_n_block
+            ),
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
@@ -1045,10 +1305,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_copy_params=smem_copy_params,
             check_inf=True,
             scores_scale=scores_scale,
+            **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
         )
 
         process_first_half_block = partial(
-            self.first_half_block_overlap,
+            self.first_half_block_overlap_fp8
+            if const_expr(self.fp8_kv_dequant)
+            else self.first_half_block_overlap,
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
             tOrP=tOrP,
@@ -1056,14 +1319,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
+            **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
         )
         process_last_half_block = partial(
-            self.last_half_block_overlap,
+            self.last_half_block_overlap_fp8
+            if const_expr(self.fp8_kv_dequant)
+            else self.last_half_block_overlap,
             pipeline_v=pipeline_v,
             mma_pv_fn=mma_pv_fn,
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
+            **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
         )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
@@ -1071,6 +1338,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # shape: (atom_v_m * rest_m)
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+
+            # FP8-KV per-(batch, kv_head) descales, folded into the dequant cast (fp8
+            # only): q*k scales K, v scales V; see mma_one_n_block_intrawg_overlap_fp8.
+            if const_expr(self.fp8_kv_dequant):
+                head_idx_kv = (
+                    head_idx // self.qhead_per_kvhead
+                    if const_expr(not self.pack_gqa)
+                    else head_idx
+                )
+                qk_descale, v_descale_tile = self._load_effective_descales(
+                    descale_tensors, batch_idx, head_idx_kv
+                )
 
             # Recompute fastdiv_mods if necessary for varlen with aux_tensors
             recompute_fastdiv_mods_q = cutlass.const_expr(
@@ -1115,7 +1394,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     fastdiv_mods=fastdiv_mods,
                 )
             mma_one_n_block = partial(
-                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
+                mma_one_n_block_all,
+                seqlen=seqlen,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
+                **(
+                    dict(qk_descale=qk_descale, v_descale_tile=v_descale_tile)
+                    if const_expr(self.fp8_kv_dequant)
+                    else {}
+                ),
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
@@ -1145,6 +1432,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
                         is_first_block=True,
+                        **(
+                            dict(qk_descale=qk_descale)
+                            if const_expr(self.fp8_kv_dequant)
+                            else {}
+                        ),
                     )
                 else:
                     self.warp_scheduler_barrier_sync()
@@ -1210,6 +1502,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state = process_last_half_block(
                         kv_consumer_state=kv_consumer_state,
                         zero_init=not O_should_accumulate,
+                        **(
+                            dict(v_descale_tile=v_descale_tile)
+                            if const_expr(self.fp8_kv_dequant)
+                            else {}
+                        ),
                     )
                     O_should_accumulate = True
                 else:
@@ -1361,6 +1658,71 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return kv_consumer_state
 
     @cute.jit
+    def _load_effective_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
+        """Load effective QK and V descales, defaulting unspecified tensors to identity."""
+        qk_descale = Float32(1.0)
+        v_descale = Float32(1.0)
+        if const_expr(descale_tensors is not None):
+            if const_expr(descale_tensors.q_descale is not None):
+                qk_descale = qk_descale * Float32(descale_tensors.q_descale[batch_idx, kv_head_idx])
+            if const_expr(descale_tensors.k_descale is not None):
+                qk_descale = qk_descale * Float32(descale_tensors.k_descale[batch_idx, kv_head_idx])
+            if const_expr(descale_tensors.v_descale is not None):
+                v_descale = Float32(descale_tensors.v_descale[batch_idx, kv_head_idx])
+        return qk_descale, v_descale
+
+    @cute.jit
+    def _dequant_tile(self, pipeline_stage, tStage, tsDst, descale, phase):
+        """Dequant one staged fp8 tile -> fp16 smem (descale folded in). """
+        rS = cute.make_rmem_tensor_like(tStage)
+        rD = cute.make_rmem_tensor_like(tsDst)
+        pipeline_stage.consumer_wait_w_index_phase(0, phase)
+        cute.autovec_copy(tStage, rS)
+        rD.store((utils.cvt_fp8_to_f16_packed(rS.load(), self.dtype) * descale).to(self.dtype))
+        cute.autovec_copy(rD, tsDst)
+        pipeline_stage.consumer_release_w_index(0)
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def first_half_block_overlap_fp8(
+        self,
+        n_block: Int32,
+        mma_qk_fn: Callable,
+        kv_consumer_state,
+        pipeline_k,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
+        acc_O: Optional[cute.Tensor] = None,
+        mask_fn: Callable = None,
+        score_mod_fn: Optional[Callable] = None,
+        is_first_block: bool = False,
+        dequant_params: Optional[SimpleNamespace] = None,
+        qk_descale=None,
+    ):
+        """FP8-KV first-half block: cooperative 256-thread dequant of the first K tile
+        (q*k descale folded in) + DequantK barrier, then the synchronous QK."""
+        dp = dequant_params
+        nthr = const_expr(self.num_mma_threads)
+        self._dequant_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, qk_descale, Int32(0))
+        cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
+        acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+        row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+        tOrP_cur = tOrP
+        tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+        if const_expr(self.rescale_O_before_gemm):
+            acc_O.fill(0.0)
+            scores_scale.store(row_scale.load())
+        return kv_consumer_state
+
+    @cute.jit
     def last_half_block_overlap(
         self,
         kv_consumer_state,
@@ -1380,6 +1742,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
+        kv_consumer_state.advance()
+        return kv_consumer_state
+
+    @cute.jit
+    def last_half_block_overlap_fp8(
+        self,
+        kv_consumer_state,
+        pipeline_v,
+        mma_pv_fn: Callable,
+        zero_init: bool,
+        scores_scale: Optional[cute.Tensor] = None,
+        softmax: Optional[Softmax] = None,
+        acc_O: Optional[cute.Tensor] = None,
+        dequant_params: Optional[SimpleNamespace] = None,
+        v_descale_tile=None,
+    ):
+        """FP8-KV final PV: each WG dequants its own hdimv-half of the last V tile
+        (v descale folded in) + WG-local DequantV barrier, then the synchronous PV."""
+        if const_expr(self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, scores_scale)
+        dp = dequant_params
+        nthr_wg = const_expr(self.num_threads_per_warp_group)
+        self._dequant_tile(dp.pipeline_stage, dp.tStage_V, dp.tsV, v_descale_tile, Int32(1))
+        if dp.warp_group_idx == 0:
+            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
+        else:
+            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV1), number_of_threads=nthr_wg)
+        mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
         kv_consumer_state.advance()
         return kv_consumer_state
 
@@ -1512,6 +1902,69 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+        return smem_pipe_read
+
+    @cute.jit
+    def mma_one_n_block_intrawg_overlap_fp8(
+        self,
+        smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
+        n_block: Int32,
+        mma_qk_fn: Callable,
+        mma_pv_fn: Callable,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        acc_O: cute.Tensor,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
+        score_mod_fn: Optional[Callable] = None,
+        mask_fn: Optional[Callable] = None,
+        check_inf: cutlass.Constexpr = True,
+        dequant_params: Optional[SimpleNamespace] = None,
+        qk_descale=None,
+        v_descale_tile=None,
+    ):
+        # FP8-KV dequant intra-WG overlap: dequant K[n] for QK[n], then dequant
+        # V[n_prev] under the QK WGMMA for PV[n_prev]. Descales folded into
+        # the casts. Separate from the generic overlap to keep that path unchanged.
+        smem_pipe_read_v = smem_pipe_read.clone()
+        smem_pipe_read.advance()
+        dp = dequant_params
+        nthr = const_expr(self.num_mma_threads)
+        nthr_wg = const_expr(self.num_threads_per_warp_group)
+        # ---- 1. dequant K[n] -> sK (cooperative 256-thread, staging phase 1) ----
+        self._dequant_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, qk_descale, Int32(1))
+        cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
+        # ---- 2. S = Q @ K.T (async) ----
+        self.warp_scheduler_barrier_sync()
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        if const_expr(self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, scores_scale)
+        # ---- 3. dequant V[n_prev] -> sV (WG-split, phase 0) WHILE QK[n] runs ----
+        self._dequant_tile(dp.pipeline_stage, dp.tStage_V, dp.tsV, v_descale_tile, Int32(0))
+        if dp.warp_group_idx == 0:
+            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
+        else:
+            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV1), number_of_threads=nthr_wg)
+        # ---- 4. O += P @ V (async), then wait QK then PV ----
+        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+        self.warp_scheduler_barrier_arrive()
+        warpgroup.wait_group(1)
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S=acc_S, n_block=n_block)
+        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        warpgroup.wait_group(0)
+        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
+        tOrP_cur = tOrP
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(not self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, row_scale)
+        if const_expr(self.rescale_O_before_gemm):
+            scores_scale.store(row_scale.load())
         return smem_pipe_read
 
     @cute.jit

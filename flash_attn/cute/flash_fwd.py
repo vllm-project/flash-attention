@@ -56,7 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
-        output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        output_quant_key: Optional[utils.QuantKey] = None,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -76,10 +76,10 @@ class FlashAttentionForwardBase:
             Callable signature: ``score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Any``
         :param mask_mod: A callable that takes the attention scores and returns a boolean representing whether that score should be masked.
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
-        :param output_quant_key: compile-time tag represents specialized fused quant output in epilogue.
-            Used as a tag in compile_key. Inspired by quant keys in vLLM and derived from output scales args.
-            Supported: ``"kFp8StaticTensorSym"`` (per-tensor static FP8 e4m3fn)
-            TODO: ``"kFp8Dynamic128Sym"``, ``"kFp8Dynamic64Sym"``, ``"kNvfp4Dynamic"``
+        :param output_quant_key: ``utils.QuantKey`` selecting the fused quant-output scheme in the
+            epilogue (its ``str()`` is the compile_key tag; vLLM-inspired, derived from the output
+            scale args). Implemented on SM100: ``Fp8Static`` (per-tensor static), ``Fp8Group``
+            (per-group dynamic, incl. UE8M0). TODO: NVFP4. SM80/SM90 reject fused output (assert None).
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size

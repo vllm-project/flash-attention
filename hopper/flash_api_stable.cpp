@@ -1252,7 +1252,10 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             //     params.seqlen_q = total_q;
             // }
             // This will zero out the semaphore if needed
-            run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
+            // Disable PDL when scheduler metadata was pre-computed, as there may be other
+            // PDL users (e.g., symmetric memory all-reduce) between the scheduler and attention
+            // that could interfere with the PDL signaling chain.
+            run_mha_fwd_combine(params, stream, !params.skip_scheduler_metadata_computation /*enable_pdl*/);
         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
             // need to zero out the semaphore in this case
             auto slice = torch::stable::narrow(tile_count_semaphore, 0, params.tile_count_semaphore_offset, 1);

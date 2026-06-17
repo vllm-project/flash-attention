@@ -66,10 +66,11 @@ def _cute_dequant_paged_attention(
 ) -> torch.Tensor:
     """Run the SM90 fp16-Q + fp8-KV-cache dequant forward (fp16 Q + fp8 paged K/V -> fp16 O).
 
-    Q is cast to fp16 (the compute dtype; no q_descale). The fp8 K/V are dequantized
-    in-kernel to fp16; per-tensor k/v scales are passed as the descales the kernel
-    folds (k into the score scale, v into the output). This matches the fp16-Q Triton
-    path, which dequantizes the fp8 cache and runs the matmuls in fp16.
+    Q is cast to fp16 (the compute dtype; no q_descale). The fp8 K/V are cast
+    in-kernel to fp16; per-tensor k/v scales are passed as descale tensors the kernel
+    folds (k into the score scale, v into final output normalization/final_scale).
+    This matches the fp16-Q Triton path, which dequantizes the fp8 cache and runs
+    the matmuls in fp16.
     """
     query = query.half()
     num_seqs = len(query_lens)
@@ -470,8 +471,8 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     scale_case: ScaleCase,
 ):
     """Gemma4 full-attention cases: fp16-Q + fp8-KV-cache dequant forward, fp16 Q
-    with per-tensor FP8 paged KV cache dequantized in-kernel to fp16 (the consumer
-    MMA warpgroups do the fp8->fp16 dequant; O is fp16).
+    with per-tensor FP8 paged KV cache cast in-kernel to fp16 (the consumer
+    MMA warpgroups do the fp8->fp16 cast; O is fp16).
 
     Q is true fp16 (no q_descale); only K/V are fp8. This is the production
     fp16-Q + fp8-KV regime, and the fp16-Q Triton path dequantizes the cache and
@@ -483,9 +484,10 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     if _cute_flash_attn_fwd is None:
         pytest.skip("FA4 CuTe interface is not importable in this environment")
 
-    # The dequant path now folds the per-(batch, kv_head) k/v descales: q*k into the
-    # per-tile softmax score scale and v into the final O scale (the dequant cast
-    # stays a pure fp8->fp16 cast). So non-unity k/v scales match too.
+    # The scale-fold path folds per-(batch, kv_head) descales differently for K and V:
+    # q*k into the per-tile softmax score scale, and v into final output
+    # normalization/final_scale.
+    # So non-unity k/v scales match too.
 
     ins = _build_case_inputs(attention_case, scale_case)
     query_lens = ins["query_lens"]
@@ -528,7 +530,7 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
         query_lens, kv_lens, ins["page_table"], q_scale, k_scale, v_scale,
         torch.bfloat16,
     )
-    # ---- FA4 CuTe fp16-Q + fp8-KV dequant SM90 forward (the kernel under test) ----
+    # ---- FA4 CuTe fp16-Q + fp8-KV scale-fold SM90 forward (the kernel under test) ----
     cute_output = _cute_dequant_paged_attention(
         q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
         query_lens, kv_lens, ins["page_table"], k_scale, v_scale,
@@ -574,7 +576,7 @@ SPLITKV_SELF_ATOL = SPLITKV_SELF_RTOL = 1e-2
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference():
-    """SplitKV variant of the fp16-Q + fp8-KV dequant forward.
+    """SplitKV variant of the fp16-Q + fp8-KV scale-fold forward.
 
     Forces num_splits=2 on the long-KV decode case (gemma4_offline_lockstep_decode,
     kv~=28000 -> enough n-blocks to actually split). This exercises the SplitKV path
@@ -869,7 +871,7 @@ def _bench_capturable_fn(backend: str, ins: dict):
     )
 
     # Static, pre-allocated output buffer (stable pointer across replays). The
-    # fp8-dequant path computes in fp16 and writes fp16 O (== compute dtype), so its
+    # fp8 scale-fold path computes in fp16 and writes fp16 O (== compute dtype), so its
     # buffer must be fp16; all other backends write bf16.
     out_buf = torch.empty(
         (total_q, num_query_heads, head_size),
@@ -913,9 +915,9 @@ def _bench_capturable_fn(backend: str, ins: dict):
         return fn, out_buf
 
     if backend == "fa4_dequant":
-        # fp16-Q + fp8-KV dequant forward: fp16 Q + fp8 paged K/V dequantized in-kernel.
+        # fp16-Q + fp8-KV scale-fold forward: fp16 Q + fp8 paged K/V cast in-kernel.
         # Cast to fp16 ONCE here (one-time alloc, stable pointer) -- this capturable
-        # path calls the kernel directly and the dequant path requires fp16 Q.
+        # path calls the kernel directly and the scale-fold path requires fp16 Q.
         q = ins["query"].half()  # fp16 (true precision; not query_fp8)
         k8 = ins["key_cache_fp8"]
         v8 = ins["value_cache_fp8"]

@@ -69,7 +69,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
-        # FP8-KV in-kernel dequant path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
+        # FP8-KV scale-fold path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
         self.fp8_kv_dequant = fp8_kv_dequant
         self.kv_dtype = kv_dtype if kv_dtype is not None else self.dtype
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -217,7 +217,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout
-        (except the fp8-KV dequant path: fp16 Q + fp8 e4m3 K/V -> fp16 O):
+        (except the fp8-KV scale-fold path: fp16 Q + fp8 e4m3 K/V -> fp16 O):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
         if const_expr(not self.fp8_kv_dequant):
@@ -738,7 +738,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 aux_tensors,
                 fastdiv_mods,
                 num_splits,
-                # FP8-KV dequant inputs (sV/sStage/pipeline_stage; None otherwise).
+                # FP8-KV cast inputs (sV/sStage/pipeline_stage; None otherwise).
                 sV=sV if const_expr(self.fp8_kv_dequant) else None,
                 sStage=sStage,
                 pipeline_stage=pipeline_stage,
@@ -1202,7 +1202,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_tensors: Optional[list],
         fastdiv_mods=None,
         num_splits: Int32 = Int32(1),
-        # FP8-KV dequant inputs (None on the non-fp8 path): sV (fp16 V write target),
+        # FP8-KV cast inputs (None on the non-fp8 path): sV (fp16 V write target),
         # sStage, pipeline_stage.
         sV: Optional[cute.Tensor] = None,
         sStage: Optional[cute.Tensor] = None,
@@ -1276,9 +1276,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        num_softmax_rows = const_expr(acc_O.shape[0][0] * acc_O.shape[1])
         softmax = Softmax.create(
             softmax_scale_log2,
-            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+            num_rows=num_softmax_rows,
             softmax_scale=softmax_scale,
         )
 
@@ -1317,7 +1318,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
             scores_scale=scores_scale,
-            softmax=softmax,
             acc_O=acc_O,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
         )
@@ -1328,7 +1328,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_v=pipeline_v,
             mma_pv_fn=mma_pv_fn,
             scores_scale=scores_scale,
-            softmax=softmax,
             acc_O=acc_O,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
         )
@@ -1339,8 +1338,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
 
-            # FP8-KV per-(batch, kv_head) descales, folded into the dequant cast (fp8
-            # only): q*k scales K, v scales V; see mma_one_n_block_intrawg_overlap_fp8.
+            softmax_tile = softmax
+            softmax_scale_eff = softmax_scale
+            v_descale_tile = Float32(1.0)
+            # FP8-KV per-(batch, kv_head) descales: q*k folds into the score scale
+            # while v folds into final output normalization.
             if const_expr(self.fp8_kv_dequant):
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead
@@ -1349,6 +1351,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
                 qk_descale, v_descale_tile = self._load_effective_descales(
                     descale_tensors, batch_idx, head_idx_kv
+                )
+                if const_expr(self.score_mod is None):
+                    softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
+                    softmax_scale_eff = None
+                else:
+                    softmax_scale_log2_eff = softmax_scale_log2
+                    softmax_scale_eff = softmax_scale * qk_descale
+                softmax_tile = Softmax.create(
+                    softmax_scale_log2_eff,
+                    num_rows=num_softmax_rows,
+                    softmax_scale=softmax_scale_eff,
                 )
 
             # Recompute fastdiv_mods if necessary for varlen with aux_tensors
@@ -1389,20 +1402,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     batch_idx,
                     head_idx,
                     m_block,
-                    softmax_scale=softmax_scale,
+                    softmax_scale=softmax_scale_eff,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
                 )
+            process_first_half_block_tile = partial(process_first_half_block, softmax=softmax_tile)
+            process_last_half_block_tile = partial(process_last_half_block, softmax=softmax_tile)
             mma_one_n_block = partial(
                 mma_one_n_block_all,
                 seqlen=seqlen,
-                softmax=softmax,
+                softmax=softmax_tile,
                 score_mod_fn=score_mod_fn,
-                **(
-                    dict(qk_descale=qk_descale, v_descale_tile=v_descale_tile)
-                    if const_expr(self.fp8_kv_dequant)
-                    else {}
-                ),
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
@@ -1425,18 +1435,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ==========================================
                 # First iteration with seqlen masking
                 if const_expr(self.intra_wg_overlap):
-                    kv_consumer_state = process_first_half_block(
+                    kv_consumer_state = process_first_half_block_tile(
                         n_block=n_block_max - 1,
                         seqlen=seqlen,
                         kv_consumer_state=kv_consumer_state,
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
                         is_first_block=True,
-                        **(
-                            dict(qk_descale=qk_descale)
-                            if const_expr(self.fp8_kv_dequant)
-                            else {}
-                        ),
                     )
                 else:
                     self.warp_scheduler_barrier_sync()
@@ -1499,14 +1504,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
                 if const_expr(self.intra_wg_overlap):
-                    kv_consumer_state = process_last_half_block(
+                    kv_consumer_state = process_last_half_block_tile(
                         kv_consumer_state=kv_consumer_state,
                         zero_init=not O_should_accumulate,
-                        **(
-                            dict(v_descale_tile=v_descale_tile)
-                            if const_expr(self.fp8_kv_dequant)
-                            else {}
-                        ),
                     )
                     O_should_accumulate = True
                 else:
@@ -1525,8 +1525,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state,
                     mma_pv_fn,
                     mma_one_n_block,
-                    process_first_half_block,
-                    process_last_half_block,
+                    process_first_half_block_tile,
+                    process_last_half_block_tile,
                     mask_fn,
                     score_mod_fn,
                     O_should_accumulate,
@@ -1544,7 +1544,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
-                    softmax.reset()
+                    softmax_tile.reset()
                     acc_O.fill(0.0)
 
             q_consumer_phase ^= 1
@@ -1554,7 +1554,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not self.pack_gqa):
                     sink_val = Float32(learnable_sink[head_idx])
                 else:  # Each thread might have a different sink value due to different q_head
-                    sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+                    sink_val = cute.make_rmem_tensor_like(softmax_tile.row_max, Float32)
                     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
                     tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
                     for r in cutlass.range(cute.size(sink_val), unroll_full=True):
@@ -1569,21 +1569,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             sink_val.fill(-Float32.inf)
 
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize(sink_val=sink_val)
-            softmax.rescale_O(acc_O, row_scale)
+            row_scale = softmax_tile.finalize(final_scale=v_descale_tile, sink_val=sink_val)
+            softmax_tile.rescale_O(acc_O, row_scale)
 
             # Override empty splits so combine kernel gives zero weight
             if const_expr(self.is_split_kv):
                 if n_block_min >= n_block_max_orig:
                     acc_O.fill(Float32(0.0))
-                    softmax.row_sum.fill(-Float32.inf)
+                    softmax_tile.row_sum.fill(-Float32.inf)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
             self.epilogue(
                 acc_O,
-                softmax.row_sum,
+                softmax_tile.row_sum,
                 mO,
                 mLSE,
                 sO,
@@ -1659,7 +1659,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _load_effective_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
-        """Load effective QK and V descales, defaulting unspecified tensors to identity."""
+        """Load effective QK score and V output descales, defaulting to identity."""
         qk_descale = Float32(1.0)
         v_descale = Float32(1.0)
         if const_expr(descale_tensors is not None):
@@ -1672,13 +1672,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return qk_descale, v_descale
 
     @cute.jit
-    def _dequant_tile(self, pipeline_stage, tStage, tsDst, descale, phase):
-        """Dequant one staged fp8 tile -> fp16 smem (descale folded in). """
+    def _cast_tile_fp8_to_f16(self, pipeline_stage, tStage, tsDst, phase):
+        """Cast one staged fp8 tile -> fp16 smem without applying a descale."""
         rS = cute.make_rmem_tensor_like(tStage)
         rD = cute.make_rmem_tensor_like(tsDst)
         pipeline_stage.consumer_wait_w_index_phase(0, phase)
         cute.autovec_copy(tStage, rS)
-        rD.store((utils.cvt_fp8_to_f16_packed(rS.load(), self.dtype) * descale).to(self.dtype))
+        rD.store(utils.cvt_fp8_to_f16_packed(rS.load(), self.dtype))
         cute.autovec_copy(rD, tsDst)
         pipeline_stage.consumer_release_w_index(0)
         cute.arch.fence_view_async_shared()
@@ -1700,13 +1700,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         is_first_block: bool = False,
         dequant_params: Optional[SimpleNamespace] = None,
-        qk_descale=None,
     ):
-        """FP8-KV first-half block: cooperative 256-thread dequant of the first K tile
-        (q*k descale folded in) + DequantK barrier, then the synchronous QK."""
+        """FP8-KV first-half block: cooperative 256-thread cast of the first K tile
+        + DequantK barrier, then the synchronous QK."""
         dp = dequant_params
         nthr = const_expr(self.num_mma_threads)
-        self._dequant_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, qk_descale, Int32(0))
+        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(0))
         cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
 
@@ -1756,15 +1755,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax: Optional[Softmax] = None,
         acc_O: Optional[cute.Tensor] = None,
         dequant_params: Optional[SimpleNamespace] = None,
-        v_descale_tile=None,
     ):
-        """FP8-KV final PV: each WG dequants its own hdimv-half of the last V tile
-        (v descale folded in) + WG-local DequantV barrier, then the synchronous PV."""
+        """FP8-KV final PV: each WG casts its own hdimv-half of the last V tile
+        + WG-local DequantV barrier, then the synchronous PV."""
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         dp = dequant_params
         nthr_wg = const_expr(self.num_threads_per_warp_group)
-        self._dequant_tile(dp.pipeline_stage, dp.tStage_V, dp.tsV, v_descale_tile, Int32(1))
+        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_V, dp.tsV, Int32(1))
         if dp.warp_group_idx == 0:
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
         else:
@@ -1923,27 +1921,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         dequant_params: Optional[SimpleNamespace] = None,
-        qk_descale=None,
-        v_descale_tile=None,
     ):
-        # FP8-KV dequant intra-WG overlap: dequant K[n] for QK[n], then dequant
-        # V[n_prev] under the QK WGMMA for PV[n_prev]. Descales folded into
-        # the casts. Separate from the generic overlap to keep that path unchanged.
+        # FP8-KV intra-WG overlap: cast K[n] for QK[n], then cast V[n_prev]
+        # under the QK WGMMA for PV[n_prev]. Separate from the generic overlap
+        # to keep that path unchanged.
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
         dp = dequant_params
         nthr = const_expr(self.num_mma_threads)
         nthr_wg = const_expr(self.num_threads_per_warp_group)
-        # ---- 1. dequant K[n] -> sK (cooperative 256-thread, staging phase 1) ----
-        self._dequant_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, qk_descale, Int32(1))
+        # ---- 1. cast K[n] -> sK (cooperative 256-thread, staging phase 1) ----
+        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(1))
         cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
         # ---- 2. S = Q @ K.T (async) ----
         self.warp_scheduler_barrier_sync()
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
-        # ---- 3. dequant V[n_prev] -> sV (WG-split, phase 0) WHILE QK[n] runs ----
-        self._dequant_tile(dp.pipeline_stage, dp.tStage_V, dp.tsV, v_descale_tile, Int32(0))
+        # ---- 3. cast V[n_prev] -> sV (WG-split, phase 0) WHILE QK[n] runs ----
+        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_V, dp.tsV, Int32(0))
         if dp.warp_group_idx == 0:
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
         else:

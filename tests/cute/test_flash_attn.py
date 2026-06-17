@@ -1742,13 +1742,14 @@ def _generate_block_kvcache(
 def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type):
     """SM90 fp16-Q + fp8-KV-cache dequant paged forward (d=512).
 
-    fp16 Q with per-tensor FP8 (e4m3) paged K/V dequantized in-kernel to fp16 (the
-    compute/output dtype). Per-(batch, kv_head) k/v descales are folded by the kernel
-    (q*k into the score scale, v into the output). The reference reads the exact paged
-    FP8 bytes the kernel indexes (gathered through page_table, cast to fp16) and applies
-    the same descales via attention_ref (dequantize-then-attend). num_splits=2 exercises
-    the SplitKV path (fp32 partials combined back to fp16). Q is true fp16 -> q_descale
-    is identity (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
+    fp16 Q with per-tensor FP8 (e4m3) paged K/V cast in-kernel to fp16 (the
+    compute/output dtype). Per-(batch, kv_head) descales are folded by the kernel
+    (q*k into the score scale, v into final output normalization/final_scale). The
+    reference reads the exact paged FP8 bytes the kernel indexes (gathered through
+    page_table, cast to fp16) and applies the same descales via attention_ref
+    (dequantize-then-attend). num_splits=2 exercises the SplitKV path (fp32
+    partials combined back to fp16). Q is true fp16 -> q_descale is identity
+    (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
     """
     device, d, page_size, causal = "cuda", 512, 64, True
     batch_size, nheads, seqlen_q, seqlen_k = 2, 4, 5, 256
@@ -1777,7 +1778,7 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
     key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
 
     # Reference reads the EXACT fp8 bytes the kernel reads: gather the paged fp8 through the
-    # page table into dense (b, seqlen_k, nheads_k, d), then to fp16 (the kernel dequants
+    # page table into dense (b, seqlen_k, nheads_k, d), then to fp16 (the kernel casts
     # fp8 -> fp16). attention_ref applies k/v_descale = dequant; out is fp16 (== kernel O dtype).
     gather = lambda paged: rearrange(
         paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
@@ -1790,7 +1791,7 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
         q, k_ref, v_ref, None, key_padding_mask, upcast=False, reorder_ops=True, **common
     )
 
-    # ---- kernel under test: fp16 Q + fp8 paged K/V, dequantized in-kernel ----
+    # ---- kernel under test: fp16 Q + fp8 paged K/V, cast in-kernel ----
     out, _ = _flash_attn_fwd(
         q=q,
         k=k_paged_fp8,

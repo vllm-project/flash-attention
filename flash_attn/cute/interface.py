@@ -476,7 +476,6 @@ def _flash_attn_fwd(
         _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v), out_torch_dtype, device)
 
     if isinstance(output_quant_key, utils.Fp8Static):
-        # Validate the scalar scale (incl. device) — the kernel dereferences it on q.device.
         _validate_tensor(output_scale, "output_scale", (1,), torch.float32, device)
     elif isinstance(output_quant_key, utils.Fp8Group):
         assert output_scales is not None
@@ -594,8 +593,6 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
-    # The SplitKV combine only casts to e4m3fn; reject fused e5m2 output there up front
-    # rather than failing later in _compile_fwd_combine.
     assert not (is_split_kv and output_quant_key is not None and out.dtype == torch.float8_e5m2), (
         "fused e5m2 output is not supported with SplitKV (num_splits > 1); use e4m3fn or num_splits=1"
     )

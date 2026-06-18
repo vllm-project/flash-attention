@@ -1023,10 +1023,8 @@ def derive_output_quant_key(output_scale, output_scales, out, head_dim_v) -> Opt
     assert group_size > 0 and head_dim_v % group_size == 0, (
         f"output_scales last dim ({output_scales.shape[-1]}) must divide head_dim_v ({head_dim_v})"
     )
-    # The SM100 fp8 epilogue casts in 16-element correction tiles (sub_tiles_per_group =
-    # group_size // 16); a group_size that isn't a multiple of 16 would skip elements.
-    assert group_size % 16 == 0, (
-        f"per-group fp8 output requires group_size ({group_size}) to be a multiple of 16"
+    assert group_size % 32 == 0, (
+        f"per-group fp8 output requires group_size ({group_size}) to be a multiple of 32"
     )
     # A non-contiguous scales buffer is the DeepGEMM column-major / TMA-aligned layout, which
     # also wants UE8M0 (power-of-two) scales; a contiguous buffer is plain row-major fp32.

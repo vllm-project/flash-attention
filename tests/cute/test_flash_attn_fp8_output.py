@@ -191,20 +191,16 @@ def test_fp8_output_varlen_deepseek_mla():
 
 
 @skip_if_no_fp8_sm
-def test_fp8_output_auto_allocate():
-    """User passes output_scale without `out`; library allocates FP8 buffer."""
+def test_fp8_output_requires_out():
+    """Fused output requires a pre-allocated fp8 `out` (its dtype selects the variant)."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     q = torch.randn(2, 256, 8, 128, dtype=torch.bfloat16, device=device)
     k = torch.randn(2, 256, 8, 128, dtype=torch.bfloat16, device=device)
     v = torch.randn(2, 256, 8, 128, dtype=torch.bfloat16, device=device)
 
-    fused_out, _ = flash_attn_func(
-        q, k, v, causal=True,
-        output_scale=_scale_t(0.05, device),
-    )
-    assert fused_out.dtype == torch.float8_e4m3fn
-    assert fused_out.shape == (2, 256, 8, 128)
+    with pytest.raises(AssertionError):
+        flash_attn_func(q, k, v, causal=True, output_scale=_scale_t(0.05, device))
 
 
 @skip_if_no_fp8_sm
@@ -218,8 +214,10 @@ def test_fp8_output_scale_shape_variants():
 
     scale_0d = torch.tensor(0.05, dtype=torch.float32, device=device)
     scale_1d = torch.tensor([0.05], dtype=torch.float32, device=device)
-    out_a, _ = flash_attn_func(q, k, v, causal=True, output_scale=scale_0d)
-    out_b, _ = flash_attn_func(q, k, v, causal=True, output_scale=scale_1d)
+    out_buf_a = torch.empty(2, 256, 8, 128, dtype=torch.float8_e4m3fn, device=device)
+    out_buf_b = torch.empty(2, 256, 8, 128, dtype=torch.float8_e4m3fn, device=device)
+    out_a, _ = flash_attn_func(q, k, v, causal=True, out=out_buf_a, output_scale=scale_0d)
+    out_b, _ = flash_attn_func(q, k, v, causal=True, out=out_buf_b, output_scale=scale_1d)
     # Both shapes go through the same `.reshape(1)` normalization on the
     # host, so the resulting FP8 bytes must be identical.
     assert torch.equal(out_a.view(torch.uint8), out_b.view(torch.uint8))

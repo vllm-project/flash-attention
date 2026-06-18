@@ -29,7 +29,7 @@ class FlashAttentionForwardCombine:
         log_max_splits: int = 4,
         num_threads: int = 256,
         stages: int = 4,
-        output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        output_quant_key: Optional[utils.QuantKey] = None,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -43,8 +43,7 @@ class FlashAttentionForwardCombine:
         :param num_threads: number of threads
         :param varlen: whether using variable length sequences
         :param stages: number of pipeline stages
-        :param output_quant_key: compile-time tag for fused quant output,
-            see FlashAttentionForwardBase for more details.
+        :param output_quant_key: utils.QuantKey for fused quantized output, or None.
         """
         self.dtype = dtype
         self.dtype_partial = dtype_partial
@@ -56,6 +55,11 @@ class FlashAttentionForwardCombine:
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
         self.output_quant_key = output_quant_key
+        if isinstance(output_quant_key, utils.Fp8Group):
+            assert self.k_block_size % output_quant_key.group_size == 0, (
+                f"per-group FP8 combine requires k_block_size ({self.k_block_size}) to be a "
+                f"multiple of group_size ({output_quant_key.group_size})"
+            )
 
     @staticmethod
     def can_implement(
@@ -101,6 +105,7 @@ class FlashAttentionForwardCombine:
         )
         gmem_threads_per_row = k_block_gmem // async_copy_elems
         assert self.num_threads % gmem_threads_per_row == 0
+        self.gmem_threads_per_row = gmem_threads_per_row
 
         # Async copy atom for O partial load
         atom_async_copy_partial = cute.make_copy_atom(
@@ -209,6 +214,7 @@ class FlashAttentionForwardCombine:
         varlen_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
         output_scale: Optional[cute.Tensor] = None,
+        output_scales: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -252,6 +258,11 @@ class FlashAttentionForwardCombine:
         )
         O_layout_transpose = [1, 3, 2, 0] if const_expr(cu_seqlens is None) else [0, 2, 1]
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
+        if const_expr(output_scales is not None):
+            output_scales = cute.make_tensor(
+                output_scales.iterator,
+                cute.select(output_scales.layout, mode=O_layout_transpose),
+            )
         # (num_splits, b, seqlen, h) -> (seqlen, num_splits, h, b)
         # or (num_splits, total_q, h) -> (total_q, num_splits, h)
         LSE_partial_layout_transpose = [2, 0, 3, 1] if const_expr(cu_seqlens is None) else [1, 0, 2]
@@ -324,6 +335,7 @@ class FlashAttentionForwardCombine:
             head_divmod,
             varlen,
             output_scale,
+            output_scales,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -354,13 +366,14 @@ class FlashAttentionForwardCombine:
         head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
         output_scale: Optional[cute.Tensor] = None,
+        output_scales: Optional[cute.Tensor] = None,
     ):
         # Thread and block indices
         tidx, _, _ = cute.arch.thread_idx()
         m_block, k_block, maybe_virtual_batch = cute.arch.block_idx()
 
-        # Load FP8 output scale and invert in-kernel.
-        if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+        # Load FP8 output scale and invert in-kernel (per-tensor static path).
+        if const_expr(isinstance(self.output_quant_key, utils.Fp8Static)):
             output_scale_inv = Float32(1.0) / Float32(output_scale[0])
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
@@ -659,9 +672,48 @@ class FlashAttentionForwardCombine:
             # ===============================
 
             rO = cute.make_rmem_tensor_like(tOrO, self.dtype)
-            # Fold per-tensor output scale into the cast (fused FP8 out).
-            if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+            if const_expr(isinstance(self.output_quant_key, utils.Fp8Static)):
+                # Fold per-tensor output scale into the cast (fused FP8 out).
                 rO.store((tOrO.load() * output_scale_inv).to(self.dtype))
+            elif const_expr(isinstance(self.output_quant_key, utils.Fp8Group)):
+                # Per-group dynamic FP8: per-row, per-group amax (masked) -> dequant scale -> cast.
+                fp8_max = Float32(self.output_quant_key.max_val)
+                group_size = const_expr(self.output_quant_key.group_size)
+                groups_per_block = const_expr(self.k_block_size // group_size)
+                threads_per_row = const_expr(self.gmem_threads_per_row)
+                num_k_chunks = const_expr(cute.size(tOcO, mode=[2]))
+                num_vals = const_expr(cute.size(tOcO, mode=[0]))
+                combined_inv = cute.make_rmem_tensor((num_rows, groups_per_block), Float32)
+                if const_expr(cu_seqlens is None):
+                    mScales_cur = output_scales[None, None, None, batch_idx]
+                else:
+                    mScales_cur = cute.domain_offset((offset, 0, 0), output_scales)
+                for m in cutlass.range_constexpr(num_rows):
+                    is_lead = tOcO[0, m, 0][1] == 0 and tOhidx[m] >= 0  # row lead writes the scales
+                    for g in cutlass.range_constexpr(groups_per_block):
+                        amax = Float32(0.0)
+                        if tOhidx[m] >= 0:
+                            for k in cutlass.range_constexpr(num_k_chunks):
+                                for v in cutlass.range_constexpr(num_vals):
+                                    if tOcO[v, m, k][1] // group_size == g:
+                                        x = tOrO[v, m, k]
+                                        amax = utils.fmax(amax, utils.fmax(x, -x))
+                        amax = cute.arch.warp_reduction_max(amax, threads_in_group=threads_per_row)
+                        block_scale, to_fp8_inv = utils.fp8_block_scale_and_inv(
+                            amax, fp8_max, self.output_quant_key.ue8m0
+                        )
+                        combined_inv[m, g] = to_fp8_inv
+                        if is_lead:
+                            mScales_cur[tOmidx[m], k_block * groups_per_block + g, tOhidx[m]] = block_scale
+                # Apply each element's group inv in FP32, then cast the whole tile to FP8 in one
+                # vectorized store (a scalar FP32->FP8 cvt is rejected by the MLIR backend).
+                for m in cutlass.range_constexpr(num_rows):
+                    for k in cutlass.range_constexpr(num_k_chunks):
+                        for v in cutlass.range_constexpr(num_vals):
+                            for g in cutlass.range_constexpr(groups_per_block):
+                                if tOcO[v, m, k][1] // group_size == g:
+                                    tOrO[v, m, k] = tOrO[v, m, k] * combined_inv[m, g]
+                rO.store(tOrO.load().to(self.dtype))
             else:
                 rO.store(tOrO.load().to(self.dtype))
             mO_cur = seqlen_info.offset_batch(mO, batch_idx, dim=3)

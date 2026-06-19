@@ -255,6 +255,71 @@ torch2cute_dtype_map = {
 }
 
 
+def _contiguous_stride(shape):
+    stride = []
+    running = 1
+    for dim in reversed(shape):
+        stride.append(running)
+        running *= dim
+    return tuple(reversed(stride))
+
+
+class _CompileOnlyTensorSpec:
+    def __init__(self, shape, dtype, assumed_align=16, stride=None):
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        self.device = torch.device("cuda")
+        self.requires_grad = False
+        self.is_cuda = True
+        self._stride = (
+            tuple(
+                cute.sym_int64(divisibility=1) if item is None else item
+                for item in stride
+            )
+            if stride is not None
+            else _contiguous_stride(self.shape)
+        )
+        self._cute_tensor = cute.runtime.make_fake_tensor(
+            _compile_only_cute_dtype(dtype),
+            tuple(cute.sym_int() for _ in self.shape),
+            stride=self._stride,
+            assumed_align=assumed_align,
+        )
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def stride(self, dim=None):
+        if dim is None:
+            return self._stride
+        return self._stride[dim]
+
+    def element_size(self):
+        return torch.empty((), dtype=self.dtype).element_size()
+
+def _compile_only_cute_dtype(dtype):
+    if dtype == torch.int32:
+        return cutlass.Int32
+    return torch2cute_dtype_map[dtype]
+
+
+def _make_compile_only_tensor_spec(
+    shape,
+    dtype,
+    assumed_align=16,
+    stride=None,
+):
+    if shape is None:
+        return None
+    return _CompileOnlyTensorSpec(
+        shape,
+        dtype,
+        assumed_align=assumed_align,
+        stride=stride,
+    )
+
+
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
@@ -331,6 +396,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    compile_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -348,6 +414,8 @@ def _flash_attn_fwd(
         output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
             FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
             dequant = out_fp8 * output_scale. SM100/SM110 only.
+        compile_only: If True, compile the selected kernel and return without
+            launching it.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
@@ -587,8 +655,19 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        if isinstance(q, _CompileOnlyTensorSpec):
+            out_partial = _make_compile_only_tensor_spec(
+                (num_splits, *q_batch_seqlen_shape, num_head, head_dim_v),
+                torch.float32,
+            )
+            lse_partial = _make_compile_only_tensor_spec(
+                (num_splits, *lse_shape),
+                torch.float32,
+                assumed_align=4,
+            )
+        else:
+            out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+            lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -729,8 +808,10 @@ def _flash_attn_fwd(
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
+        block_sparse_tensors is None
+        or block_sparse_tensors.cu_total_m_blocks is None,
+        block_sparse_tensors is None
+        or block_sparse_tensors.cu_block_idx_offsets is None,
         tile_m,
         tile_n,
         q_stage,
@@ -751,7 +832,6 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         output_quant_key,
     )
-
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -1036,12 +1116,15 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
-                dynamic_causal_tensor,
+            ]
+            if arch // 10 == 9:
+                compile_args.append(dynamic_causal_tensor)
+            compile_args.extend([
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-            ]
+            ])
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
@@ -1057,6 +1140,9 @@ def _flash_attn_fwd(
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
             )
+
+    if compile_only:
+        return out, lse
 
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
@@ -1107,12 +1193,15 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
-                dynamic_causal,
+            ]
+            if arch // 10 == 9:
+                call_args.append(dynamic_causal)
+            call_args.extend([
                 page_table,
                 window_size_left,
                 window_size_right,
                 learnable_sink,
-            ]
+            ])
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend([
@@ -2344,6 +2433,70 @@ def flash_attn_varlen_func(
         return_lse,
         out,
         output_scale,
+    )
+
+
+def compile_flash_attn_varlen_func_from_specs(
+    *,
+    q_shape: Tuple[int, ...],
+    k_shape: Tuple[int, ...],
+    v_shape: Tuple[int, ...],
+    q_dtype: torch.dtype,
+    v_stride: Optional[Tuple[int, ...]] = None,
+    cu_seqlens_q_shape: Optional[Tuple[int, ...]] = None,
+    cu_seqlens_k_shape: Optional[Tuple[int, ...]] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    num_splits: int = 1,
+    return_lse: bool = False,
+):
+    q = _make_compile_only_tensor_spec(q_shape, q_dtype)
+    k = _make_compile_only_tensor_spec(k_shape, q_dtype)
+    v = _make_compile_only_tensor_spec(v_shape, q_dtype, stride=v_stride)
+    out = _make_compile_only_tensor_spec(
+        (*q_shape[:-1], v_shape[-1]),
+        q_dtype,
+    )
+    lse = None
+    if return_lse:
+        assert q is not None
+        if cu_seqlens_q_shape is None:
+            lse_shape = (*q.shape[:-3], q.shape[-2], q.shape[-3])
+            lse_stride = None
+        else:
+            lse_shape = (q.shape[-2], q.shape[0])
+            lse_stride = (None, 1)
+        lse = _make_compile_only_tensor_spec(
+            lse_shape,
+            torch.float32,
+            4,
+            stride=lse_stride,
+        )
+
+    return _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=_make_compile_only_tensor_spec(
+            cu_seqlens_q_shape, torch.int32, 4
+        ),
+        cu_seqlens_k=_make_compile_only_tensor_spec(
+            cu_seqlens_k_shape, torch.int32, 4
+        ),
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        num_splits=num_splits,
+        return_lse=return_lse,
+        out=out,
+        lse=lse,
+        compile_only=True,
     )
 
 

@@ -274,16 +274,13 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         SOURCES
             hopper/flash_fwd_combine.cu
             hopper/flash_prepare_scheduler.cu
-            hopper/flash_api_stable.cpp
+            hopper/flash_api.cpp
+            hopper/flash_api_torch_lib.cpp
             ${FA3_GEN_SRCS}
         COMPILE_FLAGS ${VLLM_FA_GPU_FLAGS}
         ARCHITECTURES "" # LucasW: this is ignored for cuda and set on a per-file basis
         USE_SABI 3
         WITH_SOABI)
-
-    # TORCH_TARGET_VERSION only on the stable API TU: applying it to hopper .cu
-    set_source_files_properties(hopper/flash_api_stable.cpp PROPERTIES
-        COMPILE_DEFINITIONS "TORCH_TARGET_VERSION=0x020B000000000000ULL")
 
     target_include_directories(_vllm_fa3_C PRIVATE
         hopper

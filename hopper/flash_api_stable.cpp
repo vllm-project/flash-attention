@@ -1479,14 +1479,12 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     int const total_q = !is_varlen_q ? batch_size * q.size(1) : q.size(0);
     int const num_heads = q.size(-2);
     int const head_size = q.size(-1);
-    int const head_size_v = v.size(-1);
     int const seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     STD_TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-    STD_TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
     int const max_headdim = get_max_headdim();
-    STD_TORCH_CHECK(std::max(head_size, head_size_v) <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+    STD_TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     STD_TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     double softmax_scale = 1.0 / sqrt(double(head_size));
     if (softmax_scale_.has_value()) {
@@ -1502,9 +1500,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     is_causal = window_size_left < 0 && window_size_right == 0;
 
     int const arch = dprops->major * 10 + dprops->minor;
-    int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
-    int const head_size_v_rounded = head_size_rounded;
-    STD_TORCH_CHECK(!deterministic || head_size_rounded < 256, "Deterministic backward not supported for hdim 256.");
+    int const head_size_rounded = round_up_headdim(head_size);
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1533,20 +1529,20 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 
     if (!is_varlen_q) {
         CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
-        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
     } else {
         CHECK_SHAPE(q, total_q, num_heads, head_size);
-        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
-        CHECK_SHAPE(dout, total_q, num_heads, head_size_v);
+        CHECK_SHAPE(out, total_q, num_heads, head_size);
+        CHECK_SHAPE(dout, total_q, num_heads, head_size);
         CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     }
     if (!is_varlen_k) {
         CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
     } else {
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
         CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
     }
 
@@ -1596,9 +1592,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
         CHECK_DEVICE(dv);
         STD_TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
         if (!is_varlen_k) {
-            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
+            CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
         } else {
-            CHECK_SHAPE(dv, total_k, num_heads_k, head_size_v);
+            CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
         }
     } else {
         dv = torch::stable::empty_like(v);
@@ -1670,12 +1666,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // Will be zero'ed out in the backward preprocess kernel
     Tensor dq_semaphore = torch::stable::new_empty(q, {(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, std::make_optional(torch::headeronly::ScalarType::Int));
     params.dq_semaphore = static_cast<int*>(dq_semaphore.data_ptr());
-    Tensor dk_semaphore, dv_semaphore;
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: do we need to zero them out?
-        // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
-        dk_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
-        dv_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        Tensor dk_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        Tensor dv_semaphore = torch::stable::new_empty(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
         params.dk_semaphore = static_cast<int*>(dk_semaphore.data_ptr());
         params.dv_semaphore = static_cast<int*>(dv_semaphore.data_ptr());
     }

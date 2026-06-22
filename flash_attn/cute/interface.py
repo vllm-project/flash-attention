@@ -808,10 +808,8 @@ def _flash_attn_fwd(
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
-        block_sparse_tensors is None
-        or block_sparse_tensors.cu_total_m_blocks is None,
-        block_sparse_tensors is None
-        or block_sparse_tensors.cu_block_idx_offsets is None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1116,15 +1114,12 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
-            ]
-            if arch // 10 == 9:
-                compile_args.append(dynamic_causal_tensor)
-            compile_args.extend([
+                dynamic_causal_tensor,
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-            ])
+            ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
@@ -1193,15 +1188,12 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
-            ]
-            if arch // 10 == 9:
-                call_args.append(dynamic_causal)
-            call_args.extend([
+                dynamic_causal,
                 page_table,
                 window_size_left,
                 window_size_right,
                 learnable_sink,
-            ])
+            ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend([

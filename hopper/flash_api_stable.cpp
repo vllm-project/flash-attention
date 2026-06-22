@@ -599,7 +599,7 @@ mha_fwd_get_scheduler_metadata(
         int64_t headdim,
         int64_t headdim_v,
         torch::headeronly::ScalarType qkv_dtype,
-        Tensor seqused_k, // b
+        const Tensor &seqused_k, // b
         std::optional<Tensor> cu_seqlens_q_,  // b+1
         std::optional<Tensor> cu_seqlens_k_,  // b+1
         std::optional<Tensor> cu_seqlens_k_new_,  // b+1
@@ -751,8 +751,8 @@ mha_fwd_get_scheduler_metadata(
 // d: head_size
 std::tuple<Tensor, Tensor, Tensor, Tensor>
 mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
-        Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+        const Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
+        const Tensor &v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
         std::optional<Tensor> k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
         std::optional<Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
         std::optional<Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
@@ -774,12 +774,12 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> q_descale_,  // (b, h_k), not (b, h)
         std::optional<Tensor> k_descale_,  // (b, h_k)
         std::optional<Tensor> v_descale_,  // (b, h_k)
-        std::optional<double> softmax_scale_,
+        double const softmax_scale,
         bool is_causal,
         int64_t window_size_left,
         int64_t window_size_right,
-        double softcap,
-        bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        double const softcap,
+        bool const is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
@@ -851,10 +851,6 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
     int const num_heads_k = k.size(-2);
     int const batch_size_k = !paged_KV ? (!is_varlen_k ? k.size(0) : cu_seqlens_k.size(0) - 1) : page_table.size(0);
-    double softmax_scale = 1.0 / sqrt(double(head_size));
-    if (softmax_scale_.has_value()) {
-        softmax_scale = softmax_scale_.value();
-    }
     if (!kv_batch_idx_.has_value()) {
         STD_TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
     }
@@ -1334,53 +1330,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
-#ifdef FLASHATTENTION_DISABLE_BACKWARD
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
-    STD_TORCH_CHECK(false, "Flash-Attention was built with backward disabled");
-}
-#else
-template <int Arch, bool Has_softcap>
-void run_mha_bwd_constexpr(Flash_bwd_params &params, cudaStream_t stream) {
-    if (!params.is_bf16) {
-        #ifndef FLASHATTENTION_DISABLE_FP16
-        #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
-        #endif
-        #else
-        STD_TORCH_CHECK(false, "This flash attention build does not support FP16.");
-        #endif
-    } else {
-        #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
-        #endif
-        #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
-        #endif
-    }
-}
-
-void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    #ifndef FLASHATTENTION_DISABLE_BACKWARD
         // FP16_SWITCH(!params.is_bf16, [&] {
         //     HEADDIM_SWITCH(params.d, [&] {
         //         run_mha_bwd_<elem_type, kHeadDim>(params, stream);
@@ -1388,11 +1339,47 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         // });
     ARCH_SWITCH(params.arch, Arch, [&] {
         SOFTCAP_SWITCH(params.softcap > 0.f, Has_softcap, [&] {
-            run_mha_bwd_constexpr<Arch, Has_softcap>(params, stream);
+            if (!params.is_bf16) {
+                #ifndef FLASHATTENTION_DISABLE_FP16
+                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::half_t, 64, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::half_t, 96, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::half_t, 128, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::half_t, 192, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::half_t, 256, Has_softcap>(params, stream); }
+                #endif
+                #else
+                STD_TORCH_CHECK(false, "This flash attention build does not support FP16.");
+                #endif
+            } else {
+                #ifndef FLASHATTENTION_DISABLE_HDIM64
+                if (params.d_rounded == 64) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM96
+                if (params.d_rounded == 96) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM128
+                if (params.d_rounded == 128) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM192
+                if (params.d_rounded == 192) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Has_softcap>(params, stream); }
+                #endif
+                #ifndef FLASHATTENTION_DISABLE_HDIM256
+                if (params.d_rounded == 256) { return run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Has_softcap>(params, stream); }
+                #endif
+            }
         });
     });
+    #endif
 }
-#endif
 
 
 // b: batch_size
@@ -1402,12 +1389,12 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 // h_k: num_heads_k
 // d: head_size
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
-    Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-    Tensor q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-    Tensor k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    Tensor v,     // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
-    Tensor out,   // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-    Tensor softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
+    const Tensor &dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+    const Tensor &q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+    const Tensor &k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
+    const Tensor &v,     // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
+    const Tensor &out,   // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+    const Tensor &softmax_lse,    // (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
     std::optional<Tensor> dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     std::optional<Tensor> dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
     std::optional<Tensor> dv_,   // (b, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
@@ -1417,11 +1404,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     std::optional<Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int64_t> max_seqlen_q_,
     std::optional<int64_t> max_seqlen_k_,
-    std::optional<double> softmax_scale_,
+    double const softmax_scale,
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    double softcap,
+    double const softcap,
     bool const deterministic,
     int64_t const sm_margin
 ) {
@@ -1473,10 +1460,10 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
         STD_TORCH_CHECK(!is_varlen, "This flash attention build does not support varlen.");
     #endif
 
-    // auto const sizes = q.sizes();
-    int const batch_size = !is_varlen_q ? q.size(0) : cu_seqlens_q.size(0) - 1;
-    int const seqlen_q = !is_varlen_q ? q.size(1) : max_seqlen_q_.value();
-    int const total_q = !is_varlen_q ? batch_size * q.size(1) : q.size(0);
+    auto const sizes = q.sizes();
+    int const batch_size = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
+    int const seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
+    int const total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
     int const num_heads = q.size(-2);
     int const head_size = q.size(-1);
     int const seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
@@ -1486,10 +1473,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     int const max_headdim = get_max_headdim();
     STD_TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     STD_TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
-    double softmax_scale = 1.0 / sqrt(double(head_size));
-    if (softmax_scale_.has_value()) {
-        softmax_scale = softmax_scale_.value();
-    }
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
@@ -1604,7 +1587,6 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_device_guard(q);
 
-    // auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
     Tensor softmax_d, softmax_lse_log2;
     if (!is_varlen) {
@@ -1701,8 +1683,8 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 }
 
 std::tuple<Tensor, Tensor>
-mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
-            Tensor lse_partial,         // num_splits x batch_size x seqlen x num_heads
+mha_combine(const Tensor &out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
+            const Tensor &lse_partial,         // num_splits x batch_size x seqlen x num_heads
             std::optional<Tensor> out_,        // batch_size x seqlen x num_heads x head_size
             std::optional<torch::headeronly::ScalarType> out_dtype_
             ) {
@@ -1720,13 +1702,13 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     STD_TORCH_CHECK(out_partial.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     STD_TORCH_CHECK(lse_partial.stride(-2) == 1, "LSE tensor must be contiguous in the seqlen dimension");
 
-    // const auto sizes = out_partial.sizes();
+    const auto sizes = out_partial.sizes();
 
-    const int num_splits = out_partial.size(0);
-    const int batch_size = out_partial.size(1);
-    const int seqlen = out_partial.size(2);
-    const int num_heads = out_partial.size(3);
-    const int head_size_og = out_partial.size(4);
+    const int num_splits = sizes[0];
+    const int batch_size = sizes[1];
+    const int seqlen = sizes[2];
+    const int num_heads = sizes[3];
+    const int head_size_og = sizes[4];
     STD_TORCH_CHECK(num_splits <= 256, "FlashAttention combine only supports num_splits at most 256");
 
     CHECK_SHAPE(out_partial, num_splits, batch_size, seqlen, num_heads, head_size_og);
@@ -1742,7 +1724,6 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     const int head_size = round_multiple(head_size_og, alignment);
 
-    // auto opts = out_partial.options();
     torch::headeronly::ScalarType out_type = out_dtype_.value_or(out_partial.scalar_type());
     STD_TORCH_CHECK(out_type == torch::headeronly::ScalarType::Float || out_type == torch::headeronly::ScalarType::BFloat16 || out_type == torch::headeronly::ScalarType::Half, "Output type must be FP32, FP16 or BF16");
     Tensor out;
@@ -1835,7 +1816,7 @@ void boxed_mha_fwd(
     auto q_descale = to<std::optional<Tensor>>(stack[20]);
     auto k_descale = to<std::optional<Tensor>>(stack[21]);
     auto v_descale = to<std::optional<Tensor>>(stack[22]);
-    auto softmax_scale = to<std::optional<double>>(stack[23]);
+    auto softmax_scale = to<double>(stack[23]);
     auto is_causal = to<bool>(stack[24]);
     auto window_size_left = to<int64_t>(stack[25]);
     auto window_size_right = to<int64_t>(stack[26]);
@@ -1879,7 +1860,7 @@ void boxed_mha_bwd(
     auto seqused_k = to<std::optional<Tensor>>(stack[12]);
     auto max_seqlen_q = to<std::optional<int64_t>>(stack[13]);
     auto max_seqlen_k = to<std::optional<int64_t>>(stack[14]);
-    auto softmax_scale = to<std::optional<double>>(stack[15]);
+    auto softmax_scale = to<double>(stack[15]);
     auto is_causal = to<bool>(stack[16]);
     auto window_size_left = to<int64_t>(stack[17]);
     auto window_size_right = to<int64_t>(stack[18]);
@@ -1974,7 +1955,7 @@ STABLE_TORCH_LIBRARY(_vllm_fa3_C, m) {
         "Tensor? q_descale = None,"
         "Tensor? k_descale = None,"
         "Tensor? v_descale = None,"
-        "float? softmax_scale = None,"
+        "float softmax_scale,"
         "bool is_causal = False,"
         "int window_size_left = -1,"
         "int window_size_right = -1,"
@@ -2004,7 +1985,7 @@ STABLE_TORCH_LIBRARY(_vllm_fa3_C, m) {
         "Tensor? seqused_k = None,"
         "int? max_seqlen_q = None,"
         "int? max_seqlen_k = None,"
-        "float? softmax_scale = None,"
+        "float softmax_scale,"
         "bool is_causal = False,"
         "int window_size_left = -1,"
         "int window_size_right = -1,"

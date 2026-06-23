@@ -6,8 +6,11 @@
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::PhiloxCudaState / at::CUDAGeneratorImpl (default-generator dropout path)
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+#include <type_traits>  // For std::is_trivially_copyable (philox_args buffer assert below)
+#endif
 
 #include <cutlass/numeric_types.h>
 
@@ -21,6 +24,21 @@
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 namespace FLASH_NAMESPACE {
+
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+// Flash_fwd_params keeps philox state as an opaque uint64_t buffer (see flash.h) so the
+// shared header avoids ATen Generator types. Validate the buffer against the real
+// at::PhiloxCudaState layout here, where the type is actually visible.
+static_assert(sizeof(at::PhiloxCudaState) <= sizeof(Flash_fwd_params::philox_args),
+              "Flash_fwd_params::philox_args buffer is too small for at::PhiloxCudaState");
+static_assert(alignof(at::PhiloxCudaState) <= alignof(decltype(Flash_fwd_params::philox_args)),
+              "Flash_fwd_params::philox_args buffer is under-aligned for at::PhiloxCudaState");
+static_assert(std::is_trivially_copyable<at::PhiloxCudaState>::value,
+              "at::PhiloxCudaState must be trivially copyable: it is placement-new'd into "
+              "philox_args and the whole Flash_fwd_params is copied by value to the device kernel "
+              "(so the bytes must be memcpy-safe); this also guarantees a trivial destructor, so "
+              "the placement-new needs no matching delete");
+#endif
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -359,7 +377,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_) {
+        // Retained only for backwards-compat arg positioning; must be None.
+        std::optional<at::Tensor> unused_generator_compat) {
+
+    TORCH_CHECK(!unused_generator_compat.has_value(),
+                "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+                "dropout (when enabled) uses the default CUDA generator.");
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -485,11 +508,10 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //     auto gen = at::cuda::detail::getDefaultCUDAGenerator();
     //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
+    //     std::lock_guard<std::mutex> lock(gen.mutex());
+    //     new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
     // }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -534,7 +556,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                const float softcap,
                const bool return_softmax,
                int num_splits,
-               std::optional<at::Generator> gen_) {
+               // Retained only for backwards-compat arg positioning; must be None.
+               std::optional<at::Tensor> unused_generator_compat) {
+
+    TORCH_CHECK(!unused_generator_compat.has_value(),
+                "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+                "dropout (when enabled) uses the default CUDA generator.");
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -731,14 +758,13 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     // auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     // auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
     // // Forward kernel will populate memory with the seed and offset.
-    // params.rng_state = reinterpret_cast<uinpft64_t*>(rng_state.data_ptr());
+    // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //     auto gen = at::cuda::detail::getDefaultCUDAGenerator();
     //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
+    //     std::lock_guard<std::mutex> lock(gen.mutex());
+    //     new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
     // }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -818,8 +844,13 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         int window_size_right,
         const float softcap,
         const bool deterministic,
-        std::optional<at::Generator> gen_,
+        // Retained only for backwards-compat arg positioning; must be None.
+        std::optional<at::Tensor> unused_generator_compat,
         std::optional<at::Tensor> &rng_state) {
+
+    TORCH_CHECK(!unused_generator_compat.has_value(),
+                "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+                "dropout (when enabled) uses the default CUDA generator.");
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -833,7 +864,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     bool is_sm8x_min = cc_major >= 8;
     TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
-    bool is_dropout = p_dropout > 0.0;
+    [[maybe_unused]] bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
@@ -969,21 +1000,20 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     auto launch = &run_mha_bwd;
 
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        gen_, at::cuda::detail::getDefaultCUDAGenerator());
-
-    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    int64_t counter_offset = params.b * params.h * 32;
-
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
     } else if( is_dropout ) {
+        // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+        int64_t counter_offset = params.b * params.h * 32;
+        auto gen = at::cuda::detail::getDefaultCUDAGenerator();
         // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        std::lock_guard<std::mutex> lock(gen.mutex());
+        new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
+        auto seeds = at::cuda::philox::unpack(*reinterpret_cast<at::PhiloxCudaState const*>(params.philox_args));
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
+#endif
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
@@ -1029,8 +1059,13 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                int window_size_right,
                const float softcap,
                const bool deterministic,
-               std::optional<at::Generator> gen_,
+               // Retained only for backwards-compat arg positioning; must be None.
+               std::optional<at::Tensor> unused_generator_compat,
                std::optional<at::Tensor> &rng_state) {
+
+    TORCH_CHECK(!unused_generator_compat.has_value(),
+                "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+                "dropout (when enabled) uses the default CUDA generator.");
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1044,7 +1079,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     bool is_sm8x_min = cc_major >= 8;
     TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
-    bool is_dropout = p_dropout > 0.0;
+    [[maybe_unused]] bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
@@ -1198,21 +1233,20 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     auto launch = &run_mha_bwd;
 
-    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-        gen_, at::cuda::detail::getDefaultCUDAGenerator());
-
-    // We use a custom RNG that increases the offset by batch_size * nheads * 32.
-    int64_t counter_offset = params.b * params.h * 32;
-
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
     } else if( is_dropout ) {
+        // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+        int64_t counter_offset = params.b * params.h * 32;
+        auto gen = at::cuda::detail::getDefaultCUDAGenerator();
         // See Note [Acquire lock when using random generators]
-        std::lock_guard<std::mutex> lock(gen->mutex_);
-        params.philox_args = gen->philox_cuda_state(counter_offset);
-        auto seeds = at::cuda::philox::unpack(params.philox_args);
+        std::lock_guard<std::mutex> lock(gen.mutex());
+        new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
+        auto seeds = at::cuda::philox::unpack(*reinterpret_cast<at::PhiloxCudaState const*>(params.philox_args));
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
+#endif
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);

@@ -35,8 +35,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               int num_splits,
-               std::optional<at::Generator> gen_);
+               int num_splits);
 
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
@@ -76,8 +75,7 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                const double softmax_scale,
                bool is_causal,
                const double softcap,
-               const bool return_softmax,
-               std::optional<at::Generator> gen_);
+               const bool return_softmax);
 
 std::vector<at::Tensor>
 mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
@@ -99,8 +97,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                       const bool zero_tensors,
                       bool is_causal,
                       const double softcap,
-                      const bool return_softmax,
-                      std::optional<at::Generator> gen_);
+                      const bool return_softmax);
 
 /**
  *  Torch Library Registration
@@ -110,7 +107,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, Tensor? block_table, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
-            "int num_splits, Generator? gen) -> Tensor[]");
+            "int num_splits) -> Tensor[]");
     ops.impl("varlen_fwd", torch::kCUDA, make_pytorch_shim(&mha_varlen_fwd));
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
@@ -123,7 +120,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor block_count, Tensor block_offset, Tensor column_count, Tensor column_index, "
             "Tensor!? out, Tensor? alibi_slopes, "
             "float p_dropout, float softmax_scale, bool is_causal, "
-            "float softcap, bool return_softmax, Generator? gen)"
+            "float softcap, bool return_softmax)"
             "-> Tensor[]");
     ops.impl("fwd_sparse", torch::kCUDA, &mha_fwd_sparse);
 
@@ -132,8 +129,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor!? out, Tensor cu_seqlens_q, "
             "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
-            "bool is_causal, float softcap, bool return_softmax, "
-            "Generator? gen) -> Tensor[]");
+            "bool is_causal, float softcap, bool return_softmax) -> Tensor[]");
     ops.impl("varlen_fwd_sparse", torch::kCUDA, &mha_varlen_fwd_sparse);
 }
 

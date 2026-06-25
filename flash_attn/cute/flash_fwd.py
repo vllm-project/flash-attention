@@ -82,6 +82,10 @@ class FlashAttentionForwardBase:
             TODO: ``"kFp8Dynamic128Sym"``, ``"kFp8Dynamic64Sym"``, ``"kNvfp4Dynamic"``
         """
         self.dtype = dtype
+        # Output dtype, defaulting to the compute dtype. Subclasses may override in
+        # __call__ (e.g. SM90 fp8-KV: compute fp16 but write a bf16 O) so the epilogue
+        # casts the fp32 accumulator straight to the output tensor's dtype.
+        self.o_dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -356,13 +360,13 @@ class FlashAttentionForwardBase:
         )
 
         if const_expr(not self.is_split_kv):
-            rO = cute.make_fragment_like(acc_O, self.dtype)
-            rO.store(acc_O.load().to(self.dtype))
+            rO = cute.make_fragment_like(acc_O, self.o_dtype)
+            rO.store(acc_O.load().to(self.o_dtype))
             # Make sure all threads have finished reading V
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
             )
-            smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
+            smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.o_dtype)
             smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
             taccOrO = smem_thr_copy_O.retile(rO)
             taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -455,7 +459,7 @@ class FlashAttentionForwardBase:
                 )
                 gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
                 tOsO = gmem_thr_copy_O.partition_S(sO)
-                tOrO = cute.make_fragment_like(tOsO, self.dtype)
+                tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
                 # load acc O from smem to rmem for wider vectorization
                 cute.autovec_copy(tOsO, tOrO)
                 if const_expr(not self.pack_gqa):

@@ -394,9 +394,13 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     if fp8_kv_dequant:
-        # FP8-KV in-place dequant probe: fp16 Q + fp8 e4m3 K/V (dequantized in-kernel
-        # to fp16 for precision), bf16/fp16 O. Only the SM90 path.
-        assert q.dtype == torch.float16, "fp8_kv_dequant requires fp16 Q (compute is fp16)"
+        # FP8-KV in-kernel dequant: fp16/bf16 Q + fp8 e4m3 K/V (dequantized in-kernel to
+        # fp16), fp16/bf16 O. Compute is always fp16 (the single-instruction fp8->fp16 fast
+        # path); a bf16 Q is narrowed to fp16 in-kernel and the fp32 accumulator is cast to
+        # O's dtype in the epilogue, so Q/O dtypes are independent of compute. SM90 only.
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            "fp8_kv_dequant requires fp16 or bf16 Q"
+        )
         assert k.dtype == v.dtype == torch.float8_e4m3fn, (
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
@@ -516,6 +520,11 @@ def _flash_attn_fwd(
     kv_dtype = torch2cute_dtype_map[k.dtype] if fp8_kv_dequant else dtype
     if fp8_kv_dequant:
         assert arch // 10 == 9, "fp8_kv_dequant is an SM90-only forward (compute capability 9.x)"
+        # Compute is fp16 regardless of the (fp16/bf16) Q dtype: the fp8->fp16 cvt is the
+        # only single-instruction widening on SM90. The kernel derives the Q/O tensor
+        # dtypes from mQ/mO (which keep q.dtype / out_torch_dtype), narrowing bf16 Q to
+        # fp16 in-kernel and casting the fp32 accumulator to O's dtype in the epilogue.
+        dtype = torch2cute_dtype_map[torch.float16]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -785,6 +794,11 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         output_quant_key,
         fp8_kv_dequant,
+        # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
+        # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
+        # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
+        q.dtype,
+        out_torch_dtype,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1099,7 +1113,7 @@ def _flash_attn_fwd(
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
         elif fp8_kv_dequant:
-            # FP8-KV dequant: Q is fp16 but K/V are fp8 e4m3 -- apply the same uint8
+            # FP8-KV dequant: Q is fp16/bf16 but K/V are fp8 e4m3 -- apply the same uint8
             # FFI workaround to K/V only (the compiled kernel takes them as uint8).
             k_call = k_call.view(torch.uint8)
             v_call = v_call.view(torch.uint8)

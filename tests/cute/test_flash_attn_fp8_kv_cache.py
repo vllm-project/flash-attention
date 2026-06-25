@@ -64,15 +64,15 @@ def _cute_dequant_paged_attention(
     softmax_scale: float = GEMMA4_SOFTMAX_SCALE,
     num_splits: int = 1,
 ) -> torch.Tensor:
-    """Run the SM90 fp16-Q + fp8-KV-cache dequant forward (fp16 Q + fp8 paged K/V -> fp16 O).
+    """Run the SM90 fp16/bf16-Q + fp8-KV-cache dequant forward (-> O matching Q dtype).
 
-    Q is cast to fp16 (the compute dtype; no q_descale). The fp8 K/V are cast
-    in-kernel to fp16; per-tensor k/v scales are passed as descale tensors the kernel
-    folds (k into the score scale, v into final output normalization/final_scale).
-    This matches the fp16-Q Triton path, which dequantizes the fp8 cache and runs
-    the matmuls in fp16.
+    Q is passed in its caller dtype (fp16 OR bf16): compute is always fp16, so a bf16
+    Q is narrowed bf16->fp16 in-kernel and the fp32 accumulator is cast back to the Q
+    dtype for O. No q_descale. The fp8 K/V are cast in-kernel to fp16; per-tensor k/v
+    scales are passed as descale tensors the kernel folds (k into the score scale, v
+    into final output normalization/final_scale). This matches the fp16-Q Triton path,
+    which dequantizes the fp8 cache and runs the matmuls in fp16.
     """
-    query = query.half()
     num_seqs = len(query_lens)
     num_kv_heads = key_cache_fp8.shape[2]
     cu_query_lens = torch.tensor(
@@ -465,17 +465,22 @@ def _triton_unified_attention_ref(
 @pytest.mark.parametrize(
     "scale_case", SCALE_CASES, ids=lambda scale_case: scale_case.id
 )
+@pytest.mark.parametrize(
+    "qo_dtype", [torch.float16, torch.bfloat16], ids=["q_fp16", "q_bf16"]
+)
 @torch.inference_mode()
 def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     attention_case: AttentionCase,
     scale_case: ScaleCase,
+    qo_dtype: torch.dtype,
 ):
-    """Gemma4 full-attention cases: fp16-Q + fp8-KV-cache dequant forward, fp16 Q
-    with per-tensor FP8 paged KV cache cast in-kernel to fp16 (the consumer
-    MMA warpgroups do the fp8->fp16 cast; O is fp16).
+    """Gemma4 full-attention cases: fp16/bf16-Q + fp8-KV-cache dequant forward, with
+    per-tensor FP8 paged KV cache cast in-kernel to fp16 (the consumer MMA warpgroups
+    do the fp8->fp16 cast). Q is fp16 OR bf16 (bf16 is narrowed bf16->fp16 in-kernel),
+    and O matches the Q dtype (the fp32 accumulator is cast to O's dtype in the epilogue).
 
-    Q is true fp16 (no q_descale); only K/V are fp8. This is the production
-    fp16-Q + fp8-KV regime, and the fp16-Q Triton path dequantizes the cache and
+    Q carries no q_descale (true Q); only K/V are fp8. This is the production
+    Q + fp8-KV regime, and the fp16-Q Triton path dequantizes the cache and
     runs the matmuls in fp16 -- a faithful, apples-to-apples oracle (unlike fp8-Q
     which would run fp8 MMA). Reports three divergences each run: CuteDSL-vs-
     Reference, Triton-vs-Reference, and CuteDSL-vs-Triton. The two CuteDSL
@@ -493,10 +498,13 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
     query_lens = ins["query_lens"]
     kv_lens = ins["kv_lens"]
     q_scale, k_scale, v_scale = ins["q_scale"], ins["k_scale"], ins["v_scale"]
-    # Compute dtype is fp16: feed fp16 Q to the kernel, the Triton oracle, and the
-    # reference (the reference upcasts to f32, so its result is ~unchanged). Using the
-    # same fp16 tensor for both reference calls keeps the paging cross-check exact.
+    # Oracles run in fp16: feed fp16 Q to the Triton oracle and the reference (the
+    # reference upcasts to f32, so its result is ~unchanged). Using the same fp16 tensor
+    # for both reference calls keeps the paging cross-check exact. The kernel under test
+    # gets Q in qo_dtype (fp16 or bf16); bf16 is narrowed bf16->fp16 in-kernel (near
+    # lossless: fp16 has more mantissa bits than bf16) and O comes back in qo_dtype.
     q16 = ins["query"].half()
+    q_in = ins["query"].to(qo_dtype)
     # fp16 Q is true precision -> q_descale is identity (1.0) in the reference.
     q_scale_one = torch.tensor(1.0, device=ins["query"].device, dtype=torch.float32)
 
@@ -530,10 +538,13 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
         query_lens, kv_lens, ins["page_table"], q_scale, k_scale, v_scale,
         torch.bfloat16,
     )
-    # ---- FA4 CuTe fp16-Q + fp8-KV scale-fold SM90 forward (the kernel under test) ----
+    # ---- FA4 CuTe fp16/bf16-Q + fp8-KV scale-fold SM90 forward (the kernel under test) ----
     cute_output = _cute_dequant_paged_attention(
-        q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
+        q_in, ins["key_cache_fp8"], ins["value_cache_fp8"],
         query_lens, kv_lens, ins["page_table"], k_scale, v_scale,
+    )
+    assert cute_output.dtype == qo_dtype, (
+        f"expected O dtype {qo_dtype} to match Q, got {cute_output.dtype}"
     )
 
     # Report all three divergences (pytest warnings summary; no -s needed).
@@ -543,7 +554,7 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
         _divergence(triton_output, reference_output),
         _divergence(cute_output, triton_output),
     )
-    case_label = f"{attention_case.id}/{scale_case.id}"
+    case_label = f"{attention_case.id}/{scale_case.id}/{'bf16' if qo_dtype == torch.bfloat16 else 'fp16'}q"
     warnings.warn(
         f"[fp8-kv {case_label}] divergence (FP8 bar atol=rtol={FP8_KV_ATOL}):\n"
         f"    CuteDSL vs Reference [GATED]: max_abs={cr[0]:.4f} max_rel={cr[1]:.3f} mean_abs={cr[2]:.4f}\n"
@@ -554,8 +565,8 @@ def test_gemma4_fp16q_fp8kv_dequant_matches_triton_unified_attention(
 
     # Gates: the kernel must match the fp32 reference AND the production Triton
     # path (vLLM FP8 bar). Triton-vs-Reference is intentionally NOT gated.
-    # check_dtype=False: the dequant kernel's O is fp16 (compute dtype) while the
-    # references are bf16; the values are compared (upcast to fp32 by assert_close),
+    # check_dtype=False: the dequant kernel's O is qo_dtype (fp16 or bf16) while the
+    # references/Triton are bf16; the values are compared (upcast to fp32 by assert_close),
     # not the storage dtype (the fp32 divergence above is the real accuracy gate).
     torch.testing.assert_close(
         cute_output, reference_output, atol=FP8_KV_ATOL, rtol=FP8_KV_RTOL, check_dtype=False
@@ -574,15 +585,19 @@ SPLITKV_SELF_ATOL = SPLITKV_SELF_RTOL = 1e-2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "qo_dtype", [torch.float16, torch.bfloat16], ids=["q_fp16", "q_bf16"]
+)
 @torch.inference_mode()
-def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference():
-    """SplitKV variant of the fp16-Q + fp8-KV scale-fold forward.
+def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference(qo_dtype: torch.dtype):
+    """SplitKV variant of the fp16/bf16-Q + fp8-KV scale-fold forward.
 
     Forces num_splits=2 on the long-KV decode case (gemma4_offline_lockstep_decode,
     kv~=28000 -> enough n-blocks to actually split). This exercises the SplitKV path
     on the dequant kernel, which writes the fp32 partial accumulator (mO is Float32)
-    that the combine kernel merges to the final fp16 O -- the path the hardcoded
+    that the combine kernel merges to the final qo_dtype O -- the path the hardcoded
     `assert mO.element_type == self.dtype` previously made impossible to compile.
+    For bf16 Q this also covers the in-kernel bf16->fp16 narrow under SplitKV.
 
     Gates:
       (a) the SplitKV output is finite;
@@ -605,6 +620,7 @@ def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference():
     kv_lens = ins["kv_lens"]
     k_scale, v_scale = ins["k_scale"], ins["v_scale"]
     q16 = ins["query"].half()
+    q_in = ins["query"].to(qo_dtype)
     q_scale_one = torch.tensor(1.0, device=ins["query"].device, dtype=torch.float32)
 
     # fp32 reference (same builder as the non-split test).
@@ -616,13 +632,14 @@ def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference():
     # The dequant kernel with num_splits=2 (the previously-impossible SplitKV path)
     # and its num_splits=1 counterpart on identical inputs.
     cute_split = _cute_dequant_paged_attention(
-        q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
+        q_in, ins["key_cache_fp8"], ins["value_cache_fp8"],
         query_lens, kv_lens, ins["page_table"], k_scale, v_scale, num_splits=2,
     )
     cute_nosplit = _cute_dequant_paged_attention(
-        q16, ins["key_cache_fp8"], ins["value_cache_fp8"],
+        q_in, ins["key_cache_fp8"], ins["value_cache_fp8"],
         query_lens, kv_lens, ins["page_table"], k_scale, v_scale, num_splits=1,
     )
+    assert cute_split.dtype == qo_dtype and cute_nosplit.dtype == qo_dtype
 
     sr = _divergence(cute_split, reference_output)
     ss = _divergence(cute_split, cute_nosplit)

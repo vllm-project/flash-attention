@@ -9,7 +9,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Float16, BFloat16, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -229,16 +229,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 is_split_kv=self.is_split_kv,
             )
         else:
-            # FP8-KV: Q/O are fp16 but K/V are fp8, which the symmetric _check_type rejects.
-            assert mQ.element_type == self.dtype, "fp8_kv_dequant expects fp16 Q (compute dtype)"
+            # FP8-KV: K/V are fp8 (rejected by the symmetric _check_type). Q/O may each be
+            # fp16 OR bf16 -- compute is always fp16 (the single-instruction fp8->fp16 fast
+            # path). Q is narrowed bf16->fp16 in-kernel and the fp32 accumulator is cast to
+            # mO's dtype in the epilogue, so the Q/O tensor dtypes are independent of compute.
+            assert self.dtype == Float16, "fp8_kv_dequant computes in fp16"
+            assert mQ.element_type in (Float16, BFloat16), "fp8_kv_dequant expects fp16 or bf16 Q"
             if const_expr(self.is_split_kv):
                 assert mO.element_type == Float32, (
                     "fp8_kv_dequant SplitKV expects Float32 O (partial accumulator)"
                 )
             else:
-                assert mO.element_type == self.dtype, (
-                    "fp8_kv_dequant expects fp16 O (compute dtype)"
+                assert mO.element_type in (Float16, BFloat16), (
+                    "fp8_kv_dequant expects fp16 or bf16 O"
                 )
+
+        # Q input / O output dtypes (may differ from the fp16 compute dtype on the fp8-KV
+        # path). q_dtype gates the in-kernel bf16->fp16 Q narrow; o_dtype drives the
+        # epilogue cast. SplitKV writes fp32 partials via acc_O directly, so o_dtype stays
+        # the compute dtype there (the combine kernel produces the final bf16/fp16 O).
+        self.q_dtype = mQ.element_type
+        if const_expr(self.fp8_kv_dequant):
+            self.o_dtype = mO.element_type if const_expr(not self.is_split_kv) else self.dtype
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
@@ -300,11 +312,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, stage)
             for dtype, shape, stage in [
-                (mQ.element_type, (self.tile_m, self.tile_hdim), None),
+                # sQ holds the (possibly bf16) Q tensor as TMA'd; the fp16 compute view
+                # is an in-place recast (both are 2 bytes) -- see mma().
+                (self.q_dtype, (self.tile_m, self.tile_hdim), None),
                 (sK_dtype, (self.tile_n, self.tile_hdim), self.num_stages),
                 (sV_dtype, (self.tile_n, self.tile_hdimv), self.num_stages),
-                # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
-                (mQ.element_type, (self.tile_m, self.tile_hdimv), None),
+                # sO uses the output dtype (o_dtype); for splitkv o_dtype == compute dtype
+                # (the fp32 partials are written from acc_O directly, not via sO).
+                (self.o_dtype, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
         # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V). 
@@ -621,7 +636,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+        # sQ is the input-dtype (q_dtype) view of the storage: the storage MemRange is
+        # typed with the compute dtype, so the TMA'd bf16 Q must be read back as q_dtype
+        # (passing dtype here, like sO below) -- otherwise bf16 bytes get read as fp16.
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
+        # FP8-KV bf16 Q: fp16 compute view aliasing sQ's smem (both 2 bytes, so the
+        # element layout/swizzle is identical -- reinterpret the same storage as fp16, the
+        # same way sO reuses sQ's storage below). _narrow_q_to_compute() casts sQ bf16->fp16
+        # in place per Q tile; the QK WGMMA reads sQ_mma. When Q is already fp16, sQ_mma is sQ.
+        sQ_mma = sQ
+        if const_expr(self.fp8_kv_dequant and self.q_dtype != self.dtype):
+            sQ_mma = storage.sQ.get_tensor(
+                sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.dtype
+            )
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         if const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
@@ -640,8 +667,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sStage = storage.sStage.get_tensor(
                 sStage_layout.outer, swizzle=sStage_layout.inner
             )
-        # reuse sQ's data iterator
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        # reuse sQ's data iterator (sO uses the output dtype, both 2 bytes so they alias)
+        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.o_dtype)
 
         block_info = BlockInfo(
             self.tile_m,
@@ -721,6 +748,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sVt,
                 sP,
                 sO,
+                sQ_mma,
                 learnable_sink,
                 pipeline_k,
                 pipeline_v,
@@ -1185,6 +1213,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sVt: cute.Tensor,
         sP: Optional[cute.Tensor],
         sO: cute.Tensor,
+        # FP8-KV bf16 Q: fp16 compute view aliasing sQ (built in kernel() from the
+        # region-local sQ_layout). Equals sQ when Q is already fp16.
+        sQ_mma: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
@@ -1216,8 +1247,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
+        # FP8-KV bf16 Q: the QK WGMMA needs fp16 operands. sQ holds the bf16 Q as TMA'd;
+        # sQ_mma is the fp16 compute view (same smem) built in kernel(). _narrow_q_to_compute()
+        # casts sQ bf16->fp16 in place per tile before the QK reads sQ_mma.
+        narrow_q = const_expr(self.fp8_kv_dequant and self.q_dtype != self.dtype)
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
-            wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ, sK
+            wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ_mma, sK
         )
         mma_qk_fn = partial(
             sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
@@ -1272,6 +1307,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tsK=thr_copy_K.partition_D(sK2),
                 tStage_V=thr_copy_V.partition_S(gStage_V),
                 tsV=thr_copy_V.partition_D(gV),
+            )
+
+        # FP8-KV bf16 Q in-place narrow partitions (256-thread cooperative copy of the
+        # full Q tile; src is the bf16 sQ, dst the fp16 compute view over the same smem).
+        q_narrow_params = None
+        if const_expr(narrow_q):
+            VEC_Q = const_expr(8)
+            tiled_copy_Q = copy_utils.tiled_copy_2d(
+                self.dtype, self.tile_hdim // VEC_Q, self.num_mma_threads, num_copy_elems=VEC_Q
+            )
+            thr_copy_Q = tiled_copy_Q.get_slice(tidx)
+            q_narrow_params = SimpleNamespace(
+                tQsrc=thr_copy_Q.partition_S(sQ),
+                tQdst=thr_copy_Q.partition_D(sQ_mma),
             )
 
         tile_scheduler = TileSchedulerCls()
@@ -1419,6 +1468,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
+            # FP8-KV bf16 Q: cast the just-arrived bf16 Q tile -> fp16 in place (with a
+            # 256-thread barrier) before any QK WGMMA reads it. No-op when Q is already fp16.
+            if const_expr(narrow_q):
+                self._narrow_q_to_compute(q_narrow_params)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
             # We need masking on S for the very last block when K and V has length not multiple of tile_n.
@@ -1670,6 +1723,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(descale_tensors.v_descale is not None):
                 v_descale = Float32(descale_tensors.v_descale[batch_idx, kv_head_idx])
         return qk_descale, v_descale
+
+    @cute.jit
+    def _narrow_q_to_compute(self, q_narrow_params):
+        """In-place narrow the bf16 Q tile -> fp16 compute dtype. src/dst alias the same
+        smem (both 2 bytes), so each thread reads bf16 into registers, converts, and writes
+        fp16 back. A 256-thread NarrowQ barrier publishes the fp16 Q to both MMA warpgroups
+        before the QK WGMMA. Called once per Q tile (Q is reused across all KV blocks)."""
+        # The in-place aliasing (sQ_mma reinterprets sQ's storage) is only valid when the
+        # Q-input and compute dtypes have the same width -- bf16<->fp16 are both 16-bit. A
+        # different width would make sQ_mma's elements overlap sQ's incorrectly.
+        assert self.q_dtype.width == self.dtype.width, (
+            "in-place Q narrow requires q_dtype and compute dtype of equal width"
+        )
+        qp = q_narrow_params
+        rS = cute.make_rmem_tensor_like(qp.tQsrc)
+        rD = cute.make_rmem_tensor_like(qp.tQdst)
+        cute.autovec_copy(qp.tQsrc, rS)
+        rD.store(rS.load().to(self.dtype))
+        cute.autovec_copy(rD, qp.tQdst)
+        cute.arch.fence_view_async_shared()
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.NarrowQ), number_of_threads=self.num_mma_threads
+        )
 
     @cute.jit
     def _cast_tile_fp8_to_f16(self, pipeline_stage, tStage, tsDst, phase):

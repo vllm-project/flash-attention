@@ -12,6 +12,14 @@
 // could be a macro instead of a literal token.
 #define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
 
+// Stable-ABI counterparts: expand NAME (e.g. TORCH_EXTENSION_NAME) before
+// pasting it into the STABLE_TORCH_LIBRARY* macros from
+// <torch/csrc/stable/library.h>.
+#define STABLE_TORCH_LIBRARY_EXPAND(NAME, MODULE) \
+  STABLE_TORCH_LIBRARY(NAME, MODULE)
+#define STABLE_TORCH_LIBRARY_IMPL_EXPAND(NAME, KEY, MODULE) \
+  STABLE_TORCH_LIBRARY_IMPL(NAME, KEY, MODULE)
+
 // REGISTER_EXTENSION allows the shared library to be loaded and initialized
 // via python's import statement.
 #define REGISTER_EXTENSION(NAME)                                               \

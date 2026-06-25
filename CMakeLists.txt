@@ -173,6 +173,10 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
+        # Stable-ABI build: USE_CUDA allows access to CUDA shims
+        USE_CUDA
+        # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage
+        TORCH_TARGET_VERSION=0x020A000000000000ULL
     )
 
     # Pin the C++ standard on the target itself. When flash-attn is built as a

@@ -340,8 +340,6 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
 
     Returns (causal, local, window_size_left, window_size_right).
     """
-    if mask_mod is not None:
-        return False, False, window_size_left, window_size_right
     if causal:
         window_size_right = 0
     if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:

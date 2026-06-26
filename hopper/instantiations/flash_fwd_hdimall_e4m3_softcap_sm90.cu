@@ -3,7 +3,12 @@
 // This file is auto-generated. See "generate_kernels.py"
 
 #include "flash_fwd_hdim64_e4m3_softcap_sm90.cu"
+#include "flash_fwd_hdim64_e4m3_softcap_fp8out_sm90.cu"
 #include "flash_fwd_hdim96_e4m3_softcap_sm90.cu"
+#include "flash_fwd_hdim96_e4m3_softcap_fp8out_sm90.cu"
 #include "flash_fwd_hdim128_e4m3_softcap_sm90.cu"
+#include "flash_fwd_hdim128_e4m3_softcap_fp8out_sm90.cu"
 #include "flash_fwd_hdim192_e4m3_softcap_sm90.cu"
+#include "flash_fwd_hdim192_e4m3_softcap_fp8out_sm90.cu"
 #include "flash_fwd_hdim256_e4m3_softcap_sm90.cu"
+#include "flash_fwd_hdim256_e4m3_softcap_fp8out_sm90.cu"

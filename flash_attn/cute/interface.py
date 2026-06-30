@@ -389,6 +389,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_tensor_leading_dims: Optional[list[int]] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -741,8 +742,11 @@ def _flash_attn_fwd(
             q_stage=q_stage,
         )
     if aux_tensors is not None:
-        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
+        aux_tensor_metadata = get_aux_tensor_metadata(
+            aux_tensors, aux_tensor_leading_dims
+        )
     else:
+        assert aux_tensor_leading_dims is None
         aux_tensor_metadata = None
 
     if qv is not None:
@@ -896,7 +900,15 @@ def _flash_attn_fwd(
         cute_aux_tensors = None
         aux_tensor_metadata = None
         if aux_tensors is not None:
-            cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+            aux_tensor_leading_dims = (
+                aux_tensor_leading_dims
+                if aux_tensor_leading_dims is not None
+                else [None] * len(aux_tensors)
+            )
+            cute_aux_tensors = [
+                to_cute_aux_tensor(buf, leading_dim)
+                for buf, leading_dim in zip(aux_tensors, aux_tensor_leading_dims)
+            ]
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None

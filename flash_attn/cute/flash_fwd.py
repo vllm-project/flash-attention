@@ -621,6 +621,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         assert self.output_quant_key is None, (
             f"Fused quant output not implemented for {type(self).__name__}"
         )
+        # FlashAttentionForwardBase.__init__ doesn't accept/set is_split_kv; only
+        # the Sm90/Sm100 constructors do. Shared kernel() code below (and __call__)
+        # reference self.is_split_kv unconditionally, raising AttributeError on
+        # Sm80/Sm120. SM80 and SM120 dispatch never pass is_split_kv=True
+        # (interface.py asserts split_kv is unsupported on SM 12.0), so default here.
+        self.is_split_kv = False
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
@@ -831,6 +837,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, num_head, batch_size, _ = work_tile.tile_idx
 
+        # mDynamicCausal is accepted by __call__'s signature but never forwarded into
+        # kernel()'s own parameter list or the .launch() call args below, so the CuTe-DSL
+        # JIT tracer can't resolve the name and raises NameError on every call,
+        # regardless of causal/non-causal. Per-batch dynamic causal masking needs to be
+        # threaded through kernel()'s signature and the .launch() call to work properly;
+        # until then, default to static causal/non-causal (this only restores the
+        # previous, pre-dynamic-causal behavior for callers not using that feature).
+        mDynamicCausal = None
         psc = mDynamicCausal[batch_size] if const_expr(mDynamicCausal is not None) else None
         block_info = BlockInfo(
             self.tile_m,

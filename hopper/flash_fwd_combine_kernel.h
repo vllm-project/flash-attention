@@ -33,7 +33,7 @@ public:
     static constexpr int kMaxSplits = 1 << kLogMaxSplits_;
     static constexpr int AlignmentLSE = std::min(AlignmentLSE_, int(128 / 8 / sizeof(float)));
     static_assert(AlignmentLSE >= 1);
-    static constexpr int kStages = 4;
+    static constexpr int kStages = 8;
 
     static_assert(ArchTag::kMinComputeCapability >= 75);
     static constexpr bool Has_cp_async = ArchTag::kMinComputeCapability >= 80;
@@ -653,7 +653,7 @@ public:
         Tensor tOrO = make_fragment_like<float>(tOrOpartial);
         clear(tOrO);
         int stage_load = kStages - 1, stage_compute = 0;
-        #pragma unroll 4 // Already tuned for speed
+        #pragma unroll 8
         for (int s = 0; s <= thr_max_valid_split; ++s) {
             Tensor scale = make_tensor<float>(make_shape(size<1>(tOrOpartial)));
             #pragma unroll

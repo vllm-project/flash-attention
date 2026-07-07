@@ -63,6 +63,17 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
+    if hasattr(t, "_cute_tensor"):
+        tensor = t._cute_tensor
+        if fully_dynamic:
+            marked = tensor.mark_layout_dynamic()
+            return tensor if marked is None else marked
+        if leading_dim == -1:
+            leading_dim = t.ndim - 1
+        marked = tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        return tensor if marked is None else marked
+
+
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it

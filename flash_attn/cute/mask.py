@@ -356,6 +356,12 @@ class AttentionMask:
                             col_limit_right = row_idx + local_row_offset_right
                         else:
                             col_limit_right = self.tile_n
+                        if const_expr(self.dynamic_causal is not None):
+                            col_limit_right = (
+                                row_idx + causal_row_offset
+                                if self.dynamic_causal
+                                else col_limit_right
+                            )
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         col_limit_left = (
@@ -415,6 +421,17 @@ class AttentionMask:
                                 else 0
                             )
                         )
+                        if const_expr(self.dynamic_causal is not None):
+                            causal_row_limit_top = (
+                                self.tile_m
+                                if col0 >= seqlenk_col_limit and mask_seqlen
+                                else col0 - causal_row_offset
+                            )
+                            row_limit_top = (
+                                causal_row_limit_top
+                                if self.dynamic_causal
+                                else row_limit_top
+                            )
                         row_limit_bot = (
                             col0 - causal_row_offset + self.window_size_left
                             if const_expr(self.window_size_left is not None)

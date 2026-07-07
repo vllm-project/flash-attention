@@ -949,7 +949,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             pipeline_v,
                             self.intra_wg_overlap,
                             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                            self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            self.q_subtile_factor,
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -1300,7 +1300,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q

@@ -4,8 +4,8 @@
 
 #pragma once
 
-// For STD_TORCH_CHECK
-#include <torch/headeronly/util/Exception.h>
+// For TORCH_CHECK
+#include <c10/util/Exception.h>
 
 /// @param COND       - a boolean expression to switch by
 /// @param CONST_NAME - a name given for the constexpr bool variable.
@@ -130,8 +130,8 @@
 #elif defined(FLASHATTENTION_VARLEN_ONLY)
   #define VARLEN_SWITCH(COND, CONST_NAME, ...)                                                   \
   [&] {                                                                                          \
-    STD_TORCH_CHECK(COND, "This flash attention build only supports varlen "                     \
-                          "(for build size reasons).");                                          \
+    TORCH_CHECK(COND, "This flash attention build only supports varlen "                         \
+                      "(for build size reasons).");                                              \
     constexpr static bool CONST_NAME = true;                                                     \
     return __VA_ARGS__();                                                                        \
   }()

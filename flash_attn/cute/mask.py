@@ -428,9 +428,7 @@ class AttentionMask:
                                 else col0 - causal_row_offset
                             )
                             row_limit_top = (
-                                causal_row_limit_top
-                                if self.dynamic_causal
-                                else row_limit_top
+                                causal_row_limit_top if self.dynamic_causal else row_limit_top
                             )
                         row_limit_bot = (
                             col0 - causal_row_offset + self.window_size_left

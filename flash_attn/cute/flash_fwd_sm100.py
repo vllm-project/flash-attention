@@ -134,8 +134,8 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
-        # Derived tag for fused quant output, also see FlashAttentionForwardBase
-        output_quant_key: cutlass.Constexpr[str] | None = None,
+        # Fused quantized-output spec (utils.QuantKey) or None.
+        output_quant_key: Optional[utils.QuantKey] = None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -388,6 +388,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         output_scale: Optional[cute.Tensor] = None,
+        output_scales: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -432,6 +433,11 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
+        if const_expr(output_scales is not None):
+            output_scales = cute.make_tensor(
+                output_scales.iterator,
+                cute.select(output_scales.layout, mode=O_layout_transpose),
+            )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -559,6 +565,10 @@ class FlashAttentionForwardSm100:
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+            if const_expr(output_scales is not None):
+                output_scales = pack_gqa_layout(
+                    output_scales, self.qhead_per_kvhead, nheads_kv, head_idx=2
+                )
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
@@ -779,6 +789,7 @@ class FlashAttentionForwardSm100:
             fastdiv_mods,
             head_divmod,
             output_scale,
+            output_scales,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -839,6 +850,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         head_divmod=None,
         output_scale: Optional[cute.Tensor] = None,
+        output_scales: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1320,6 +1332,7 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors,
                 tile_scheduler,
                 output_scale,
+                output_scales,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2394,6 +2407,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
         output_scale: Optional[cute.Tensor] = None,
+        output_scales: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2414,8 +2428,8 @@ class FlashAttentionForwardSm100:
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
-        # Load FP8 output scale and invert in-kernel.
-        if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+        # Load FP8 output scale and invert in-kernel (per-tensor static path).
+        if const_expr(isinstance(self.output_quant_key, utils.Fp8Static)):
             output_scale_inv = Float32(1.0) / Float32(output_scale[0])
 
         # First iter: no correction is required
@@ -2456,6 +2470,13 @@ class FlashAttentionForwardSm100:
                     cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
                 )  # (128, 128, 2)
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+
+            # Per-group FP8 scales view for this batch/head (SplitKV: combine writes them).
+            mScales_cur = None
+            if const_expr(isinstance(self.output_quant_key, utils.Fp8Group) and not self.is_split_kv):
+                mScales_cur = seqlen.offset_batch_Q(output_scales, batch_idx, dim=3)[
+                    None, None, head_idx
+                ]
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2557,7 +2578,7 @@ class FlashAttentionForwardSm100:
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * v_descale
                     # Fold per-tensor output scale into the existing per-row scale.
-                    if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+                    if const_expr(isinstance(self.output_quant_key, utils.Fp8Static)):
                         scale = scale * output_scale_inv
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
@@ -2576,6 +2597,7 @@ class FlashAttentionForwardSm100:
                         mO_cur,
                         gO_stage,
                         gmem_tiled_copy_O,
+                        mScales_cur=mScales_cur,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2736,6 +2758,107 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
+    def _epilogue_cast_default(
+        self,
+        tiled_tmem_load: cute.TiledCopy,
+        tiled_smem_store: cute.TiledCopy,
+        tOtO_t2r: cute.Tensor,
+        tOsO_s2r: cute.Tensor,
+        tOcO_t2r: cute.Tensor,
+        scale: Float32,
+        corr_tile_size: cutlass.Constexpr[int],
+    ):
+        """Per-element ``scale`` then cvt to ``self.o_dtype`` (non-quant + static FP8)."""
+        for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
+            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+            tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
+            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                )
+            copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+
+    @cute.jit
+    def _epilogue_cast_pergroup_fp8(
+        self,
+        tiled_tmem_load: cute.TiledCopy,
+        tiled_smem_store: cute.TiledCopy,
+        tOtO_t2r: cute.Tensor,
+        tOsO_s2r: cute.Tensor,
+        tOcO_t2r: cute.Tensor,
+        scale: Float32,
+        corr_tile_size: cutlass.Constexpr[int],
+        tidx: Int32,
+        m_tile_idx: Int32,
+        seqlen_q: Int32,
+        mScales_cur: cute.Tensor,
+    ):
+        """Per-row dynamic FP8 cast (``kFp8Group{N}Sym``).
+
+        For each ``group_size``-wide head_dim_v slab of this thread's
+        row: pass 1 applies ``scale`` and reduces a per-row block amax; pass 2
+        reloads, normalizes by the dequant scale and casts to FP8. Two passes (with
+        a tmem reload) avoid holding the whole slab in the correction warps' limited
+        register budget.
+        """
+        group_size: cutlass.Constexpr[int] = self.output_quant_key.group_size
+        fp8_max = Float32(self.output_quant_key.max_val)
+        sub_tiles_per_group: cutlass.Constexpr[int] = group_size // corr_tile_size
+        num_groups: cutlass.Constexpr[int] = self.head_dim_v_padded // group_size
+
+        # One correction thread owns one row (4 warps = 128 threads = m_block_size).
+        seqlen_limit = seqlen_q * self.qhead_per_kvhead if const_expr(self.pack_gqa) else seqlen_q
+        m_global = m_tile_idx * self.m_block_size + tidx
+        row_in_bounds = m_global < seqlen_limit
+
+        for ig in cutlass.range_constexpr(num_groups):
+            # Pass 1: apply `scale` and reduce the per-row amax over the group.
+            group_amax = Float32(0.0)
+            for js in cutlass.range_constexpr(sub_tiles_per_group):
+                i = ig * sub_tiles_per_group + js
+                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+                tOrO_frg = cute.make_fragment(
+                    tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype
+                )
+                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                    )
+                for j in cutlass.range_constexpr(cute.size(tOrO_frg)):
+                    v = tOrO_frg[j]
+                    # |v| via fmax(v, -v): no fabs in cute.math.
+                    group_amax = utils.fmax(group_amax, utils.fmax(v, -v))
+
+            # block_scale = amax/fp8_max (stored); fold the per-row `scale` (1/row_sum) into the
+            # to-fp8 multiplier. All-zero rows get a zero scale so the fp8 codes come out zero.
+            block_scale, to_fp8_inv = utils.fp8_block_scale_and_inv(
+                group_amax, fp8_max, self.output_quant_key.ue8m0
+            )
+            combined_inv = scale * to_fp8_inv
+
+            # Pass 2: reload, apply combined_inv, cvt + store to smem.
+            for js in cutlass.range_constexpr(sub_tiles_per_group):
+                i = ig * sub_tiles_per_group + js
+                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+                tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
+                tOrO_frg = cute.make_fragment(
+                    tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype
+                )
+                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tOrO_frg[j], tOrO_frg[j + 1]), (combined_inv, combined_inv)
+                    )
+                copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+
+            # One thread owns one row; write its single fp32 scale for this group.
+            if row_in_bounds:
+                mScales_cur[m_global, ig] = block_scale
+
+    @cute.jit
     def correction_epilogue(
         self,
         thr_mma: cute.core.ThrMma,
@@ -2749,6 +2872,7 @@ class FlashAttentionForwardSm100:
         mO_cur: Optional[cute.Tensor] = None,
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
+        mScales_cur: Optional[cute.Tensor] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2771,6 +2895,8 @@ class FlashAttentionForwardSm100:
         :type scale: Float32
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
+        :param mScales_cur: per-(batch, head) per-group output-scale view; per-group FP8 only
+        :type mScales_cur: Optional[cute.Tensor]
         """
 
         corr_tile_size = 8 * 32 // self.o_dtype.width
@@ -2801,16 +2927,22 @@ class FlashAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-        for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
-            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-            tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
-                )
-            copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+
+        mma_tile_coord_v = thr_mma.thr_idx
+        if const_expr(isinstance(self.output_quant_key, utils.Fp8Group)):
+            m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+            self._epilogue_cast_pergroup_fp8(
+                tiled_tmem_load, tiled_smem_store,
+                tOtO_t2r, tOsO_s2r, tOcO_t2r,
+                scale, corr_tile_size,
+                tidx, m_tile_idx, seqlen_q, mScales_cur,
+            )
+        else:
+            self._epilogue_cast_default(
+                tiled_tmem_load, tiled_smem_store,
+                tOtO_t2r, tOsO_s2r, tOcO_t2r,
+                scale, corr_tile_size,
+            )
         cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
@@ -2818,7 +2950,6 @@ class FlashAttentionForwardSm100:
             assert(gmem_tiled_copy_O is not None)
             cute.arch.barrier(barrier_id=int(NamedBarrierFwdSm100.Epilogue),
                               number_of_threads=len(self.epilogue_warp_ids) * cute.arch.WARP_SIZE)
-            mma_tile_coord_v = thr_mma.thr_idx
             m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
             self._store_O_to_gmem(
                 sO, gO, mO_cur, gmem_tiled_copy_O, tidx, seqlen_q, m_tile_idx

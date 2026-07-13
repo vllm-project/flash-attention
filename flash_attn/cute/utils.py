@@ -4,8 +4,11 @@ import math
 import hashlib
 import inspect
 import os
+from dataclasses import dataclass
 from functools import partial
 from typing import Type, Callable, Optional, Tuple, overload
+
+import torch
 
 import cutlass
 import cutlass.cute as cute
@@ -949,6 +952,105 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """Could inline but nice for reflecting the above api"""
     return val[0]
+
+
+_FUSED_OUTPUT_QUANT_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+@dataclass(frozen=True)
+class QuantKey:
+    """Output-quantization spec (vLLM-style); the instance is the compile key. The fp8 variant
+    rides in ``dtype``; the subclass selects the scheme (:class:`Fp8Static` / :class:`Fp8Group`).
+    """
+
+    dtype: torch.dtype
+
+    @property
+    def max_val(self) -> float:
+        # Host-side dtype-metadata lookup, evaluated once at trace time; no device sync.
+        return torch.finfo(self.dtype).max
+
+
+@dataclass(frozen=True)
+class Fp8Static(QuantKey):
+    """Per-tensor static FP8 (a single ``output_scale``)."""
+
+    def __str__(self) -> str:
+        return "kFp8StaticTensorSym"
+
+
+@dataclass(frozen=True)
+class Fp8Group(QuantKey):
+    """Per-group dynamic FP8: head_dim_v grouped in ``group_size`` chunks. ``ue8m0`` rounds the
+    dequant scales to powers of two and writes them in the DeepGEMM column-major / TMA-aligned
+    layout (vs plain row-major fp32)."""
+
+    group_size: int
+    ue8m0: bool = False
+
+    def __str__(self) -> str:
+        return f"kFp8Group{self.group_size}Sym"
+
+
+def derive_output_quant_key(output_scale, output_scales, out, head_dim_v) -> Optional[QuantKey]:
+    """Build the :class:`QuantKey` for fused quantized output, or None for an unquantized pass.
+
+    The output dtype is taken from the pre-allocated ``out`` tensor (which must be one of the fp8
+    variants). ``output_scale`` selects per-tensor static; ``output_scales`` selects per-group
+    dynamic (group_size derived from its last dim vs ``head_dim_v``).
+    """
+    if output_scale is None and output_scales is None:
+        return None
+    if output_scale is not None and output_scales is not None:
+        # Per-tensor + per-group together is a two-level (nvfp4-style) scheme, unsupported.
+        raise ValueError(
+            "output_scale (per-tensor) and output_scales (per-group) are mutually exclusive"
+        )
+    assert out is not None, (
+        "fused quantized output requires a pre-allocated `out` tensor; its dtype selects the "
+        "fp8 variant (e4m3fn or e5m2)"
+    )
+    dtype = out.dtype
+    assert dtype in _FUSED_OUTPUT_QUANT_DTYPES, (
+        f"fused quantized output requires out dtype in {_FUSED_OUTPUT_QUANT_DTYPES}, got {dtype}"
+    )
+    if output_scale is not None:
+        assert output_scale.dtype == torch.float32, "output_scale must be float32"
+        assert output_scale.numel() == 1, "output_scale must be a scalar (numel == 1) tensor"
+        return Fp8Static(dtype)
+    assert output_scales.dtype == torch.float32, "output_scales must be float32"
+    group_size = head_dim_v // output_scales.shape[-1]
+    assert group_size > 0 and head_dim_v % group_size == 0, (
+        f"output_scales last dim ({output_scales.shape[-1]}) must divide head_dim_v ({head_dim_v})"
+    )
+    assert group_size % 32 == 0, (
+        f"per-group fp8 output requires group_size ({group_size}) to be a multiple of 32"
+    )
+    # A non-contiguous scales buffer is the DeepGEMM column-major / TMA-aligned layout, which
+    # also wants UE8M0 (power-of-two) scales; a contiguous buffer is plain row-major fp32.
+    ue8m0 = not output_scales.is_contiguous()
+    return Fp8Group(dtype, group_size, ue8m0)
+
+
+@cute.jit
+def fp8_block_scale_and_inv(amax: Float32, max_val: Float32, ue8m0: cutlass.Constexpr[bool] = False):
+    """``(block_scale, to_fp8_inv)`` = ``(amax/max_val, 1/block_scale)`` (shared fwd/combine).
+
+    ``ue8m0`` rounds the scale up to a power of two (vLLM ``scale_ue8m0`` semantics).
+    """
+    if const_expr(ue8m0):
+        raw = fmax(amax * (Float32(1.0) / max_val), Float32(1e-10))
+        # block_scale = exp2(ceil(log2(raw))); Int32() truncates toward zero, hence the bump.
+        log2_raw = cute.math.log2(raw)
+        exp = Int32(log2_raw)
+        exp = exp + 1 if Float32(exp) < log2_raw else exp
+        block_scale = cute.math.exp2(Float32(exp))
+        to_fp8_inv = cute.math.exp2(Float32(-exp))
+        return block_scale, to_fp8_inv
+    is_zero = amax == 0.0
+    block_scale = Float32(0.0) if is_zero else amax * (Float32(1.0) / max_val)
+    to_fp8_inv = Float32(0.0) if is_zero else cute.arch.rcp_approx(block_scale)
+    return block_scale, to_fp8_inv
 
 
 @cute.jit

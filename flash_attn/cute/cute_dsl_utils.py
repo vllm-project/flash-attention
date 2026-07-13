@@ -61,6 +61,8 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    if t is None:
+        return None
     if hasattr(t, "_cute_tensor"):
         tensor = t._cute_tensor
         if fully_dynamic:

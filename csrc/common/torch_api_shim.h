@@ -5,9 +5,13 @@
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifdef TORCH_TARGET_VERSION
@@ -95,6 +99,112 @@ inline std::optional<const Tensor>& as_optional_const(
     std::optional<Tensor>& tensor) {
     return reinterpret_cast<std::optional<const Tensor>&>(tensor);
 }
+
+namespace detail {
+
+template <typename T>
+struct StableBoxedArgument {
+    using argument_type = T;
+    using value_type = std::remove_cv_t<std::remove_reference_t<T>>;
+    using storage_type = value_type;
+
+    static decltype(auto) convert(storage_type& value) {
+        if constexpr (std::is_lvalue_reference_v<argument_type>) {
+            return static_cast<argument_type>(value);
+        } else {
+            return value_type(value);
+        }
+    }
+};
+
+template <>
+struct StableBoxedArgument<int> {
+    using storage_type = int64_t;
+
+    static int convert(storage_type value) {
+        STD_TORCH_CHECK(
+            value <= std::numeric_limits<int>::max() &&
+                value >= std::numeric_limits<int>::min(),
+            "int64_t value is out of range for int");
+        return static_cast<int>(value);
+    }
+};
+
+template <>
+struct StableBoxedArgument<float> {
+    using storage_type = double;
+
+    static float convert(storage_type value) {
+        STD_TORCH_CHECK(
+            value <= std::numeric_limits<float>::max() &&
+                value >= -std::numeric_limits<float>::max(),
+            "double value is out of range for float");
+        return static_cast<float>(value);
+    }
+};
+
+template <>
+struct StableBoxedArgument<std::optional<int>> {
+    using storage_type = std::optional<int64_t>;
+
+    static std::optional<int> convert(const storage_type& value) {
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        return StableBoxedArgument<int>::convert(*value);
+    }
+};
+
+template <>
+struct StableBoxedArgument<std::optional<const Tensor>&> {
+    using storage_type = std::optional<Tensor>;
+
+    static std::optional<const Tensor>& convert(storage_type& value) {
+        return as_optional_const(value);
+    }
+};
+
+template <auto Function>
+struct StableBoxer;
+
+template <typename Return, typename... Args, Return (*Function)(Args...)>
+struct StableBoxer<Function> {
+    using Storage =
+        std::tuple<typename StableBoxedArgument<Args>::storage_type...>;
+
+    template <size_t... Indices>
+    static Storage unbox(StableIValue* stack,
+                         std::index_sequence<Indices...>) {
+        return Storage{
+            torch::stable::detail::to<
+                typename StableBoxedArgument<Args>::storage_type>(
+                stack[Indices])...};
+    }
+
+    template <size_t... Indices>
+    static Return invoke(Storage& args, std::index_sequence<Indices...>) {
+        return Function(
+            StableBoxedArgument<Args>::convert(std::get<Indices>(args))...);
+    }
+
+    static void boxed(StableIValue* stack,
+                      uint64_t num_args,
+                      uint64_t num_outputs) {
+        STD_TORCH_CHECK(
+            num_args == sizeof...(Args),
+            "Registered schema has ", num_args,
+            " arguments, but the kernel has ", sizeof...(Args));
+        STD_TORCH_CHECK(
+            num_outputs == 1,
+            "Registered schema has ", num_outputs,
+            " outputs, but the kernel has 1");
+        auto args = unbox(stack, std::index_sequence_for<Args...>{});
+        stack[0] = torch::stable::detail::from(
+            invoke(args, std::index_sequence_for<Args...>{}));
+    }
+};
+
+}  // namespace detail
 
 inline bool has_shape(const Tensor& tensor,
                       std::initializer_list<int64_t> expected) {
@@ -187,6 +297,9 @@ inline CUDAStream getCurrentCUDAStream() {
 #ifndef TORCH_CHECK
 #define TORCH_CHECK STD_TORCH_CHECK
 #endif
+
+#define FLASH_STABLE_TORCH_BOX(function) \
+    flash::torch_api::detail::StableBoxer<&function>::boxed
 
 #else
 

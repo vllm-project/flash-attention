@@ -2,13 +2,6 @@
 
 #include <cuda_runtime.h>
 
-#include <torch/csrc/inductor/aoti_torch/c/shim.h>
-#include <torch/csrc/stable/accelerator.h>
-#include <torch/csrc/stable/ops.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
-#include <torch/headeronly/util/Exception.h>
-
 #include <cstdint>
 #include <deque>
 #include <initializer_list>
@@ -16,6 +9,15 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#ifdef TORCH_TARGET_VERSION
+
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/stable/ops.h>
+#include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 
 extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(
     int32_t device_index, void** ret_stream);
@@ -87,6 +89,11 @@ inline cudaStream_t current_stream() {
 template <typename T>
 inline T* data_ptr(const Tensor& tensor) {
     return static_cast<T*>(tensor.data_ptr());
+}
+
+inline std::optional<const Tensor>& as_optional_const(
+    std::optional<Tensor>& tensor) {
+    return reinterpret_cast<std::optional<const Tensor>&>(tensor);
 }
 
 inline bool has_shape(const Tensor& tensor,
@@ -179,4 +186,87 @@ inline CUDAStream getCurrentCUDAStream() {
 
 #ifndef TORCH_CHECK
 #define TORCH_CHECK STD_TORCH_CHECK
+#endif
+
+#else
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/nn/functional.h>
+#include <torch/version.h>
+
+namespace flash::torch_api {
+
+using Tensor = at::Tensor;
+using ScalarType = at::ScalarType;
+using DeviceGuard = at::cuda::CUDAGuard;
+
+inline DeviceGuard device_guard(const Tensor& tensor) {
+    return DeviceGuard(static_cast<c10::DeviceIndex>(tensor.get_device()));
+}
+
+inline cudaDeviceProp* current_device_properties() {
+    return at::cuda::getCurrentDeviceProperties();
+}
+
+inline cudaStream_t current_stream() {
+    return at::cuda::getCurrentCUDAStream().stream();
+}
+
+template <typename T>
+inline T* data_ptr(const Tensor& tensor) {
+    return tensor.data_ptr<T>();
+}
+
+inline bool has_shape(const Tensor& tensor,
+                      std::initializer_list<int64_t> expected) {
+    return tensor.sizes() == at::IntArrayRef(expected);
+}
+
+inline Tensor empty_like(const Tensor& tensor) {
+    return torch::empty_like(tensor);
+}
+
+inline Tensor empty(const Tensor& like,
+                    std::initializer_list<int64_t> sizes,
+                    ScalarType dtype) {
+    return torch::empty(sizes, like.options().dtype(dtype));
+}
+
+inline Tensor zeros(const Tensor& like,
+                    std::initializer_list<int64_t> sizes,
+                    ScalarType dtype) {
+    return torch::zeros(sizes, like.options().dtype(dtype));
+}
+
+inline void zero_(Tensor& tensor) {
+    tensor.zero_();
+}
+
+inline void fill_(Tensor& tensor, double value) {
+    tensor.fill_(value);
+}
+
+inline Tensor pad(const Tensor& tensor, std::initializer_list<int64_t> padding) {
+    return torch::nn::functional::pad(
+        tensor, torch::nn::functional::PadFuncOptions(padding));
+}
+
+inline Tensor narrow(Tensor tensor,
+                     int64_t dimension,
+                     int64_t start,
+                     int64_t length) {
+    return tensor.narrow(dimension, start, length);
+}
+
+inline Tensor transpose(const Tensor& tensor, int64_t dim0, int64_t dim1) {
+    return tensor.transpose(dim0, dim1);
+}
+
+inline void zero_slice_(Tensor& tensor, int64_t start, int64_t length) {
+    tensor.narrow(0, start, length).zero_();
+}
+
+}  // namespace flash::torch_api
+
 #endif

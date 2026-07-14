@@ -53,7 +53,31 @@ void boxed_mha_fwd(
     auto cp_rank = torch::stable::detail::to<int64_t>(stack[35]);
     auto cp_tot_seqused_k = torch::stable::detail::to<std::optional<Tensor>>(stack[36]);
 
-    auto outputs = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, s_aux, cp_world_size, cp_rank, cp_tot_seqused_k);
+    auto outputs = mha_fwd(
+        q, k, v,
+        flash::torch_api::as_optional_const(k_new),
+        flash::torch_api::as_optional_const(v_new),
+        flash::torch_api::as_optional_const(q_v),
+        out,
+        flash::torch_api::as_optional_const(cu_seqlens_q),
+        flash::torch_api::as_optional_const(cu_seqlens_k),
+        flash::torch_api::as_optional_const(cu_seqlens_k_new),
+        flash::torch_api::as_optional_const(seqused_q),
+        flash::torch_api::as_optional_const(seqused_k),
+        max_seqlen_q, max_seqlen_k,
+        flash::torch_api::as_optional_const(page_table),
+        flash::torch_api::as_optional_const(kv_batch_idx),
+        flash::torch_api::as_optional_const(leftpad_k),
+        flash::torch_api::as_optional_const(rotary_cos),
+        flash::torch_api::as_optional_const(rotary_sin),
+        flash::torch_api::as_optional_const(seqlens_rotary),
+        q_descale, k_descale, v_descale,
+        softmax_scale, is_causal, window_size_left, window_size_right,
+        softcap, is_rotary_interleaved, scheduler_metadata, num_splits,
+        pack_gqa, sm_margin,
+        flash::torch_api::as_optional_const(s_aux),
+        cp_world_size, cp_rank,
+        flash::torch_api::as_optional_const(cp_tot_seqused_k));
 
     stack[0] = torch::stable::detail::from(outputs);
 }
@@ -87,7 +111,16 @@ void boxed_mha_fwd_get_scheduler_metadata(
     auto pack_gqa = torch::stable::detail::to<std::optional<bool>>(stack[21]);
     auto sm_margin = torch::stable::detail::to<int64_t>(stack[22]);
 
-    auto scheduler_metadata = mha_fwd_get_scheduler_metadata(batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, headdim, headdim_v, qkv_dtype, seqused_k, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, leftpad_k, page_size, max_seqlen_k_new, is_causal, window_size_left, window_size_right, has_softcap, num_splits, pack_gqa, sm_margin);
+    auto scheduler_metadata = mha_fwd_get_scheduler_metadata(
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k,
+        headdim, headdim_v, qkv_dtype, seqused_k,
+        flash::torch_api::as_optional_const(cu_seqlens_q),
+        flash::torch_api::as_optional_const(cu_seqlens_k),
+        flash::torch_api::as_optional_const(cu_seqlens_k_new),
+        flash::torch_api::as_optional_const(seqused_q),
+        flash::torch_api::as_optional_const(leftpad_k),
+        page_size, max_seqlen_k_new, is_causal, window_size_left,
+        window_size_right, has_softcap, num_splits, pack_gqa, sm_margin);
 
     stack[0] = torch::stable::detail::from(scheduler_metadata);
 }

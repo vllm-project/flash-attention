@@ -1835,6 +1835,91 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
+@pytest.mark.skipif(not IS_SM90, reason="fp8-KV dequant forward is SM90-only")
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (0.5, 0.25)])
+@pytest.mark.parametrize("num_splits", [1, 2])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type):
+    """SM90 fp16-Q + fp8-KV-cache dequant paged forward (d=512).
+
+    fp16 Q with per-tensor FP8 (e4m3) paged K/V dequantized in-kernel to fp16 (the
+    compute/output dtype). Per-(batch, kv_head) k/v descales are folded by the kernel
+    (q*k into the score scale, v into the output). The reference reads the exact paged
+    FP8 bytes the kernel indexes (gathered through page_table, cast to fp16) and applies
+    the same descales via attention_ref (dequantize-then-attend). num_splits=2 exercises
+    the SplitKV path (fp32 partials combined back to fp16). Q is true fp16 -> q_descale
+    is identity (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
+    """
+    device, d, page_size, causal = "cuda", 512, 64, True
+    batch_size, nheads, seqlen_q, seqlen_k = 2, 4, 5, 256
+    nheads_k = nheads if mha_type == "mha" else 2
+    torch.random.manual_seed(0)
+
+    # fp16 Q (true precision -> no q_descale); bf16 paged K/V from the shared builder.
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.float16)
+    _, _, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k, page_size, batch_size, nheads_k, d, d, device, torch.bfloat16, torch.bfloat16
+    )
+
+    # Static per-tensor fp8 quantization of the paged buffers the kernel indexes.
+    quant = lambda x, s: (x / s).to(torch.float8_e4m3fn)
+    k_paged_fp8, v_paged_fp8 = quant(k_cache_paged, k_scale), quant(v_cache_paged, v_scale)
+    descale = lambda s: torch.full((batch_size, nheads_k), s, device=device, dtype=torch.float32)
+    k_descale, v_descale = descale(k_scale), descale(v_scale)
+
+    # Deterministic cache lengths so num_splits=2 actually splits (4 and 3 blocks @ page=64).
+    cache_seqlens = torch.tensor(
+        [seqlen_k - (i % 2) * page_size for i in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
+    )
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
+
+    # Reference reads the EXACT fp8 bytes the kernel reads: gather the paged fp8 through the
+    # page table into dense (b, seqlen_k, nheads_k, d), then to fp16 (the kernel dequants
+    # fp8 -> fp16). attention_ref applies k/v_descale = dequant; out is fp16 (== kernel O dtype).
+    gather = lambda paged: rearrange(
+        paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
+    )[:, :seqlen_k].to(torch.float16)
+    k_ref, v_ref = gather(k_paged_fp8), gather(v_paged_fp8)
+    common = dict(causal=causal, k_descale=k_descale, v_descale=v_descale)
+    out_ref, _ = attention_ref(q, k_ref, v_ref, None, key_padding_mask, **common)
+    # out_pt models fp16 arithmetic (NO fp8 intermediate_dtype) -> sets the error bar.
+    out_pt, _ = attention_ref(
+        q, k_ref, v_ref, None, key_padding_mask, upcast=False, reorder_ops=True, **common
+    )
+
+    # ---- kernel under test: fp16 Q + fp8 paged K/V, dequantized in-kernel ----
+    out, _ = _flash_attn_fwd(
+        q=q,
+        k=k_paged_fp8,
+        v=v_paged_fp8,
+        causal=causal,
+        page_table=page_table,
+        seqused_k=cache_seqlens,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=num_splits,
+        q_descale=None,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+    # Same max/mean multiplier style as test_flash_attn_kvcache (fp8 bar).
+    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

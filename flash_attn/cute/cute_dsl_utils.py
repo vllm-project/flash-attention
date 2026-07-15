@@ -14,6 +14,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
+from quack.compile_utils import make_fake_tensor as fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -61,15 +62,25 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
+    if t is None:
+        return None
     if hasattr(t, "_cute_tensor"):
-        tensor = t._cute_tensor
+        # Compile-only fake tensor. cutlass-dsl 4.6.0 removed mark_layout_dynamic()
+        # on fake tensors, so express the dynamic layout at construction instead
+        # (equivalent to from_dlpack(...).mark_layout_dynamic(leading_dim=...)).
+        cute_dtype = t._cute_tensor.element_type
+        ndim = t.ndim
         if fully_dynamic:
-            marked = tensor.mark_layout_dynamic()
-            return tensor if marked is None else marked
-        if leading_dim == -1:
-            leading_dim = t.ndim - 1
-        marked = tensor.mark_layout_dynamic(leading_dim=leading_dim)
-        return tensor if marked is None else marked
+            leading_dim = None
+        elif leading_dim == -1:
+            leading_dim = ndim - 1
+        divisibility = max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
+        return fake_tensor(
+            cute_dtype,
+            tuple(cute.sym_int() for _ in range(ndim)),
+            divisibility=divisibility,
+            leading_dim=leading_dim,
+        )
 
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type

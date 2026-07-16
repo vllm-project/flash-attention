@@ -37,6 +37,19 @@ class SchedulingMode(IntEnum):
     CLC = auto()
 
 
+def _sm90_gqa_l2_divisor(qhead_per_kvhead):
+    """Round a GQA ratio up to a power-of-two bucket, capped at 16."""
+    if qhead_per_kvhead <= 1:
+        return 1
+    if qhead_per_kvhead <= 2:
+        return 2
+    if qhead_per_kvhead <= 4:
+        return 4
+    if qhead_per_kvhead <= 8:
+        return 8
+    return 16
+
+
 @dataclass
 class ClcState(ParamsBase):
     """Owns the runtime state shared by CLC-capable tile schedulers.
@@ -164,6 +177,11 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+
+
+@dataclass
+class HopperTileSchedulerArguments(TileSchedulerArguments):
+    use_dynamic_gqa_l2_budget: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -817,6 +835,14 @@ class SingleTileVarlenScheduler:
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+            if const_expr(
+                isinstance(args, HopperTileSchedulerArguments)
+                and args.use_dynamic_gqa_l2_budget
+            ):
+                size_l2 = Int32(
+                    32 * 1024 * 1024
+                    // _sm90_gqa_l2_divisor(args.qhead_per_kvhead_packgqa)
+                )
             # if backward, this is qdo block size
             kv_block_size = (
                 (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
@@ -1115,6 +1141,111 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*obj_list, loc=self._loc)
+
+
+class StaticPersistentVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Static persistent scheduler for non-split variable-length attention."""
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> SingleTileVarlenScheduler.Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            f"StaticPersistentVarlenTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        assert not args.is_split_kv, "Static persistent varlen does not support split-KV"
+        return SingleTileVarlenScheduler.to_underlying_arguments(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "StaticPersistentVarlenTileScheduler":
+        assert not params.is_split_kv, "Static persistent varlen does not support split-KV"
+        tile_idx = cute.arch.block_idx()[0]
+        return StaticPersistentVarlenTileScheduler(params, tile_idx, Int32(0), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        sm_count: int,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        max_grid_x = SingleTileVarlenScheduler.get_grid_shape(params)[0]
+        # A second wave balances causal tiles while retaining several tiles per CTA.
+        return (cutlass.min(sm_count * 2, max_grid_x), Int32(1), Int32(1))
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+
+class DynamicPersistentVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Atomic persistent scheduler for non-split variable-length attention."""
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> SingleTileVarlenScheduler.Params:
+        assert scheduling_mode == SchedulingMode.STATIC
+        assert not args.is_split_kv
+        return SingleTileVarlenScheduler.to_underlying_arguments(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "DynamicPersistentVarlenTileScheduler":
+        return DynamicPersistentVarlenTileScheduler(
+            params, Int32(0), Int32(0), loc=loc, ip=ip
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        sm_count: int,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        max_grid_x = SingleTileVarlenScheduler.get_grid_shape(params)[0]
+        return (cutlass.min(sm_count, max_grid_x), Int32(1), Int32(1))
+
+    @cute.jit
+    def claim_next_work(self, mWorkCounter: cute.Tensor) -> WorkTileInfo:
+        lane_idx = cute.arch.lane_idx()
+        tile_idx = Int32(0)
+        if lane_idx == 0:
+            tile_idx = cute.arch.atomic_add(
+                mWorkCounter.iterator.llvm_ptr,
+                Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+        self._tile_idx = cute.arch.shuffle_sync(tile_idx, 0)
+        return self.get_current_work()
 
 
 # -----------------------------------------------------------------------------

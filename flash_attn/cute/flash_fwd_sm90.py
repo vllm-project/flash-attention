@@ -38,15 +38,22 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    TileSchedulerArguments,
+    HopperTileSchedulerArguments,
+    WorkTileInfo,
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    StaticPersistentVarlenTileScheduler,
+    DynamicPersistentVarlenTileScheduler,
 )
 from cutlass.cute import FastDivmodDivisor
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
+
+
+def _use_paged_kv_overlap_sm90(intra_wg_overlap, paged_kv_non_tma, tile_n):
+    return intra_wg_overlap and paged_kv_non_tma and tile_n == 128
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -57,6 +64,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         is_split_kv: bool = False,
+        use_persistent_varlen: bool = False,
+        use_dynamic_varlen: bool = False,
+        persistent_scheduler_sm_count: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -64,10 +74,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.intra_wg_overlap = intra_wg_overlap
+        self.use_paged_kv_overlap = _use_paged_kv_overlap_sm90(
+            self.intra_wg_overlap,
+            paged_kv_non_tma,
+            self.tile_n,
+        )
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
+        self.use_persistent_varlen = use_persistent_varlen
+        self.use_dynamic_varlen = use_dynamic_varlen
+        assert not (self.use_persistent_varlen and self.use_dynamic_varlen)
+        self.persistent_scheduler_sm_count = persistent_scheduler_sm_count
+        assert (
+            not (self.use_persistent_varlen or self.use_dynamic_varlen)
+            or self.persistent_scheduler_sm_count is not None
+        )
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
@@ -142,12 +165,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        work_info_struct = cute.struct.MemRange[
+            cutlass.Int32, 2 * 5 if const_expr(self.use_dynamic_varlen) else 0
+        ]
 
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            work_info: work_info_struct
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -158,6 +185,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            work_info: work_info_struct
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
@@ -185,6 +213,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
         output_scale: Optional[cute.Tensor] = None,
+        mSchedulerWorkspace: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -336,14 +365,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
+            TileScheduler = (
+                DynamicPersistentVarlenTileScheduler
+                if const_expr(self.use_dynamic_varlen)
+                else (
+                    StaticPersistentVarlenTileScheduler
+                    if const_expr(self.use_persistent_varlen)
+                    else SingleTileVarlenScheduler
+                )
+            )
         else:
             TileScheduler = (
                 SingleTileScheduler
                 if const_expr(not self.is_causal or self.is_local)
                 else SingleTileLPTScheduler
             )
-        tile_sched_args = TileSchedulerArguments(
+        tile_sched_args = HopperTileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
@@ -366,9 +403,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
+            use_dynamic_gqa_l2_budget=self.use_dynamic_varlen
+            and self.pack_gqa
+            and self.tile_hdim == 128,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+        grid_dim = (
+            TileScheduler.get_grid_shape(
+                tile_sched_params,
+                sm_count=self.persistent_scheduler_sm_count,
+            )
+            if const_expr(
+                self.use_persistent_varlen or self.use_dynamic_varlen
+            )
+            else TileScheduler.get_grid_shape(tile_sched_params)
+        )
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
@@ -418,6 +467,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             aux_data,
             fastdiv_mods,
             output_scale,
+            mSchedulerWorkspace,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -467,6 +517,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         output_scale: Optional[cute.Tensor] = None,
+        mSchedulerWorkspace: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -563,6 +614,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
         # reuse sQ's data iterator
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        sWorkInfo = (
+            storage.work_info.get_tensor(
+                cute.make_layout((5, 2), stride=(1, 5))
+            )
+            if const_expr(self.use_dynamic_varlen)
+            else None
+        )
 
         block_info = BlockInfo(
             self.tile_m,
@@ -629,6 +687,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                sWorkInfo,
+                mSchedulerWorkspace,
                 num_splits,
             )
 
@@ -662,11 +722,33 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
+                sWorkInfo,
                 blocksparse_tensors,
                 aux_data,
                 fastdiv_mods,
                 num_splits,
             )
+
+        if const_expr(self.use_dynamic_varlen):
+            cute.arch.sync_threads()
+            tidx, _, _ = cute.arch.thread_idx()
+            if tidx == 0:
+                # Workspace layout is [work counter, completion counter]. The
+                # last finishing CTA resets both for the next exclusive launch.
+                done_ptr = (mSchedulerWorkspace.iterator + 1).llvm_ptr
+                done = cute.arch.atomic_add(
+                    done_ptr, Int32(1), sem="release", scope="gpu"
+                )
+                if done == cute.arch.grid_dim()[0] - 1:
+                    cute.arch.store(
+                        mSchedulerWorkspace.iterator.llvm_ptr,
+                        Int32(0),
+                        sem="release",
+                        scope="gpu",
+                    )
+                    cute.arch.store(
+                        done_ptr, Int32(0), sem="release", scope="gpu"
+                    )
 
     @cute.jit
     def load(
@@ -689,6 +771,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        sWorkInfo: Optional[cute.Tensor],
+        mSchedulerWorkspace: Optional[cute.Tensor],
         num_splits: Int32 = Int32(1),
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -700,13 +784,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # KV loading restricted to warp 0 for TMA, all warps for non-TMA KV
         is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
 
-        if is_load_warp:
+        if is_load_warp or const_expr(self.use_dynamic_varlen):
             q_producer_phase = Int32(1)
             kv_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
             )
             tile_scheduler = TileSchedulerCls()
-            work_tile = tile_scheduler.initial_work_tile_info()
+            work_info_phase = Int32(0)
+            work_tile = (
+                self.publish_dynamic_work(
+                    tile_scheduler,
+                    mSchedulerWorkspace,
+                    sWorkInfo,
+                    work_info_phase,
+                    warp_idx_in_wg,
+                )
+                if const_expr(self.use_dynamic_varlen)
+                else tile_scheduler.initial_work_tile_info()
+            )
+            if const_expr(self.use_dynamic_varlen):
+                work_info_phase ^= 1
             while work_tile.is_valid_tile:
                 # if work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -771,6 +868,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.num_threads_per_warp_group,
                         mK.element_type,
                         arch=self.arch.major * 10 + self.arch.minor,
+                        cache_v_ptr=self.use_paged_kv_overlap,
                     )
 
                 load_K = partial(
@@ -835,7 +933,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if is_kv_load_warp:
                         pipeline_k.producer_acquire(kv_producer_state)
                         if const_expr(not self.use_tma_KV):
-                            paged_kv_manager.load_page_table(n_block)
+                            paged_kv_manager.load_page_table(n_block, mask_seqlen=True)
+                            if const_expr(self.use_paged_kv_overlap):
+                                paged_kv_manager.update_V_ptr()
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
@@ -852,7 +952,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         q_producer_phase ^= 1
 
                     if is_kv_load_warp:
-                        if const_expr(not self.intra_wg_overlap or not self.use_tma_KV):
+                        if const_expr(
+                            not self.intra_wg_overlap
+                            or (not self.use_tma_KV and not self.use_paged_kv_overlap)
+                        ):
                             pipeline_v.producer_acquire(kv_producer_state)
                             load_V(
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
@@ -866,18 +969,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     else None
                                 )
                                 if const_expr(not self.use_tma_KV):
-                                    paged_kv_manager.load_page_table(n_block)
+                                    paged_kv_manager.load_page_table(
+                                        n_block, mask_seqlen=False
+                                    )
                                 pipeline_k.producer_acquire(kv_producer_state)
                                 load_K(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
+                                    mask_seqlen=False,
                                 )
                                 pipeline_v.producer_acquire(kv_producer_state)
                                 load_V(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
+                                    mask_seqlen=False,
                                 )
                                 kv_producer_state.advance()
                         else:
@@ -886,38 +993,64 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 n_block = n_block_prev - 1
                                 page_idx = (
                                     mPageTable[batch_idx, n_block]
-                                    if const_expr(mPageTable is not None)
+                                    if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
                                 page_idx_prev = (
                                     mPageTable[batch_idx, n_block_prev]
-                                    if const_expr(mPageTable is not None)
+                                    if const_expr(mPageTable is not None and self.use_tma_KV)
                                     else None
                                 )
                                 kv_producer_state_prev = kv_producer_state.clone()
                                 kv_producer_state.advance()
+                                if const_expr(not self.use_tma_KV):
+                                    paged_kv_manager.load_page_table(
+                                        n_block, mask_seqlen=False
+                                    )
                                 pipeline_k.producer_acquire(kv_producer_state)
                                 load_K(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
+                                    mask_seqlen=False,
                                 )
                                 pipeline_v.producer_acquire(kv_producer_state_prev)
-                                load_V(
-                                    block=n_block_prev,
-                                    producer_state=kv_producer_state_prev,
-                                    page_idx=page_idx_prev,
-                                )
+                                if const_expr(self.use_tma_KV):
+                                    load_V(
+                                        block=n_block_prev,
+                                        producer_state=kv_producer_state_prev,
+                                        page_idx=page_idx_prev,
+                                    )
+                                else:
+                                    self.load_paged_V_cached(
+                                        paged_kv_manager,
+                                        sV,
+                                        n_block_prev,
+                                        pipeline_v,
+                                        kv_producer_state_prev,
+                                    )
                             n_block = n_block_min
                             page_idx = (
                                 mPageTable[batch_idx, n_block]
-                                if const_expr(mPageTable is not None)
+                                if const_expr(mPageTable is not None and self.use_tma_KV)
                                 else None
                             )
                             pipeline_v.producer_acquire(kv_producer_state)
-                            load_V(
-                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
-                            )
+                            if const_expr(self.use_tma_KV):
+                                load_V(
+                                    block=n_block,
+                                    producer_state=kv_producer_state,
+                                    page_idx=page_idx,
+                                )
+                            else:
+                                self.load_paged_V_cached(
+                                    paged_kv_manager,
+                                    sV,
+                                    n_block,
+                                    pipeline_v,
+                                    kv_producer_state,
+                                    update_cache=False,
+                                )
                             kv_producer_state.advance()
                 else:
                     # Block sparsity: use TMA closures directly (not paged)
@@ -952,9 +1085,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             self.q_subtile_factor,
                         )
 
-                tile_scheduler.prefetch_next_work()
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+                if const_expr(self.use_dynamic_varlen):
+                    work_tile = self.publish_dynamic_work(
+                        tile_scheduler,
+                        mSchedulerWorkspace,
+                        sWorkInfo,
+                        work_info_phase,
+                        warp_idx_in_wg,
+                    )
+                    work_info_phase ^= 1
+                else:
+                    tile_scheduler.prefetch_next_work()
+                    work_tile = tile_scheduler.advance_to_next_work()
                 # End of persistent scheduler loop
 
             # Producer tail is only useful for cluster to avoid early exit of blocks.
@@ -962,6 +1104,56 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
                 pipeline_v.producer_tail(kv_producer_state)
+
+    @cute.jit
+    def read_dynamic_work(
+        self, sWorkInfo: cute.Tensor, work_info_phase: Int32
+    ) -> WorkTileInfo:
+        return WorkTileInfo(
+            (
+                Int32(sWorkInfo[0, work_info_phase]),
+                Int32(sWorkInfo[1, work_info_phase]),
+                Int32(sWorkInfo[2, work_info_phase]),
+                Int32(sWorkInfo[3, work_info_phase]),
+            ),
+            sWorkInfo[4, work_info_phase] != 0,
+        )
+
+    @cute.jit
+    def publish_dynamic_work(
+        self,
+        tile_scheduler: DynamicPersistentVarlenTileScheduler,
+        mSchedulerWorkspace: cute.Tensor,
+        sWorkInfo: Optional[cute.Tensor],
+        work_info_phase: Int32,
+        warp_idx_in_wg: Int32,
+    ) -> WorkTileInfo:
+        if warp_idx_in_wg == 0:
+            claimed_work = tile_scheduler.claim_next_work(mSchedulerWorkspace)
+            if cute.arch.lane_idx() == 0:
+                m_block, head_idx, batch_idx, split_idx = claimed_work.tile_idx
+                sWorkInfo[0, work_info_phase] = m_block
+                sWorkInfo[1, work_info_phase] = head_idx
+                sWorkInfo[2, work_info_phase] = batch_idx
+                sWorkInfo[3, work_info_phase] = split_idx
+                sWorkInfo[4, work_info_phase] = (
+                    Int32(1) if claimed_work.is_valid_tile else Int32(0)
+                )
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.PFull),
+            number_of_threads=self.num_threads,
+        )
+        return self.read_dynamic_work(sWorkInfo, work_info_phase)
+
+    @cute.jit
+    def wait_dynamic_work(
+        self, sWorkInfo: cute.Tensor, work_info_phase: Int32
+    ) -> WorkTileInfo:
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.PFull),
+            number_of_threads=self.num_threads,
+        )
+        return self.read_dynamic_work(sWorkInfo, work_info_phase)
 
     @cute.jit
     def load_KV(
@@ -974,14 +1166,38 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         producer_state: pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
+        mask_seqlen: cutlass.Constexpr[bool] = True,
     ):
         if const_expr(self.use_tma_KV):
             src_idx = block if const_expr(page_idx is None) else page_idx
             tma_load_fn(src_idx=src_idx, producer_state=producer_state)
         else:
-            paged_kv_manager.load_KV(block, sX[None, None, producer_state.index], K_or_V)
+            paged_kv_manager.load_KV(
+                block,
+                sX[None, None, producer_state.index],
+                K_or_V,
+                mask_seqlen=mask_seqlen,
+            )
             cute.arch.cp_async_commit_group()
         pipeline_kv.producer_commit(producer_state)
+
+    @cute.jit
+    def load_paged_V_cached(
+        self,
+        paged_kv_manager: PagedKVManager,
+        sV: cute.Tensor,
+        block: Int32,
+        pipeline_v: pipeline.PipelineAsync,
+        producer_state: pipeline.PipelineState,
+        update_cache: cutlass.Constexpr[bool] = True,
+    ):
+        paged_kv_manager.load_V_cached(
+            block,
+            sV[None, None, producer_state.index],
+            update_cache=update_cache,
+        )
+        cute.arch.cp_async_commit_group()
+        pipeline_v.producer_commit(producer_state)
 
     @cute.jit
     def mma(
@@ -1008,6 +1224,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
+        sWorkInfo: cute.Tensor,
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
@@ -1050,7 +1267,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         tile_scheduler = TileSchedulerCls()
-        work_tile = tile_scheduler.initial_work_tile_info()
+        work_info_phase = Int32(0)
+        work_tile = (
+            self.wait_dynamic_work(sWorkInfo, work_info_phase)
+            if const_expr(self.use_dynamic_varlen)
+            else tile_scheduler.initial_work_tile_info()
+        )
+        if const_expr(self.use_dynamic_varlen):
+            work_info_phase ^= 1
         softmax = Softmax.create(
             softmax_scale_log2,
             num_rows=acc_O.shape[0][0] * acc_O.shape[1],
@@ -1242,6 +1466,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
                 )
+                interior_mask_fn = (
+                    partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                    if const_expr(self.mask_mod is not None)
+                    else None
+                )
                 # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
                 for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                     kv_consumer_state = mma_one_n_block(
@@ -1249,7 +1478,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         n_block=n_block_max - 1 - n_tile,
                         seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                        mask_fn=interior_mask_fn,
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left
@@ -1264,8 +1493,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
-                # Release Q pipeline so the producer can load the next tile's Q
-                pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = process_last_half_block(
@@ -1302,16 +1529,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
                 )
-
-                # Release Q pipeline so the producer can load the next tile's Q
-                pipeline_q.consumer_release_w_index(0)
-
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax.reset()
                     acc_O.fill(0.0)
-
-            q_consumer_phase ^= 1
 
             sink_val = None
             if const_expr(learnable_sink is not None):
@@ -1362,8 +1583,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 split_idx,
             )
 
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            # sO aliases sQ. Each consumer warp releases Q only after its epilogue
+            # work, so the pipeline cannot become empty until all consumers finish.
+            pipeline_q.consumer_release_w_index(0)
+            q_consumer_phase ^= 1
+
+            work_tile = (
+                self.wait_dynamic_work(sWorkInfo, work_info_phase)
+                if const_expr(self.use_dynamic_varlen)
+                else tile_scheduler.advance_to_next_work()
+            )
+            if const_expr(self.use_dynamic_varlen):
+                work_info_phase ^= 1
 
     @cute.jit
     def first_half_block_overlap(

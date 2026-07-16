@@ -1,4 +1,4 @@
-from typing import Type
+from typing import Optional, Type
 from dataclasses import dataclass
 
 import cutlass
@@ -39,6 +39,7 @@ class PagedKVManager(ParamsBase):
     gmem_thr_copy_KV: cute.TiledCopy
     tPrPage: cute.Tensor
     tPrPageOffset: cute.Tensor
+    tPrVPtr: Optional[cute.Tensor]
     tKpK: cute.Tensor
     tVpV: cute.Tensor
 
@@ -59,6 +60,7 @@ class PagedKVManager(ParamsBase):
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
         arch: cutlass.Constexpr[int] = 100,
+        cache_v_ptr: cutlass.Constexpr[bool] = False,
     ):
         # SM100 transposes V in gmem to (dv, page_size, num_pages);
         # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
@@ -86,10 +88,16 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = max(1, n_block_size // num_threads)
+        page_entry_per_thread = max(1, (n_block_size + num_threads - 1) // num_threads)
+        assert not cache_v_ptr or arch == 90
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
+        tPrVPtr = (
+            cute.make_rmem_tensor((page_entry_per_thread,), cutlass.Int64)
+            if cache_v_ptr
+            else None
+        )
 
         mPageTable = mPageTable[bidb, None]
         mK_paged = mK_paged[None, None, bidh, None]
@@ -129,12 +137,17 @@ class PagedKVManager(ParamsBase):
             gmem_thr_copy_KV,
             tPrPage,
             tPrPageOffset,
+            tPrVPtr,
             tKpK,
             tVpV,
         )
 
     @cute.jit
-    def load_page_table(self, n_block: Int32):
+    def load_page_table(
+        self,
+        n_block: Int32,
+        mask_seqlen: cutlass.Constexpr[bool] = True,
+    ):
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
             row = (
                 i * self.num_threads
@@ -148,7 +161,7 @@ class PagedKVManager(ParamsBase):
 
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
-            ) and row_idx < self.seqlen_k
+            ) and (row_idx < self.seqlen_k if const_expr(mask_seqlen) else True)
             page = self.mPageTable[page_idx] if is_valid else 0
 
             self.tPrPage[i] = page
@@ -171,6 +184,17 @@ class PagedKVManager(ParamsBase):
         return tPrXPtr
 
     @cute.jit
+    def update_V_ptr(self):
+        assert self.arch == 90
+        assert self.tPrVPtr is not None
+        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+            page = self.tPrPage[i]
+            page_offset = self.tPrPageOffset[i]
+            self.tPrVPtr[i] = utils.elem_pointer(
+                self.mV_paged, (page_offset, 0, page)
+            ).toint()
+
+    @cute.jit
     def _flatten_smem_sm100(self, sX: cute.Tensor, K_or_V: str):
         """Flatten SM100 smem ((a,b), cta_split, k) to (a,(b,k)); transpose V to (d,page_size)."""
         sX_pi = cute.make_tensor(
@@ -191,7 +215,7 @@ class PagedKVManager(ParamsBase):
         tXcX: cute.Tensor,
         mX_paged_cur_copy: cute.Tensor,
         m: Int32,
-        should_load: cute.Tensor,
+        should_load: Optional[cute.Tensor],
     ):
         """Issue cp.async copies for one row across all k-tiles."""
         for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
@@ -199,15 +223,28 @@ class PagedKVManager(ParamsBase):
             mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
             tXsX_k = tXsX[None, m, k]
             mX_paged_cur_copy_ki = cute.make_tensor(mX_paged_cur_copy_ki.iterator, tXsX_k.layout)
-            cute.copy(
-                self.gmem_tiled_copy_KV,
-                mX_paged_cur_copy_ki,
-                tXsX_k,
-                pred=should_load,
-            )
+            if const_expr(should_load is not None):
+                cute.copy(
+                    self.gmem_tiled_copy_KV,
+                    mX_paged_cur_copy_ki,
+                    tXsX_k,
+                    pred=should_load,
+                )
+            else:
+                cute.copy(
+                    self.gmem_tiled_copy_KV,
+                    mX_paged_cur_copy_ki,
+                    tXsX_k,
+                )
 
     @cute.jit
-    def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
+    def load_KV(
+        self,
+        n_block: Int32,
+        sX: cute.Tensor,
+        K_or_V: str,
+        mask_seqlen: cutlass.Constexpr[bool] = True,
+    ):
         assert K_or_V in ("K", "V")
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
@@ -224,15 +261,20 @@ class PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
-        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
-
-        seqlenk_row_limit = (
-            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
-        )
+        if const_expr(mask_seqlen):
+            tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
+            seqlenk_row_limit = (
+                self.seqlen_k - n_block * self.n_block_size - tXcX[0][0]
+                if n_block >= 0
+                else 0
+            )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
-            row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
-            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
-            should_load.fill(row_valid)
+            if const_expr(mask_seqlen):
+                row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
+                should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
+                should_load.fill(row_valid)
+            else:
+                should_load = None
 
             x_ptr_i64 = utils.shuffle_sync(
                 tPrXPtr[m // self.gmem_threads_per_row],
@@ -245,3 +287,54 @@ class PagedKVManager(ParamsBase):
             mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
             self._copy_row_async(tXsX, tXcX, mX_paged_cur_copy, m, should_load)
+
+    @cute.jit
+    def load_V_cached(
+        self,
+        n_block: Int32,
+        sV: cute.Tensor,
+        update_cache: cutlass.Constexpr[bool] = True,
+    ):
+        assert self.arch == 90
+        assert self.tPrVPtr is not None
+        # Keep this separate from load_KV: passing the cached rmem pointer tensor
+        # through a nested JIT helper violates CuTeDSL region dominance.
+        sV_pi = cute.group_modes(sV, 0, 1)
+
+        cV = cute.make_identity_tensor((self.n_block_size, self.head_dim_v_padded))
+        tVsV = self.gmem_thr_copy_KV.partition_D(sV_pi)
+        tVcV = self.gmem_thr_copy_KV.partition_S(cV)
+        tVc0V = self.gmem_thr_copy_KV.get_slice(0).partition_S(cV)
+        seqlenk_row_limit = (
+            self.seqlen_k - n_block * self.n_block_size - tVcV[0][0]
+            if n_block >= 0
+            else 0
+        )
+        for m in cutlass.range_constexpr(cute.size(tVsV, mode=[1])):
+            row_valid = tVc0V[0, m, 0][0] < seqlenk_row_limit
+            should_load = cute.make_fragment_like(
+                tVsV[(0, None), m, 0], cute.Boolean
+            )
+            should_load.fill(row_valid)
+
+            v_ptr_i64 = utils.shuffle_sync(
+                self.tPrVPtr[m // self.gmem_threads_per_row],
+                m % self.gmem_threads_per_row,
+                width=self.gmem_threads_per_row,
+            )
+            v_gmem_ptr = cute.make_ptr(
+                self.mV_paged.element_type,
+                v_ptr_i64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            mV_paged_cur = cute.make_tensor(
+                v_gmem_ptr, cute.make_layout((self.head_dim_v_padded,))
+            )
+            mV_paged_cur_copy = cute.tiled_divide(
+                mV_paged_cur, (self.async_copy_elems,)
+            )
+            self._copy_row_async(tVsV, tVcV, mV_paged_cur_copy, m, should_load)
+
+        if const_expr(update_cache):
+            self.update_V_ptr()

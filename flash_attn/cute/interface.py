@@ -337,7 +337,105 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
-    return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+    return max(1, min(num_SMs // total_mblocks, max_splits, num_n_blocks))
+
+
+def _num_splits_sm90(
+    total_mblocks,
+    num_SMs,
+    num_n_blocks,
+    max_splits,
+    batch_size,
+    qhead_per_kvhead,
+    paged_kv,
+    head_dim,
+    head_dim_v,
+):
+    """Hopper split-K policy derived from measured workload boundaries."""
+    if total_mblocks == 0:
+        return 1
+
+    # Four K blocks can benefit severely underfilled multi-request GQA/MQA.
+    # Require more available CTA waves than K blocks: once four-way splitting
+    # nearly fills the GPU, combine overhead outweighs the extra parallelism.
+    allow_four_n_blocks = (
+        batch_size > 1
+        and qhead_per_kvhead > 1
+        and num_n_blocks == 4
+        and num_SMs // total_mblocks > num_n_blocks
+    )
+    if num_n_blocks <= 4 and not allow_four_n_blocks:
+        return 1
+
+    # Leave enough K work in each split to amortize the partial-output combine.
+    blocks_per_split = (
+        8 if num_n_blocks >= 192 and total_mblocks > 1 else 4
+    )
+    max_splits_for_work = (
+        max(1, num_n_blocks // blocks_per_split)
+        if num_n_blocks >= 64
+        else num_n_blocks
+    )
+    num_splits = min(
+        num_SMs // total_mblocks,
+        max_splits,
+        num_n_blocks,
+        max_splits_for_work,
+    )
+
+    # A single underfilled wave leaves Hopper d64 paged prefill idle, while
+    # two splits provide enough parallel work to amortize the combine.
+    if (
+        paged_kv
+        and batch_size == 1
+        and head_dim == head_dim_v == 64
+        and num_splits == 1
+        and num_n_blocks > 4
+        and num_SMs // 2 < total_mblocks < num_SMs
+    ):
+        num_splits = 2
+    return max(1, num_splits)
+
+
+def _combine_max_seqlen_q_sm90(arch, max_seqlen_q, is_packed_varlen):
+    return max_seqlen_q if arch // 10 == 9 and is_packed_varlen else None
+
+
+def _use_dynamic_varlen_scheduler_sm90(
+    *,
+    arch,
+    batch_size,
+    num_head,
+    num_head_kv,
+    head_dim,
+    max_seqlen_q,
+    max_seqlen_k,
+    no_explicit_window,
+    local,
+    mask_mod,
+    aux_tensors,
+):
+    """Select the measured Hopper regimes that benefit from dynamic work."""
+    if arch // 10 != 9:
+        return False
+    if batch_size > 1 or num_head == num_head_kv:
+        return True
+    return (
+        batch_size == 1
+        and head_dim == 128
+        and (
+            max_seqlen_k >= 16 * 1024
+            or (
+                max_seqlen_q >= 64 * 128
+                and max_seqlen_k >= 64 * 128
+                and num_head >= 64
+            )
+        )
+        and no_explicit_window
+        and not local
+        and mask_mod is None
+        and aux_tensors is None
+    )
 
 
 def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
@@ -402,6 +500,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    dynamic_scheduler_workspace: Optional[torch.Tensor] = None,
     compile_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
@@ -421,6 +520,12 @@ def _flash_attn_fwd(
         output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
             FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
             dequant = out_fp8 * output_scale. SM100/SM110 only.
+        dynamic_scheduler_workspace: Optional contiguous CUDA int32 tensor with
+            shape (2,). The entries are respectively the work and completion
+            counters. The caller must zero-initialize the workspace and keep it
+            exclusive to one non-overlapping launch. Violating either contract
+            silently produces incorrect output. The last finishing CTA resets
+            both entries.
         compile_only: If True, compile the selected kernel and return without
             launching it.
     """
@@ -604,6 +709,9 @@ def _flash_attn_fwd(
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
+    no_explicit_window = (
+        window_size_left is None and window_size_right is None
+    )
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
@@ -647,6 +755,17 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    if (
+        arch // 10 == 9
+        and tile_mn is None
+        and head_dim == head_dim_v
+        and head_dim in (64, 128)
+        and not local
+        and not use_block_sparsity
+        and seqlen_q_packgqa <= 64
+    ):
+        tile_m = 64
+        tile_n = 128
     if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
@@ -666,7 +785,23 @@ def _flash_attn_fwd(
     if arch // 10 == 12:
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
-        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+        num_splits = (
+            _num_splits_sm90(
+                total_mblocks,
+                num_SMs,
+                num_n_blocks,
+                128,
+                batch_size,
+                qhead_per_kvhead,
+                page_table is not None,
+                head_dim,
+                head_dim_v,
+            )
+            if arch // 10 == 9
+            else num_splits_heuristic(
+                total_mblocks, num_SMs, num_n_blocks, 128
+            )
+        )
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -679,6 +814,49 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
+    persistent_varlen_capable = (
+        arch // 10 == 9
+        and (cu_seqlens_q is not None or seqused_q is not None)
+        and batch_size == 1
+        and not is_split_kv
+    )
+    if dynamic_scheduler_workspace is not None:
+        assert arch // 10 == 9, "dynamic varlen scheduler is only supported on SM90"
+        assert cu_seqlens_q is not None or seqused_q is not None
+        assert dynamic_scheduler_workspace.dtype == torch.int32
+        assert dynamic_scheduler_workspace.is_cuda
+        assert dynamic_scheduler_workspace.device == device
+        assert dynamic_scheduler_workspace.shape == (2,)
+        assert dynamic_scheduler_workspace.stride(0) == 1
+    dynamic_varlen_capable = (
+        dynamic_scheduler_workspace is not None
+        and arch // 10 == 9
+        and (cu_seqlens_q is not None or seqused_q is not None)
+    )
+    use_dynamic_varlen = (
+        dynamic_varlen_capable
+        and not is_split_kv
+        and _use_dynamic_varlen_scheduler_sm90(
+            arch=arch,
+            batch_size=batch_size,
+            num_head=num_head,
+            num_head_kv=num_head_kv,
+            head_dim=head_dim,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            no_explicit_window=no_explicit_window,
+            local=local,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+        )
+    )
+    dynamic_scheduler_workspace_effective = (
+        dynamic_scheduler_workspace if use_dynamic_varlen else None
+    )
+    use_persistent_varlen = persistent_varlen_capable and not use_dynamic_varlen
+    persistent_scheduler_sm_count = (
+        num_SMs if use_persistent_varlen or use_dynamic_varlen else None
+    )
     if is_split_kv:
         if isinstance(q, _CompileOnlyTensorSpec):
             out_partial = _make_compile_only_tensor_spec(
@@ -865,6 +1043,10 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
+        use_persistent_varlen,
+        use_dynamic_varlen,
+        # The persistent grid shape bakes this trace-time value into the cubin.
+        persistent_scheduler_sm_count,
         use_clc_scheduler,
         q is not None,
         qv is not None,
@@ -884,11 +1066,20 @@ def _flash_attn_fwd(
             seqused_k_tensor,
             learnable_sink_tensor,
             output_scale_tensor, # 1d scalar tensor
+            dynamic_scheduler_workspace_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale)
+            for t in (
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                learnable_sink,
+                output_scale,
+                dynamic_scheduler_workspace_effective,
+            )
         ]
         dynamic_causal_tensor = (
             to_cute_tensor(dynamic_causal, assumed_align=4, leading_dim=0)
@@ -981,6 +1172,9 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                use_persistent_varlen=use_persistent_varlen,
+                use_dynamic_varlen=use_dynamic_varlen,
+                persistent_scheduler_sm_count=persistent_scheduler_sm_count,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
             )
@@ -1167,6 +1361,8 @@ def _flash_attn_fwd(
             # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
             if not use_dedicated_hd256_kernel:
                 compile_args.append(output_scale_tensor)
+            if arch // 10 == 9:
+                compile_args.append(dynamic_scheduler_workspace_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1253,6 +1449,8 @@ def _flash_attn_fwd(
             # See the TODO above: hd256/MLA kernels don't take output_scale yet.
             if not use_dedicated_hd256_kernel:
                 call_args.append(output_scale)
+            if arch // 10 == 9:
+                call_args.append(dynamic_scheduler_workspace_effective)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1262,6 +1460,9 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            max_seqlen_q=_combine_max_seqlen_q_sm90(
+                arch, max_seqlen_q, cu_seqlens_q is not None
+            ),
             output_scale=output_scale,
         )
     return out, lse, p, row_max
@@ -3097,6 +3298,7 @@ def compile_flash_attn_varlen_func_from_specs(
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx, output_quant_key,
+    use_max_seqlen_q,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -3144,12 +3346,18 @@ def _compile_fwd_combine(
     mSemaphore = None  # Not parametrized in compile_key
     output_scale = fake_tensor(Float32, (1,), divisibility=1) if output_quant_key is not None else None
 
-    return cute.compile(
-        fa_combine,
+    compile_args = [
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
         output_scale,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+    ]
+    compile_args.append(Int32(1) if use_max_seqlen_q else None)
+    compile_args.append(
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    )
+    return cute.compile(
+        fa_combine,
+        *compile_args,
         options="--enable-tvm-ffi",
     )
 
@@ -3165,6 +3373,7 @@ def _flash_attn_fwd_combine(
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -3182,6 +3391,10 @@ def _flash_attn_fwd_combine(
         seqused: Used sequence lengths for each batch
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
+        max_seqlen_q: Maximum query sequence length for packed variable-length
+            input. It must be at least the true maximum; a smaller value leaves
+            output rows unwritten. Defaults to total_q, preserving the previous
+            launch shape when omitted.
         k_block_size: Block size for head dimension
 
     Returns:
@@ -3214,6 +3427,8 @@ def _flash_attn_fwd_combine(
     head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
+    if max_seqlen_q is not None:
+        assert max_seqlen_q > 0
     # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
     # so that kBlockM is smaller and we have more parallelism.
     k_block_size = 64 if head_dim <= 64 else 128
@@ -3241,18 +3456,22 @@ def _flash_attn_fwd_combine(
         lse is not None,
         varlen_batch_idx is not None,
         output_quant_key,
+        max_seqlen_q is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
             *compile_key
         )
     if not is_fake_mode():
-        _flash_attn_fwd_combine.compile_cache[compile_key](
+        call_args = [
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
             output_scale,
-        )
+        ]
+        if max_seqlen_q is not None:
+            call_args.append(max_seqlen_q)
+        _flash_attn_fwd_combine.compile_cache[compile_key](*call_args)
 
 
 _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")

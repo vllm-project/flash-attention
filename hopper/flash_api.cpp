@@ -43,19 +43,21 @@ inline tsa::DeviceGuard make_cuda_guard_from_tensor(const Tensor& t) {
 
 std::deque<std::once_flag> device_flags;
 std::vector<cudaDeviceProp> device_properties;
+std::once_flag vectors_init_flag;
 
-void initVectors() {
-  static bool init_flag [[maybe_unused]] = []() {
-    int device_count;
-    cudaError_t err = cudaGetDeviceCount(&device_count);
-    if (err != cudaSuccess) {
-      STD_TORCH_CHECK(false, "cudaGetDeviceCount failed: " +
-                                 std::string(cudaGetErrorString(err)));
-    }
-    device_flags.resize(device_count);
-    device_properties.resize(device_count);
-    return true;
-  }();
+void do_init_device_vectors() {
+  int device_count;
+  cudaError_t err = cudaGetDeviceCount(&device_count);
+  if (err != cudaSuccess) {
+    STD_TORCH_CHECK(false, "cudaGetDeviceCount failed: " +
+                               std::string(cudaGetErrorString(err)));
+  }
+  device_flags.resize(device_count);
+  device_properties.resize(device_count);
+}
+
+void initDeviceVectors() {
+  std::call_once(vectors_init_flag, do_init_device_vectors);
 }
 
 void initDeviceProperty(int device_index) {
@@ -69,22 +71,27 @@ void initDeviceProperty(int device_index) {
 }
 
 cudaDeviceProp* get_device_prop() {
-  initVectors();
+  initDeviceVectors();
   int device_index;
   cudaError_t err = cudaGetDevice(&device_index);
   if (err != cudaSuccess) {
     STD_TORCH_CHECK(false, "cudaGetDevice failed: " +
                                std::string(cudaGetErrorString(err)));
   }
+  STD_TORCH_CHECK(device_index >= 0 && static_cast<size_t>(device_index) <
+                                           device_properties.size(),
+                  "CUDA device index " + std::to_string(device_index) +
+                      " out of range [0, " +
+                      std::to_string(device_properties.size()) + ")");
   std::call_once(device_flags[device_index], initDeviceProperty, device_index);
   return &device_properties[device_index];
 }
 
-inline cudaStream_t get_cuda_stream(const Tensor& t) {
+inline cudaStream_t get_current_cuda_stream(int32_t device_index = -1) {
   void* stream_ptr = nullptr;
   TORCH_ERROR_CODE_CHECK(
-      aoti_torch_get_current_cuda_stream(t.get_device_index(), &stream_ptr));
-  return static_cast<cudaStream_t>(stream_ptr);
+      aoti_torch_get_current_cuda_stream(device_index, &stream_ptr));
+  return reinterpret_cast<cudaStream_t>(stream_ptr);
 }
 } // namespace
 
@@ -709,7 +716,7 @@ mha_fwd_get_scheduler_metadata(
         auto kBlockMN_kernel_args_sm8x = tile_size_fwd_sm8x(params.arch == 86 || params.arch == 89, params.d_rounded, params.dv_rounded, params.is_causal, params.is_local, params.is_e4m3 ? 1 : 2 /*element_size*/, params.page_table, is_varlen && params.num_splits > 1, params.softcap > 0.f, params.knew_ptr);
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
-        auto stream = get_cuda_stream(seqused_k);
+        auto stream = get_current_cuda_stream(seqused_k.get_device_index());
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -1270,7 +1277,7 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
     #endif
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-        auto stream = get_cuda_stream(q);
+        auto stream = get_current_cuda_stream(q.get_device_index());
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == ScalarType::BFloat16) {
@@ -1635,7 +1642,7 @@ std::vector<Tensor> mha_bwd(
     #endif
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-        auto stream = get_cuda_stream(q);
+        auto stream = get_current_cuda_stream(q.get_device_index());
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1738,7 +1745,7 @@ mha_combine(const Tensor &out_partial,         // num_splits x batch_size x seql
     params.arch = get_device_prop()->major * 10 + get_device_prop()->minor;
 
     if (seqlen > 0 && batch_size > 0) {
-        auto stream = get_cuda_stream(out_partial);
+        auto stream = get_current_cuda_stream(out_partial.get_device_index());
         run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
 

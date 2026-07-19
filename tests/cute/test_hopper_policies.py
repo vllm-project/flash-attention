@@ -17,7 +17,7 @@ from flash_attn.cute.tile_scheduler import (
     StaticPersistentVarlenTileScheduler,
     _sm90_gqa_l2_divisor,
 )
-from flash_attn.cute.testing import maybe_fake_tensor_mode
+from flash_attn.cute.testing import attention_ref, maybe_fake_tensor_mode
 
 
 @pytest.mark.parametrize(
@@ -253,6 +253,8 @@ def _dynamic_selector(**overrides):
             },
             True,
         ),
+        ({"batch_size": 2, "mask_mod": object()}, False),
+        ({"num_head_kv": 32, "aux_tensors": []}, False),
         ({"max_seqlen_k": 16 * 1024 - 1}, False),
         ({"num_head": 64, "max_seqlen_q": 8192, "max_seqlen_k": 8192}, True),
         ({"num_head": 60, "max_seqlen_q": 8192, "max_seqlen_k": 8192}, False),
@@ -296,61 +298,38 @@ def test_dynamic_varlen_selector_rejects_non_sm90(arch):
     )
 
 
-@pytest.mark.parametrize("arch", [80, 100, 110, 120])
-@maybe_fake_tensor_mode()
-def test_dynamic_workspace_rejects_non_sm90(arch):
-    dtype = torch.bfloat16
-    q = torch.empty((1, 1, 64), device="cuda", dtype=dtype)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-    cu_seqlens = torch.empty(2, device="cuda", dtype=torch.int32)
-    workspace = torch.zeros(2, device="cuda", dtype=torch.int32)
-
-    with pytest.raises(
-        AssertionError,
-        match="dynamic varlen scheduler is only supported on SM90",
-    ):
-        _flash_attn_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=1,
-            max_seqlen_k=1,
-            dynamic_scheduler_workspace=workspace,
-            _arch=arch,
-            compile_only=True,
-        )
-
-
 IS_SM90 = (
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
 )
 
 
 @pytest.mark.skipif(not IS_SM90, reason="SM90 dynamic scheduler regression")
-def test_dynamic_scheduler_workspace_resets_eager_and_graph():
+def test_dynamic_scheduler_uses_internal_state(monkeypatch):
     torch.manual_seed(0)
     device = "cuda"
     dtype = torch.bfloat16
     batch_size, seqlen_q, seqlen_k = 2, 1, 256
     num_heads, head_dim = 4, 64
-    q = torch.randn(
-        batch_size * seqlen_q,
+    q_padded = torch.randn(
+        batch_size,
+        seqlen_q,
         num_heads,
         head_dim,
         device=device,
         dtype=dtype,
     )
-    k = torch.randn(
-        batch_size * seqlen_k,
+    k_padded = torch.randn(
+        batch_size,
+        seqlen_k,
         num_heads,
         head_dim,
         device=device,
         dtype=dtype,
     )
-    v = torch.randn_like(k)
+    v_padded = torch.randn_like(k_padded)
+    q = q_padded.flatten(0, 1)
+    k = k_padded.flatten(0, 1)
+    v = v_padded.flatten(0, 1)
     cu_seqlens_q = torch.arange(
         batch_size + 1, device=device, dtype=torch.int32
     )
@@ -361,11 +340,17 @@ def test_dynamic_scheduler_workspace_resets_eager_and_graph():
         device=device,
         dtype=torch.int32,
     )
-    workspace = torch.zeros(2, device=device, dtype=torch.int32)
-    out = torch.empty_like(q)
+    selected = []
+    original_init = interface.FlashAttentionForwardSm90.__init__
 
-    def run():
-        _flash_attn_fwd(
+    def record_init(self, *args, **kwargs):
+        selected.append(kwargs["use_dynamic_varlen"])
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(interface.FlashAttentionForwardSm90, "__init__", record_init)
+    _flash_attn_fwd.compile_cache.clear()
+    try:
+        out, *_ = _flash_attn_fwd(
             q,
             k,
             v,
@@ -374,93 +359,13 @@ def test_dynamic_scheduler_workspace_resets_eager_and_graph():
             max_seqlen_q=seqlen_q,
             max_seqlen_k=seqlen_k,
             num_splits=1,
-            out=out,
-            dynamic_scheduler_workspace=workspace,
+            causal=True,
         )
-
-    run()
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(workspace).item() == 0
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    for _ in range(100):
-        graph.replay()
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(workspace).item() == 0
-
-
-@pytest.mark.skipif(not IS_SM90, reason="SM90 dynamic scheduler regression")
-@pytest.mark.parametrize(
-    "batch_size,num_heads,num_heads_kv,num_splits,seqlen_k,head_dim,"
-    "causal,window_size_right",
-    [
-        (1, 8, 1, 1, 640, 64, False, None),  # Short GQA is not selected.
-        (2, 4, 4, 2, 640, 64, False, None),  # Split-K disables dynamic.
-        (1, 8, 1, 1, 16 * 1024, 128, False, 0),  # Explicit right=0.
-    ],
-)
-def test_ineffective_workspace_reuses_compile_key(
-    batch_size,
-    num_heads,
-    num_heads_kv,
-    num_splits,
-    seqlen_k,
-    head_dim,
-    causal,
-    window_size_right,
-):
-    torch.manual_seed(0)
-    device = "cuda"
-    dtype = torch.bfloat16
-    seqlen_q = 1
-    q = torch.randn(
-        batch_size * seqlen_q,
-        num_heads,
-        head_dim,
-        device=device,
-        dtype=dtype,
-    )
-    k = torch.randn(
-        batch_size * seqlen_k,
-        num_heads_kv,
-        head_dim,
-        device=device,
-        dtype=dtype,
-    )
-    v = torch.randn_like(k)
-    cu_seqlens_q = torch.arange(
-        batch_size + 1, device=device, dtype=torch.int32
-    )
-    cu_seqlens_k = torch.arange(
-        0,
-        (batch_size + 1) * seqlen_k,
-        seqlen_k,
-        device=device,
-        dtype=torch.int32,
-    )
-    workspace = torch.zeros(2, device=device, dtype=torch.int32)
-
-    def run(dynamic_scheduler_workspace=None):
-        _flash_attn_fwd(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=seqlen_q,
-            max_seqlen_k=seqlen_k,
-            num_splits=num_splits,
-            causal=causal,
-            window_size_right=window_size_right,
-            dynamic_scheduler_workspace=dynamic_scheduler_workspace,
+        torch.cuda.synchronize()
+        assert selected == [True]
+        out_ref, _ = attention_ref(q_padded, k_padded, v_padded, causal=True)
+        torch.testing.assert_close(
+            out.view_as(q_padded), out_ref, atol=1e-2, rtol=1e-2
         )
-
-    _flash_attn_fwd.compile_cache.clear()
-    run()
-    keys_without_workspace = set(_flash_attn_fwd.compile_cache.cache)
-    run(workspace)
-    torch.cuda.synchronize()
-    assert set(_flash_attn_fwd.compile_cache.cache) == keys_without_workspace
-    assert torch.count_nonzero(workspace).item() == 0
+    finally:
+        _flash_attn_fwd.compile_cache.clear()

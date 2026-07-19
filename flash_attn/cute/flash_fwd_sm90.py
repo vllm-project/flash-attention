@@ -213,7 +213,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
         output_scale: Optional[cute.Tensor] = None,
-        mSchedulerWorkspace: Optional[cute.Tensor] = None,
+        mWorkCounter: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -467,7 +467,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             aux_data,
             fastdiv_mods,
             output_scale,
-            mSchedulerWorkspace,
+            mWorkCounter,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -517,7 +517,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         output_scale: Optional[cute.Tensor] = None,
-        mSchedulerWorkspace: Optional[cute.Tensor] = None,
+        mWorkCounter: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -688,7 +688,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 sWorkInfo,
-                mSchedulerWorkspace,
+                mWorkCounter,
                 num_splits,
             )
 
@@ -729,27 +729,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 num_splits,
             )
 
-        if const_expr(self.use_dynamic_varlen):
-            cute.arch.sync_threads()
-            tidx, _, _ = cute.arch.thread_idx()
-            if tidx == 0:
-                # Workspace layout is [work counter, completion counter]. The
-                # last finishing CTA resets both for the next exclusive launch.
-                done_ptr = (mSchedulerWorkspace.iterator + 1).llvm_ptr
-                done = cute.arch.atomic_add(
-                    done_ptr, Int32(1), sem="release", scope="gpu"
-                )
-                if done == cute.arch.grid_dim()[0] - 1:
-                    cute.arch.store(
-                        mSchedulerWorkspace.iterator.llvm_ptr,
-                        Int32(0),
-                        sem="release",
-                        scope="gpu",
-                    )
-                    cute.arch.store(
-                        done_ptr, Int32(0), sem="release", scope="gpu"
-                    )
-
     @cute.jit
     def load(
         self,
@@ -772,7 +751,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         sWorkInfo: Optional[cute.Tensor],
-        mSchedulerWorkspace: Optional[cute.Tensor],
+        mWorkCounter: Optional[cute.Tensor],
         num_splits: Int32 = Int32(1),
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -794,7 +773,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             work_tile = (
                 self.publish_dynamic_work(
                     tile_scheduler,
-                    mSchedulerWorkspace,
+                    mWorkCounter,
                     sWorkInfo,
                     work_info_phase,
                     warp_idx_in_wg,
@@ -1088,7 +1067,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.use_dynamic_varlen):
                     work_tile = self.publish_dynamic_work(
                         tile_scheduler,
-                        mSchedulerWorkspace,
+                        mWorkCounter,
                         sWorkInfo,
                         work_info_phase,
                         warp_idx_in_wg,
@@ -1123,13 +1102,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def publish_dynamic_work(
         self,
         tile_scheduler: DynamicPersistentVarlenTileScheduler,
-        mSchedulerWorkspace: cute.Tensor,
+        mWorkCounter: cute.Tensor,
         sWorkInfo: Optional[cute.Tensor],
         work_info_phase: Int32,
         warp_idx_in_wg: Int32,
     ) -> WorkTileInfo:
         if warp_idx_in_wg == 0:
-            claimed_work = tile_scheduler.claim_next_work(mSchedulerWorkspace)
+            claimed_work = tile_scheduler.claim_next_work(mWorkCounter)
             if cute.arch.lane_idx() == 0:
                 m_block, head_idx, batch_idx, split_idx = claimed_work.tile_idx
                 sWorkInfo[0, work_info_phase] = m_block

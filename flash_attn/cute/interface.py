@@ -416,7 +416,7 @@ def _use_dynamic_varlen_scheduler_sm90(
     aux_tensors,
 ):
     """Select the measured Hopper regimes that benefit from dynamic work."""
-    if arch // 10 != 9:
+    if arch // 10 != 9 or mask_mod is not None or aux_tensors is not None:
         return False
     if batch_size > 1 or num_head == num_head_kv:
         return True
@@ -433,8 +433,6 @@ def _use_dynamic_varlen_scheduler_sm90(
         )
         and no_explicit_window
         and not local
-        and mask_mod is None
-        and aux_tensors is None
     )
 
 
@@ -500,7 +498,6 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
-    dynamic_scheduler_workspace: Optional[torch.Tensor] = None,
     compile_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
@@ -520,12 +517,6 @@ def _flash_attn_fwd(
         output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
             FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
             dequant = out_fp8 * output_scale. SM100/SM110 only.
-        dynamic_scheduler_workspace: Optional contiguous CUDA int32 tensor with
-            shape (2,). The entries are respectively the work and completion
-            counters. The caller must zero-initialize the workspace and keep it
-            exclusive to one non-overlapping launch. Violating either contract
-            silently produces incorrect output. The last finishing CTA resets
-            both entries.
         compile_only: If True, compile the selected kernel and return without
             launching it.
     """
@@ -593,6 +584,7 @@ def _flash_attn_fwd(
             assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
 
     q_dtype = q.dtype if q is not None else qv.dtype
+    device = v.device
 
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -630,6 +622,14 @@ def _flash_attn_fwd(
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     if dynamic_causal is not None:
         assert arch // 10 == 9, "dynamic_causal is only supported on SM90 (Hopper)."
+        _validate_tensor(
+            dynamic_causal,
+            "dynamic_causal",
+            (batch_size,),
+            torch.int32,
+            device,
+        )
+        assert dynamic_causal.stride(0) == 1, "dynamic_causal must be contiguous"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
     if arch // 10 not in [8, 12]:
@@ -664,7 +664,6 @@ def _flash_attn_fwd(
     else:
         out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
         output_quant_key = None
-    device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
     if qv is None:
@@ -820,17 +819,8 @@ def _flash_attn_fwd(
         and batch_size == 1
         and not is_split_kv
     )
-    if dynamic_scheduler_workspace is not None:
-        assert arch // 10 == 9, "dynamic varlen scheduler is only supported on SM90"
-        assert cu_seqlens_q is not None or seqused_q is not None
-        assert dynamic_scheduler_workspace.dtype == torch.int32
-        assert dynamic_scheduler_workspace.is_cuda
-        assert dynamic_scheduler_workspace.device == device
-        assert dynamic_scheduler_workspace.shape == (2,)
-        assert dynamic_scheduler_workspace.stride(0) == 1
     dynamic_varlen_capable = (
-        dynamic_scheduler_workspace is not None
-        and arch // 10 == 9
+        arch // 10 == 9
         and (cu_seqlens_q is not None or seqused_q is not None)
     )
     use_dynamic_varlen = (
@@ -850,8 +840,14 @@ def _flash_attn_fwd(
             aux_tensors=aux_tensors,
         )
     )
-    dynamic_scheduler_workspace_effective = (
-        dynamic_scheduler_workspace if use_dynamic_varlen else None
+    dynamic_scheduler_counter = (
+        _make_compile_only_tensor_spec((1,), torch.int32, assumed_align=4)
+        if use_dynamic_varlen and isinstance(v, _CompileOnlyTensorSpec)
+        else (
+            torch.zeros((1,), dtype=torch.int32, device=device)
+            if use_dynamic_varlen
+            else None
+        )
     )
     use_persistent_varlen = persistent_varlen_capable and not use_dynamic_varlen
     persistent_scheduler_sm_count = (
@@ -1011,6 +1007,7 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         causal,
+        dynamic_causal is not None,
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
@@ -1066,7 +1063,7 @@ def _flash_attn_fwd(
             seqused_k_tensor,
             learnable_sink_tensor,
             output_scale_tensor, # 1d scalar tensor
-            dynamic_scheduler_workspace_tensor,
+            dynamic_scheduler_counter_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
@@ -1078,7 +1075,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 learnable_sink,
                 output_scale,
-                dynamic_scheduler_workspace_effective,
+                dynamic_scheduler_counter,
             )
         ]
         dynamic_causal_tensor = (
@@ -1362,7 +1359,7 @@ def _flash_attn_fwd(
             if not use_dedicated_hd256_kernel:
                 compile_args.append(output_scale_tensor)
             if arch // 10 == 9:
-                compile_args.append(dynamic_scheduler_workspace_tensor)
+                compile_args.append(dynamic_scheduler_counter_tensor)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1450,7 +1447,7 @@ def _flash_attn_fwd(
             if not use_dedicated_hd256_kernel:
                 call_args.append(output_scale)
             if arch // 10 == 9:
-                call_args.append(dynamic_scheduler_workspace_effective)
+                call_args.append(dynamic_scheduler_counter)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(

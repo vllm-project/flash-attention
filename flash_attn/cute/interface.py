@@ -3037,6 +3037,7 @@ def compile_flash_attn_varlen_func_from_specs(
     v_shape: Tuple[int, ...],
     q_dtype: torch.dtype,
     v_stride: Optional[Tuple[int, ...]] = None,
+    k_stride: Optional[Tuple[int, ...]] = None,
     cu_seqlens_q_shape: Optional[Tuple[int, ...]] = None,
     cu_seqlens_k_shape: Optional[Tuple[int, ...]] = None,
     max_seqlen_q: Optional[int] = None,
@@ -3046,9 +3047,15 @@ def compile_flash_attn_varlen_func_from_specs(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     num_splits: int = 1,
     return_lse: bool = False,
+    seqused_k_shape: Optional[Tuple[int, ...]] = None,
+    page_table_shape: Optional[Tuple[int, ...]] = None,
+    q_descale: bool = False,
+    k_descale: bool = False,
+    v_descale: bool = False,
+    softcap: Optional[float] = None,
 ):
     q = _make_compile_only_tensor_spec(q_shape, q_dtype)
-    k = _make_compile_only_tensor_spec(k_shape, q_dtype)
+    k = _make_compile_only_tensor_spec(k_shape, q_dtype, stride=k_stride)
     v = _make_compile_only_tensor_spec(v_shape, q_dtype, stride=v_stride)
     out = _make_compile_only_tensor_spec(
         (*q_shape[:-1], v_shape[-1]),
@@ -3080,16 +3087,28 @@ def compile_flash_attn_varlen_func_from_specs(
         cu_seqlens_k=_make_compile_only_tensor_spec(
             cu_seqlens_k_shape, torch.int32, 4
         ),
+        seqused_k=_make_compile_only_tensor_spec(seqused_k_shape, torch.int32, 4),
+        page_table=_make_compile_only_tensor_spec(page_table_shape, torch.int32, 4),
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
+        softcap=softcap,
         window_size_left=window_size[0],
         window_size_right=window_size[1],
         num_splits=num_splits,
         return_lse=return_lse,
         out=out,
         lse=lse,
+        q_descale=_make_compile_only_tensor_spec((1,), torch.float32, 4)
+        if q_descale
+        else None,
+        k_descale=_make_compile_only_tensor_spec((1,), torch.float32, 4)
+        if k_descale
+        else None,
+        v_descale=_make_compile_only_tensor_spec((1,), torch.float32, 4)
+        if v_descale
+        else None,
         compile_only=True,
     )
 

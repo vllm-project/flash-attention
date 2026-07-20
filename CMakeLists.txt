@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.26)
 
 project(vllm_flash_attn LANGUAGES CXX CUDA)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(FA2_ENABLED ON)

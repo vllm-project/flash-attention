@@ -55,7 +55,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &s_aux_,
         int const cp_world_size,
         int const cp_rank,
-        std::optional<const at::Tensor> &cp_tot_seqused_k
+        std::optional<const at::Tensor> &cp_tot_seqused_k,
+        bool batch_invariant
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -83,7 +84,8 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        bool batch_invariant
 );
 
 /**
@@ -126,7 +128,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  s_aux,"
             "    int      cp_world_size,"
             "    int      cp_rank,"
-            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+            "    Tensor?  cp_tot_seqused_k,"
+            "    bool     batch_invariant=False) -> Tensor[]");
     ops.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
 
     ops.def("get_scheduler_metadata("
@@ -152,7 +155,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     has_softcap,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
-            "    int      sm_margin) -> Tensor");
+            "    int      sm_margin,"
+            "    bool     batch_invariant=False) -> Tensor");
    ops.impl("get_scheduler_metadata", torch::kCUDA, 
         make_pytorch_shim(&mha_fwd_get_scheduler_metadata));
 }

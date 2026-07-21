@@ -432,6 +432,7 @@ void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool ena
 }
 
 inline bool get_pagedkv_tma(Flash_fwd_params const& params) {
+    if (params.batch_invariant) { return false; }
     // disable for local since we move k_ptr to start of sliding window by m_block
     if (params.arch < 90 || !params.page_table || params.leftpad_k || params.knew_ptr || params.is_local) { return false; }
     // This needs to match the kernel configs
@@ -466,6 +467,7 @@ inline bool get_pack_gqa(Flash_fwd_params const& params) {
 }
 
 inline int get_num_splits(Flash_fwd_params const& params) {
+    if (params.batch_invariant) { return 1; }
     #ifdef FLASHATTENTION_DISABLE_SPLIT
     return 1;
     #else
@@ -574,7 +576,8 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        bool batch_invariant
         ) {
 
     TORCH_CHECK(qkv_dtype == at::ScalarType::Half || qkv_dtype == at::ScalarType::BFloat16 || qkv_dtype == at::ScalarType::Float8_e4m3fn,
@@ -595,6 +598,7 @@ mha_fwd_get_scheduler_metadata(
     params.d_rounded = round_up_headdim(headdim);
     params.dv_rounded = headdim_v == headdim ? params.d_rounded : round_up_headdimv(headdim_v);
     params.seqlen_knew = max_seqlen_k_new;
+    params.batch_invariant = batch_invariant;
 
     bool const is_varlen_q = cu_seqlens_q_.has_value();
     params.cu_seqlens_q = is_varlen_q ? cu_seqlens_q_.value().data_ptr<int>() : nullptr;
@@ -608,7 +612,8 @@ mha_fwd_get_scheduler_metadata(
     if (window_size_left >= max_seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (max_seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (!batch_invariant && max_seqlen_q == 1 && window_size_left == -1 &&
+        window_size_right == -1) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((headdim <= 64 || headdim > 128) || !page_size.has_value()) {
             is_causal = false;
@@ -635,7 +640,9 @@ mha_fwd_get_scheduler_metadata(
     params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    params.num_splits = batch_invariant
+        ? 1
+        : (num_splits <= 0 ? get_num_splits(params) : num_splits);
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split
     params.pack_gqa |= params.num_splits > 1;
@@ -745,7 +752,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<const at::Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        std::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        std::optional<const at::Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
+        bool batch_invariant
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -839,7 +847,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
     if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
     // causal=true is the same as causal=false in this case
-    if (seqlen_q == 1 && window_size_left == -1 && window_size_right == -1) {
+    if (!batch_invariant && seqlen_q == 1 && window_size_left == -1 &&
+        window_size_right == -1) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
         if ((head_size <= 64 || head_size > 128) || !paged_KV) {
             is_causal = false;
@@ -1029,9 +1038,12 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
+    params.batch_invariant = batch_invariant;
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    params.num_splits = batch_invariant
+        ? 1
+        : (num_splits <= 0 ? get_num_splits(params) : num_splits);
     // printf("Num splits = %d.\n", params.num_splits);
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
     // Always enable PackGQA for Split

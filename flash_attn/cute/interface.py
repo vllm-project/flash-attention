@@ -38,6 +38,15 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_decode_sm120 import FlashAttentionDecodeSm120
+from flash_attn.cute.sm120_paged_decode import (
+    Sm120PagedDecodeD256Metadata,
+    build_sm120_paged_decode_d256_compile_plan,
+    build_sm120_paged_decode_d256_warmup_plan,
+    select_sm120_paged_decode_d256_num_splits,
+    sm120_paged_decode_d256_available,
+    sm120_paged_decode_d256_enabled,
+)
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -338,6 +347,174 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+
+
+def _try_flash_attn_sm120_paged_decode_d256(
+    *,
+    q,
+    k,
+    v,
+    out,
+    lse,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_q,
+    seqused_k,
+    page_table,
+    batch_size,
+    total_q,
+    num_head,
+    num_head_kv,
+    head_dim,
+    head_dim_v,
+    q_dtype,
+    page_size,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    causal,
+    local,
+    qv,
+    score_mod,
+    mask_mod,
+    softcap,
+    learnable_sink,
+    block_sparse_tensors,
+    q_descale,
+    k_descale,
+    v_descale,
+    requires_grad,
+    arch,
+    num_splits,
+    current_stream,
+    compile_only,
+):
+    """Launch the bounded SM120 BF16 D256 B1 paged-decode specialization.
+
+    Returning ``None`` means fail closed: the caller resumes the existing FA4
+    path.  This function owns no long-lived tensor/workspace cache; that is the
+    safe alternative to a hot-plan until a lifecycle proof is available.
+    """
+    if not sm120_paged_decode_d256_enabled():
+        return None
+    metadata = Sm120PagedDecodeD256Metadata(
+        capability=arch,
+        dtype=q_dtype,
+        batch_size=batch_size,
+        query_tokens=max_seqlen_q,
+        query_heads=num_head,
+        kv_heads=num_head_kv,
+        head_dim=head_dim,
+        page_size=page_size or 0,
+        kv_tokens=max_seqlen_k,
+        paged_kv=page_table is not None,
+        has_cu_seqlens_q=cu_seqlens_q is not None,
+        has_seqused_k=seqused_k is not None,
+        causal_or_full_decode=not local,
+        has_unsupported_feature=(
+            requires_grad
+            or total_q != 1
+            or head_dim_v != 256
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or qv is not None
+            or score_mod is not None
+            or mask_mod is not None
+            or softcap is not None
+            or learnable_sink is not None
+            or block_sparse_tensors is not None
+            or q_descale is not None
+            or k_descale is not None
+            or v_descale is not None
+        ),
+    )
+    if not sm120_paged_decode_d256_available(metadata):
+        return None
+
+    selected_splits = select_sm120_paged_decode_d256_num_splits(metadata.kv_tokens)
+    if num_splits not in (0, 1, selected_splits):
+        return None
+
+    if isinstance(q, _CompileOnlyTensorSpec):
+        out_partial = _make_compile_only_tensor_spec(
+            (selected_splits, total_q, num_head, head_dim_v), torch.float32
+        )
+        lse_partial = _make_compile_only_tensor_spec(
+            (selected_splits, num_head, total_q), torch.float32, assumed_align=4
+        )
+    else:
+        out_partial = torch.empty(
+            selected_splits, total_q, num_head, head_dim_v,
+            dtype=torch.float32, device=v.device,
+        )
+        lse_partial = torch.empty(
+            selected_splits, num_head, total_q, dtype=torch.float32, device=v.device
+        )
+
+    decode_key = (cutlass.BFloat16, selected_splits, metadata.page_size)
+    if decode_key not in _flash_attn_fwd.sm120_paged_decode_cache:
+        decode = FlashAttentionDecodeSm120(
+            cutlass.BFloat16,
+            256,
+            256,
+            6,
+            selected_splits,
+            tile_n=32,
+            num_threads=256,
+            page_size=metadata.page_size,
+        )
+        _flash_attn_fwd.sm120_paged_decode_cache[decode_key] = cute.compile(
+            decode,
+            to_cute_tensor(q),
+            to_cute_tensor(k),
+            to_cute_tensor(v),
+            to_cute_tensor(out_partial, assumed_align=4),
+            to_cute_tensor(lse_partial, assumed_align=4),
+            Float32(softmax_scale),
+            to_cute_tensor(page_table),
+            to_cute_tensor(seqused_k),
+            current_stream,
+            options="--enable-tvm-ffi",
+        )
+
+    combine_key = (
+        cutlass.BFloat16,
+        Float32,
+        256,
+        8,
+        128,
+        max(math.ceil(math.log2(selected_splits)), 5),
+        True,
+        False,
+        lse is not None,
+        False,
+        None,
+    )
+    if combine_key not in _flash_attn_fwd_combine.compile_cache:
+        _flash_attn_fwd_combine.compile_cache[combine_key] = _compile_fwd_combine(
+            *combine_key
+        )
+    if compile_only:
+        return out, lse, None, None
+    if not is_fake_mode():
+        _flash_attn_fwd.sm120_paged_decode_cache[decode_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out_partial,
+            lse_partial,
+            Float32(softmax_scale),
+            page_table,
+            seqused_k,
+        )
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial.transpose(-1, -2),
+            out,
+            lse.transpose(-1, -2) if lse is not None else None,
+            cu_seqlens_q,
+        )
+    return out, lse, None, None
 
 
 def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
@@ -659,6 +836,49 @@ def _flash_attn_fwd(
         seqlen_k_loaded = max(0, min(max_seqlen_k, win_right + win_left + 1 + tile_m))
     else:
         seqlen_k_loaded = max_seqlen_k
+
+    specialized_result = _try_flash_attn_sm120_paged_decode_d256(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        batch_size=batch_size,
+        total_q=total_q,
+        num_head=num_head,
+        num_head_kv=num_head_kv,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        q_dtype=q_dtype,
+        page_size=page_size,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        local=local,
+        qv=qv,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        softcap=softcap,
+        learnable_sink=learnable_sink,
+        block_sparse_tensors=block_sparse_tensors,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        requires_grad=requires_grad,
+        arch=arch,
+        num_splits=num_splits,
+        current_stream=current_stream,
+        compile_only=compile_only,
+    )
+    if specialized_result is not None:
+        return specialized_result
+
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -1268,6 +1488,7 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
+_flash_attn_fwd.sm120_paged_decode_cache = get_jit_cache("sm120_paged_decode")
 
 
 def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, nheads_major=False):
@@ -3028,6 +3249,102 @@ def flash_attn_varlen_func(
         out,
         output_scale,
     )
+
+
+def compile_sm120_paged_decode_d256_from_specs(
+    *,
+    kv_tokens: int,
+    page_size: int,
+    softmax_scale: Optional[float] = None,
+):
+    """Compile the bounded SM120 D256 paged-decode forward and combine pair.
+
+    This is deliberately a narrow public compile-only contract.  It is the
+    same selector used by runtime routing and it does not enumerate a shape
+    Cartesian product.
+    """
+    if not sm120_paged_decode_d256_enabled():
+        raise ValueError("FLASH_ATTENTION_SM120_DECODE_KERNEL is not enabled")
+    metadata = Sm120PagedDecodeD256Metadata(
+        capability=120,
+        dtype=torch.bfloat16,
+        batch_size=1,
+        query_tokens=1,
+        query_heads=24,
+        kv_heads=4,
+        head_dim=256,
+        page_size=page_size,
+        kv_tokens=kv_tokens,
+        paged_kv=True,
+        has_cu_seqlens_q=True,
+        has_seqused_k=True,
+    )
+    plan = build_sm120_paged_decode_d256_compile_plan(metadata)
+    num_splits = plan[0].num_splits
+    num_pages = (kv_tokens + page_size - 1) // page_size
+    q = _make_compile_only_tensor_spec((1, 24, 256), torch.bfloat16)
+    k = _make_compile_only_tensor_spec((num_pages, page_size, 4, 256), torch.bfloat16)
+    v = _make_compile_only_tensor_spec((num_pages, page_size, 4, 256), torch.bfloat16)
+    out = _make_compile_only_tensor_spec((1, 24, 256), torch.bfloat16)
+    return _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=_make_compile_only_tensor_spec((2,), torch.int32, 4),
+        seqused_k=_make_compile_only_tensor_spec((1,), torch.int32, 4),
+        page_table=_make_compile_only_tensor_spec((1, num_pages), torch.int32, 4),
+        max_seqlen_q=1,
+        max_seqlen_k=kv_tokens,
+        softmax_scale=softmax_scale,
+        num_splits=num_splits,
+        out=out,
+        _arch=120,
+        compile_only=True,
+    )
+
+
+def compile_sm120_paged_decode_d256_plan(metadata: Sm120PagedDecodeD256Metadata):
+    """Compile one vendor-owned plan; its single request includes forward+combine."""
+    if not sm120_paged_decode_d256_enabled():
+        raise ValueError("FLASH_ATTENTION_SM120_DECODE_KERNEL is not enabled")
+    plan = build_sm120_paged_decode_d256_compile_plan(metadata)
+    compile_sm120_paged_decode_d256_from_specs(
+        kv_tokens=plan[0].kv_tokens_witness,
+        page_size=plan[0].page_size,
+    )
+    return plan
+
+
+def compile_sm120_paged_decode_d256_warmup_plan(
+    metadata: Sm120PagedDecodeD256Metadata, max_kv_tokens: int
+):
+    """Compile the vendor-owned bounded witness set, including all combines."""
+    if not sm120_paged_decode_d256_enabled():
+        raise ValueError("FLASH_ATTENTION_SM120_DECODE_KERNEL is not enabled")
+    plan = build_sm120_paged_decode_d256_warmup_plan(metadata, max_kv_tokens)
+    for unit in plan:
+        if unit.kernel != "sm120_paged_decode_d256_forward":
+            continue
+        compile_sm120_paged_decode_d256_from_specs(
+            kv_tokens=unit.kv_tokens_witness,
+            page_size=unit.page_size,
+        )
+    return plan
+
+
+def try_launch_sm120_paged_decode_d256(
+    metadata: Sm120PagedDecodeD256Metadata, **flash_attn_varlen_kwargs
+) -> bool:
+    """Launch through the public varlen wrapper only when the vendor contract matches.
+
+    ``False`` is a no-side-effect fail-closed result; callers must use their
+    existing fallback.  On ``True`` the supplied output buffer has been written.
+    The wrapper rechecks the same metadata-derived contract before dispatch.
+    """
+    if not sm120_paged_decode_d256_enabled() or not sm120_paged_decode_d256_available(metadata):
+        return False
+    flash_attn_varlen_func(**flash_attn_varlen_kwargs)
+    return True
 
 
 def compile_flash_attn_varlen_func_from_specs(

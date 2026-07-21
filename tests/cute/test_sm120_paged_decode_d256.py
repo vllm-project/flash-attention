@@ -1,18 +1,24 @@
 """Focused tests for the bounded SM120 BF16 D256 paged-decode path."""
 
 import math
+import gc
+from unittest.mock import MagicMock
+import weakref
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from flash_attn.cute import flash_attn_varlen_func
+from flash_attn.cute import interface as cute_interface
+from flash_attn.cute.sm120_paged_decode_cache import Sm120PagedDecodeRuntimeCache
 from flash_attn.cute.sm120_paged_decode import (
     Sm120PagedDecodeD256Metadata,
     build_sm120_paged_decode_d256_compile_plan,
     build_sm120_paged_decode_d256_warmup_plan,
     select_sm120_paged_decode_d256_num_splits,
     sm120_paged_decode_d256_available,
+    sm120_paged_decode_d256_enabled,
 )
 
 
@@ -56,6 +62,132 @@ def test_split_selector_boundaries(kv_tokens, expected):
 )
 def test_eligibility_fails_closed(override):
     assert not sm120_paged_decode_d256_available(_metadata(**override))
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "no", "invalid", "2"])
+def test_opt_in_invalid_or_disabled_values_fail_closed(monkeypatch, value):
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_DECODE_KERNEL", value)
+    assert not sm120_paged_decode_d256_enabled()
+
+
+def test_public_launcher_does_not_call_varlen_for_unsupported_metadata(monkeypatch):
+    monkeypatch.setenv("FLASH_ATTENTION_SM120_DECODE_KERNEL", "1")
+    varlen = MagicMock()
+    monkeypatch.setattr(cute_interface, "flash_attn_varlen_func", varlen)
+
+    launched = cute_interface.try_launch_sm120_paged_decode_d256(
+        _metadata(dtype=torch.float16),
+        q=object(),
+        k=object(),
+        v=object(),
+    )
+
+    assert not launched
+    varlen.assert_not_called()
+
+
+def _hot_plan_tensors():
+    return tuple(torch.empty((2, 2)) for _ in range(7))
+
+
+def test_hot_plan_requires_object_storage_stream_launcher_and_configuration_match():
+    cache = Sm120PagedDecodeRuntimeCache()
+    tensors = _hot_plan_tensors()
+    stream = ("cuda", 0, 11)
+    launcher = (101, 102)
+    key = ("decode", "combine")
+    cache.record_hot_plan(key, tensors, stream, launcher, 16, 16)
+
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 16) is not None
+    tensors[0].set_(torch.empty_like(tensors[0]))
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 16) is None
+
+    tensors = _hot_plan_tensors()
+    cache.record_hot_plan(key, tensors, stream, launcher, 16, 16)
+    replaced_output = (*tensors[:3], torch.empty_like(tensors[3]), *tensors[4:])
+    assert cache.get_hot_plan(key, replaced_output, stream, launcher, 16, 16) is None
+    assert cache.get_hot_plan(key, tensors, ("cuda", 0, 12), launcher, 16, 16) is None
+    assert cache.get_hot_plan(key, tensors, stream, (103, 102), 16, 16) is None
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 784, 16) is None
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 32) is None
+
+
+def test_hot_plan_rejects_shape_stride_and_dtype_mutation():
+    cache = Sm120PagedDecodeRuntimeCache()
+    stream = ("cuda", 0, 11)
+    launcher = (101, 102)
+    key = ("decode", "combine")
+
+    tensors = _hot_plan_tensors()
+    cache.record_hot_plan(key, tensors, stream, launcher, 16, 16)
+    tensors[0].resize_(4, 1)
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 16) is None
+
+    tensors = _hot_plan_tensors()
+    cache.record_hot_plan(key, tensors, stream, launcher, 16, 16)
+    tensors[0].as_strided_((2, 2), (1, 2))
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 16) is None
+
+    tensors = _hot_plan_tensors()
+    cache.record_hot_plan(key, tensors, stream, launcher, 16, 16)
+    tensors[0].data = tensors[0].to(torch.bfloat16)
+    assert cache.get_hot_plan(key, tensors, stream, launcher, 16, 16) is None
+
+
+def test_hot_plan_uses_weak_input_references_and_allows_page_content_updates():
+    cache = Sm120PagedDecodeRuntimeCache()
+    tensors = list(_hot_plan_tensors())
+    stream = ("cuda", 0, 11)
+    launcher = (101, 102)
+    cache.record_hot_plan(
+        ("decode", "combine"), tuple(tensors), stream, launcher, 16, 16
+    )
+    tensors[5].fill_(1)
+    tensors[6].fill_(2)
+    assert (
+        cache.get_hot_plan(
+            ("decode", "combine"), tuple(tensors), stream, launcher, 16, 16
+        )
+        is not None
+    )
+
+    input_ref = weakref.ref(tensors[0])
+    tensors[0] = torch.empty_like(tensors[0])
+    gc.collect()
+    assert input_ref() is None
+
+
+def test_workspace_cache_is_bounded_per_stream_and_capture_falls_back():
+    cache = Sm120PagedDecodeRuntimeCache()
+    stream = ("cuda", 0, 11)
+    created = []
+
+    def make_workspace():
+        workspace = object()
+        created.append(workspace)
+        return workspace
+
+    first = cache.get_workspace((0,), stream, make_workspace, allow_cache=True)
+    for index in range(1, 9):
+        cache.get_workspace((index,), stream, make_workspace, allow_cache=True)
+    assert cache.workspace_count(stream) == 8
+    assert (
+        cache.get_workspace((0,), stream, make_workspace, allow_cache=True) is not first
+    )
+
+    capture_stream = ("cuda", 0, 12)
+    first_capture = cache.get_workspace(
+        (0,), capture_stream, make_workspace, allow_cache=False
+    )
+    second_capture = cache.get_workspace(
+        (0,), capture_stream, make_workspace, allow_cache=False
+    )
+    assert first_capture is not second_capture
+    assert cache.workspace_count(capture_stream) == 0
+
+    cache.clear()
+    assert cache.workspace_count(stream) == 0
+    assert cache.hot_plan_count(stream) == 0
 
 
 def test_compile_plan_contains_exact_forward_and_combine_witness():

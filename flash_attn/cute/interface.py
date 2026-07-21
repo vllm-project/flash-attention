@@ -47,6 +47,11 @@ from flash_attn.cute.sm120_paged_decode import (
     sm120_paged_decode_d256_available,
     sm120_paged_decode_d256_enabled,
 )
+from flash_attn.cute.sm120_paged_decode_cache import (
+    Sm120PagedDecodeRuntimeCache,
+    current_stream_key,
+    is_current_stream_capturing,
+)
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -443,12 +448,40 @@ def _try_flash_attn_sm120_paged_decode_d256(
             (selected_splits, num_head, total_q), torch.float32, assumed_align=4
         )
     else:
-        out_partial = torch.empty(
-            selected_splits, total_q, num_head, head_dim_v,
-            dtype=torch.float32, device=v.device,
+        runtime_stream_key = current_stream_key(q)
+        allow_runtime_cache = not is_current_stream_capturing()
+        workspace_key = (
+            selected_splits,
+            total_q,
+            num_head,
+            head_dim_v,
+            v.device,
         )
-        lse_partial = torch.empty(
-            selected_splits, num_head, total_q, dtype=torch.float32, device=v.device
+
+        def make_workspace():
+            return (
+                torch.empty(
+                    selected_splits,
+                    total_q,
+                    num_head,
+                    head_dim_v,
+                    dtype=torch.float32,
+                    device=v.device,
+                ),
+                torch.empty(
+                    selected_splits,
+                    num_head,
+                    total_q,
+                    dtype=torch.float32,
+                    device=v.device,
+                ),
+            )
+
+        out_partial, lse_partial = _flash_attn_fwd.sm120_paged_decode_runtime_cache.get_workspace(
+            workspace_key,
+            runtime_stream_key,
+            make_workspace,
+            allow_cache=allow_runtime_cache,
         )
 
     decode_key = (cutlass.BFloat16, selected_splits, metadata.page_size)
@@ -494,6 +527,32 @@ def _try_flash_attn_sm120_paged_decode_d256(
         _flash_attn_fwd_combine.compile_cache[combine_key] = _compile_fwd_combine(
             *combine_key
         )
+    if not isinstance(q, _CompileOnlyTensorSpec) and allow_runtime_cache:
+        hot_tensors = (q, k, v, out, cu_seqlens_q, seqused_k, page_table)
+        launcher_identity = (
+            id(_flash_attn_fwd.sm120_paged_decode_cache[decode_key]),
+            id(_flash_attn_fwd_combine.compile_cache[combine_key]),
+        )
+        plan_key = (decode_key, combine_key)
+        if _flash_attn_fwd.sm120_paged_decode_runtime_cache.get_hot_plan(
+            plan_key,
+            hot_tensors,
+            runtime_stream_key,
+            launcher_identity,
+            metadata.page_size,
+            selected_splits,
+        ) is None:
+            # A hot-plan hit is valid only when all caller-owned objects still
+            # match by weak identity and storage metadata. A miss intentionally
+            # takes this checked path and records no strong input references.
+            _flash_attn_fwd.sm120_paged_decode_runtime_cache.record_hot_plan(
+                plan_key,
+                hot_tensors,
+                runtime_stream_key,
+                launcher_identity,
+                metadata.page_size,
+                selected_splits,
+            )
     if compile_only:
         return out, lse, None, None
     if not is_fake_mode():
@@ -1489,6 +1548,7 @@ def _flash_attn_fwd(
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 _flash_attn_fwd.sm120_paged_decode_cache = get_jit_cache("sm120_paged_decode")
+_flash_attn_fwd.sm120_paged_decode_runtime_cache = Sm120PagedDecodeRuntimeCache()
 
 
 def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, nheads_major=False):

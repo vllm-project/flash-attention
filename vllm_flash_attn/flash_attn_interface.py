@@ -107,6 +107,7 @@ def get_scheduler_metadata(
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
+    batch_invariant=False,
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -128,6 +129,7 @@ def get_scheduler_metadata(
         num_splits,
         pack_gqa,
         sm_margin,
+        batch_invariant,
     )
 
     return scheduler_metadata
@@ -166,6 +168,7 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    batch_invariant=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -210,6 +213,8 @@ def flash_attn_varlen_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
+        batch_invariant: bool. Whether to keep numerically relevant FA3 kernel choices independent
+            of the other sequences in the variable-length batch.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -304,6 +309,7 @@ def flash_attn_varlen_func(
             cp_world_size,
             cp_rank,
             cp_tot_seqused_k,
+            batch_invariant,
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")

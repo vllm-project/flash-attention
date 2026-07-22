@@ -2,8 +2,10 @@
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::Generator and at::PhiloxCudaState
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+#include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::PhiloxCudaState / at::CUDAGeneratorImpl (default-generator dropout path)
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+#endif
 
 #include <cutlass/numeric_types.h>
 
@@ -159,8 +161,7 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
                const double softmax_scale,
                bool is_causal,
                const double softcap,
-               const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               const bool return_softmax) {
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
@@ -289,11 +290,10 @@ mha_fwd_sparse(at::Tensor &q,         // batch_size x seqlen_q x num_heads x hea
     // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //     auto gen = at::cuda::detail::getDefaultCUDAGenerator();
     //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
+    //     std::lock_guard<std::mutex> lock(gen.mutex());
+    //     new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
     // }
 
     // for alibi_slopes_ cast away constness that was added for torch library
@@ -341,8 +341,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
                       const bool zero_tensors,
                       bool is_causal,
                       const double softcap,
-                      const bool return_softmax,
-                      std::optional<at::Generator> gen_) {
+                      const bool return_softmax) {
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
@@ -496,11 +495,10 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
     // params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     // if (p_dropout > 0.0)  {
-    //     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
-    //         gen_, at::cuda::detail::getDefaultCUDAGenerator());
+    //     auto gen = at::cuda::detail::getDefaultCUDAGenerator();
     //     // See Note [Acquire lock when using random generators]
-    //     std::lock_guard<std::mutex> lock(gen->mutex_);
-    //     params.philox_args = gen->philox_cuda_state(counter_offset);
+    //     std::lock_guard<std::mutex> lock(gen.mutex());
+    //     new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
     // }
 
     // for alibi_slopes_ cast away constness that was added for torch library

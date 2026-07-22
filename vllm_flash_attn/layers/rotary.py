@@ -107,7 +107,8 @@ def apply_rotary_emb(
     Arguments:
         x: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim)
-        cos, sin: (seqlen_rotary, rotary_dim / 2)
+        cos, sin: (seqlen_rotary, rotary_dim / 2). These tensors must have the
+            same dtype, which may differ from x.
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
             of 1st half and 2nd half (GPT-NeoX style).
         inplace: if True, apply rotary embedding in-place.
@@ -117,7 +118,7 @@ def apply_rotary_emb(
         max_seqlen: int
     Return:
         out: (batch_size, seqlen, nheads, headdim) if cu_seqlens is None
-            else (total_seqlen, nheads, headdim)
+            else (total_seqlen, nheads, headdim). The dtype matches x.
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """

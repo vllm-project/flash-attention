@@ -324,7 +324,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.o_dtype, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
-        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V). 
+        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V).
         self.sStage_layout = None
         if const_expr(self.fp8_kv_dequant):
             self.sStage_layout = sm90_utils.make_smem_layout(
@@ -668,9 +668,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # fp8 staging buffer (TMA dst, dequant src).
         sStage = None
         if const_expr(self.fp8_kv_dequant):
-            sStage = storage.sStage.get_tensor(
-                sStage_layout.outer, swizzle=sStage_layout.inner
-            )
+            sStage = storage.sStage.get_tensor(sStage_layout.outer, swizzle=sStage_layout.inner)
         # reuse sQ's data iterator (sO uses the output dtype, both 2 bytes so they alias)
         sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.o_dtype)
 
@@ -933,10 +931,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.fp8_kv_dequant):
             # fp8_kv_dequant path uses different load logic, separate from the non-fp8 path.
             self.load_fp8(
-                mQ, mK, mV, sQ, sStage,
-                tma_atom_Q, tma_atom_K, tma_atom_V,
-                pipeline_q, pipeline_stage, gmem_tiled_copy_Q, mPageTable,
-                block_info, SeqlenInfoCls, TileSchedulerCls, num_splits,
+                mQ,
+                mK,
+                mV,
+                sQ,
+                sStage,
+                tma_atom_Q,
+                tma_atom_K,
+                tma_atom_V,
+                pipeline_q,
+                pipeline_stage,
+                gmem_tiled_copy_Q,
+                mPageTable,
+                block_info,
+                SeqlenInfoCls,
+                TileSchedulerCls,
+                num_splits,
             )
             return
 
@@ -1308,9 +1318,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
 
-        # FP8-KV MMA WGs side dequant setup: 
-        # K: cooperative 256-thread(2 WGs) copy of the full tile; 
-        # V: each WG copies only its own hdimv-half. 
+        # FP8-KV MMA WGs side dequant setup:
+        # K: cooperative 256-thread(2 WGs) copy of the full tile;
+        # V: each WG copies only its own hdimv-half.
         dequant_params = None
         if const_expr(self.fp8_kv_dequant):
             sStage2 = sStage[None, None, 0]
@@ -1423,9 +1433,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # while v folds into final output normalization.
             if const_expr(self.fp8_kv_dequant):
                 head_idx_kv = (
-                    head_idx // self.qhead_per_kvhead
-                    if const_expr(not self.pack_gqa)
-                    else head_idx
+                    head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 )
                 qk_descale, v_descale_tile = self._load_effective_descales(
                     descale_tensors, batch_idx, head_idx_kv

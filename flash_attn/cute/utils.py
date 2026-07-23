@@ -14,7 +14,7 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm, nvgpu
-from cutlass.base_dsl._mlir_helpers.arith import recast_type
+from cutlass._mlir_helpers.arith import recast_type
 from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.runtime import from_dlpack
 

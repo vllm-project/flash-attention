@@ -26,9 +26,10 @@
 using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
-          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
+          bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv, bool OnlyQv,
           bool PackGQA, bool Split, bool V_colmajor, bool Use_one_mma_wg, int kBlockH=1>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+    static_assert(!OnlyQv || HasQv, "OnlyQv requires HasQv");
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
     static_assert(!(AppendKV && !Varlen), "AppendKV requires Varlen");
@@ -53,7 +54,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
     using CollectiveMainloop = std::conditional_t<
         Arch >= 90,
-        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementS, kBlockH>,
+        flash::CollectiveMainloopFwdSm90<kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm90, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, HasQv, OnlyQv, MmaPV_is_RS, IntraWGOverlap, PackGQA, Split, V_colmajor, ElementS, kBlockH>,
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split, ElementS>
     >;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split, FP8_TransposeV, kBlockH>;
@@ -222,16 +223,19 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                     static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen && !Use_one_mma_wg;
                     QV_SWITCH(params.qv_ptr, HasQV_, [&] {
                         static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
-                        APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
-                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                                static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                                int const qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
-                                PACK_GQA_BLOCK_SWITCH(qhead_per_khead, kBlockH_, [&] {
-                                    // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
-                                    // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
-                                    static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
+                        BOOL_SWITCH(params.only_qv, OnlyQv_, [&] {
+                            static constexpr bool OnlyQv = OnlyQv_ && HasQv;
+                            APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
+                                // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                                CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                                    static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                                    int const qhead_per_khead = !PackGQA ? 1 : cutlass::ceil_div(params.h, params.h_k);
+                                    PACK_GQA_BLOCK_SWITCH(qhead_per_khead, kBlockH_, [&] {
+                                        // Non-unary values of kBlockH can improve GQA perf for specific ratios (4, 8, 16) by enabling TMA for loading Q
+                                        // Disable for hdim diff, fp16, 1 mma wg or split to shrink build
+                                        static constexpr int kBlockH = !PackGQA || Arch < 90 || (kHeadDim != kHeadDimV) || cute::is_same_v<T, cutlass::half_t> || Use_one_mma_wg || Split ? 1 : kBlockH_;
+                                        run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, OnlyQv, PackGQA, Split, V_colmajor, Use_one_mma_wg, kBlockH>(params, stream);
+                                    });
                                 });
                             });
                         });

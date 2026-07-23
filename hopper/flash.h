@@ -149,6 +149,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     int num_splits;  // For split-KV version
     bool pack_gqa;
+    bool only_qv;
 
     int * __restrict__ tile_count_semaphore;
     // int * __restrict__ num_m_blocks_ptr;

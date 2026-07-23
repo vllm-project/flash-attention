@@ -96,6 +96,72 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 paged-KV loader regression")
+def test_flash_attn_sm90_paged_tile_n_larger_than_producer_group():
+    """All KV rows must be loaded when tile N exceeds the 128-thread producer group."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 1, 257
+    page_size, nheads, nheads_kv, head_dim = 16, 8, 2, 64
+    pages_per_seq = math.ceil(seqlen_k / page_size)
+
+    q = torch.randn(
+        batch_size * seqlen_q, nheads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, nheads_kv, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    k_paged = torch.zeros(
+        batch_size * pages_per_seq,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_paged = torch.zeros_like(k_paged)
+    for batch_idx in range(batch_size):
+        page_slice = slice(batch_idx * pages_per_seq, (batch_idx + 1) * pages_per_seq)
+        k_paged[page_slice].view(-1, nheads_kv, head_dim)[:seqlen_k].copy_(k[batch_idx])
+        v_paged[page_slice].view(-1, nheads_kv, head_dim)[:seqlen_k].copy_(v[batch_idx])
+
+    cu_seqlens_q = torch.arange(
+        batch_size + 1, device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * seqlen_k, seqlen_k, device="cuda", dtype=torch.int32
+    )
+    seqused_k = torch.full((batch_size,), seqlen_k, device="cuda", dtype=torch.int32)
+    page_table = torch.arange(
+        batch_size * pages_per_seq, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_seq)
+
+    out_paged, *_ = _flash_attn_fwd(
+        q,
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        page_table=page_table,
+        tile_mn=(64, 192),
+        num_splits=1,
+    )
+    out_dense, *_ = _flash_attn_fwd(
+        q,
+        k.flatten(0, 1),
+        v.flatten(0, 1),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        tile_mn=(64, 192),
+        num_splits=1,
+    )
+
+    torch.testing.assert_close(out_paged, out_dense, rtol=0, atol=0)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])

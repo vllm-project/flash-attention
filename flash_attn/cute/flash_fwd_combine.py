@@ -209,6 +209,7 @@ class FlashAttentionForwardCombine:
         varlen_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
         output_scale: Optional[cute.Tensor] = None,
+        max_seqlen_q: Optional[Int32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -297,8 +298,13 @@ class FlashAttentionForwardCombine:
         seqlen_divmod = FastDivmodDivisor(seqlen)
         head_divmod = FastDivmodDivisor(num_head)
 
+        grid_seqlen = (
+            max_seqlen_q
+            if const_expr(cu_seqlens is not None and max_seqlen_q is not None)
+            else seqlen
+        )
         grid_dim = (
-            cute.ceil_div(seqlen * num_head, self.tile_m),
+            cute.ceil_div(grid_seqlen * num_head, self.tile_m),
             cute.ceil_div(self.head_dim, self.k_block_size),
             batch_size,
         )

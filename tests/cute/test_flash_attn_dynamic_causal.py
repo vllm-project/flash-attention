@@ -145,3 +145,70 @@ def test_dynamic_causal_causal_splitkv(seqlen_q, seqlen_k, num_splits, head_dim)
     torch.cuda.synchronize()
     err = _rel_err(out, _ref_causal(q, k, v, scale))
     assert err < 2e-2, f"causal psc=1 rel_err={err:.3e}"
+
+
+@pytest.mark.parametrize(
+    "dynamic_causal_first",
+    [False, True],
+    ids=["none-then-tensor", "tensor-then-none"],
+)
+def test_dynamic_causal_compile_cache_orders(dynamic_causal_first):
+    """Presence changes must compile independently in either cache order."""
+    torch.manual_seed(1)
+    batch, seqlen_q, seqlen_k, num_heads, head_dim = 2, 8, 32, 4, 64
+    scale = head_dim**-0.5
+    q_padded = torch.randn(
+        batch, seqlen_q, num_heads, head_dim, device=DEV, dtype=DT
+    )
+    k_padded = torch.randn(
+        batch, seqlen_k, num_heads, head_dim, device=DEV, dtype=DT
+    )
+    v_padded = torch.randn_like(k_padded)
+    q, k, v = [tensor.flatten(0, 1) for tensor in (q_padded, k_padded, v_padded)]
+    cu_q = torch.arange(
+        0, (batch + 1) * seqlen_q, seqlen_q, device=DEV, dtype=torch.int32
+    )
+    cu_k = torch.arange(
+        0, (batch + 1) * seqlen_k, seqlen_k, device=DEV, dtype=torch.int32
+    )
+    per_sequence_causal = torch.tensor([0, 1], device=DEV, dtype=torch.int32)
+    causal_ref = torch.stack(
+        [
+            _ref_causal(q_padded[idx], k_padded[idx], v_padded[idx], scale)
+            for idx in range(batch)
+        ]
+    )
+    mixed_ref = torch.stack(
+        [
+            _ref_bidirectional(q_padded[0], k_padded[0], v_padded[0], scale),
+            _ref_causal(q_padded[1], k_padded[1], v_padded[1], scale),
+        ]
+    )
+    call_order = (
+        (per_sequence_causal, None)
+        if dynamic_causal_first
+        else (None, per_sequence_causal)
+    )
+
+    _flash_attn_fwd.compile_cache.clear()
+    try:
+        for dynamic_causal in call_order:
+            out, *_ = _flash_attn_fwd(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                softmax_scale=scale,
+                causal=True,
+                dynamic_causal=dynamic_causal,
+                num_splits=1,
+            )
+            ref = mixed_ref if dynamic_causal is not None else causal_ref
+            err = _rel_err(out.view_as(q_padded), ref)
+            assert err < 2e-2, f"dynamic_causal cache-order rel_err={err:.3e}"
+        assert len(_flash_attn_fwd.compile_cache.cache) == 2
+    finally:
+        _flash_attn_fwd.compile_cache.clear()

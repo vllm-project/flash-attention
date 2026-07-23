@@ -731,6 +731,41 @@ class AttentionMask:
                 )
 
         else:  # Causal or local
+            if const_expr(mask_mod is not None):
+                assert vec_size % 32 == 0 or 32 % vec_size == 0, (
+                    "vec_size must divide 32 or be a multiple of 32"
+                )
+                if const_expr(vec_size == 1):
+                    self.apply_mask_mod_sm100_scalar(
+                        acc_S,
+                        tScS_t2r,
+                        m_block,
+                        n_block,
+                        mask_seqlen,
+                        mask_mod,
+                        batch_idx,
+                        head_idx,
+                        aux_tensors,
+                        fastdiv_mods,
+                        head_divmod,
+                        check_q_boundary,
+                    )
+                else:
+                    self.apply_mask_mod_sm100_vector(
+                        acc_S,
+                        tScS_t2r,
+                        m_block,
+                        n_block,
+                        mask_seqlen,
+                        mask_mod,
+                        batch_idx,
+                        head_idx,
+                        vec_size,
+                        aux_tensors,
+                        fastdiv_mods,
+                        head_divmod,
+                        check_q_boundary,
+                    )
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):

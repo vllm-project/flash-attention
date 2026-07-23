@@ -345,8 +345,6 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
 
     Returns (causal, local, window_size_left, window_size_right).
     """
-    if mask_mod is not None:
-        return False, False, window_size_left, window_size_right
     if causal:
         window_size_right = 0
     if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
@@ -396,6 +394,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_tensor_leading_dims: Optional[list[int]] = None,
     aux_scalars: Optional[tuple] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
@@ -768,8 +767,11 @@ def _flash_attn_fwd(
             q_stage=q_stage,
         )
     if aux_tensors is not None:
-        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
+        aux_tensor_metadata = get_aux_tensor_metadata(
+            aux_tensors, aux_tensor_leading_dims
+        )
     else:
+        assert aux_tensor_leading_dims is None
         aux_tensor_metadata = None
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
 
@@ -931,7 +933,15 @@ def _flash_attn_fwd(
         cute_aux_tensors = None
         aux_tensor_metadata = None
         if aux_tensors is not None:
-            cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+            aux_tensor_leading_dims = (
+                aux_tensor_leading_dims
+                if aux_tensor_leading_dims is not None
+                else [None] * len(aux_tensors)
+            )
+            cute_aux_tensors = [
+                to_cute_aux_tensor(buf, leading_dim)
+                for buf, leading_dim in zip(aux_tensors, aux_tensor_leading_dims)
+            ]
 
         qv_tensor = to_cute_tensor(qv)
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)

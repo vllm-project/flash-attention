@@ -403,6 +403,7 @@ def _flash_attn_fwd(
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
     compile_only: bool = False,
+    fp8_kv_dequant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -478,17 +479,28 @@ def _flash_attn_fwd(
     assert v.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
-    
-    input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
-    present = {name: t for name, t in input_tensors.items() if t is not None}
-    names = list(present.keys())
-    for i in range(len(names)):
-        for j in range(i + 1, len(names)):
-            a, b = names[i], names[j]
-            assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
+    if fp8_kv_dequant:
+        # FP8-KV in-kernel dequant: fp16/bf16 Q + fp8 e4m3 K/V (dequantized in-kernel to
+        # fp16), fp16/bf16 O. Compute is always fp16 (the single-instruction fp8->fp16 fast
+        # path); a bf16 Q is narrowed to fp16 in-kernel and the fp32 accumulator is cast to
+        # O's dtype in the epilogue, so Q/O dtypes are independent of compute. SM90 only.
+        assert q.dtype in (torch.float16, torch.bfloat16), (
+            "fp8_kv_dequant requires fp16 or bf16 Q"
+        )
+        assert k.dtype == v.dtype == torch.float8_e4m3fn, (
+            "fp8_kv_dequant requires fp8 e4m3 K/V"
+        )
+        assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
+    else:
+        input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
+        present = {name: t for name, t in input_tensors.items() if t is not None}
+        names = list(present.keys())
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = names[i], names[j]
+                assert present[a].dtype == present[b].dtype, f"{a}.dtype {present[a].dtype} != {b}.dtype {present[b].dtype}"
 
     q_dtype = q.dtype if q is not None else qv.dtype
-
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -540,7 +552,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
@@ -590,7 +602,7 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse, None, None
 
-    if is_fp8:
+    if is_fp8 or fp8_kv_dequant:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
                 _validate_tensor(t, name, (batch_size, num_head_kv), torch.float32, device)
@@ -599,7 +611,24 @@ def _flash_attn_fwd(
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
+    if fp8_kv_dequant and q_descale is None:
+        # fp16 Q has no q-scale; materialize an identity (1.0) q_descale so the
+        # DescaleTensors struct has all three fields present (identity q is a no-op).
+        _ref_descale = k_descale if k_descale is not None else v_descale
+        q_descale = (
+            torch.ones_like(_ref_descale)
+            if _ref_descale is not None
+            else torch.ones((batch_size, num_head_kv), dtype=torch.float32, device=q.device)
+        )
     dtype = torch2cute_dtype_map[q_dtype]
+    kv_dtype = torch2cute_dtype_map[k.dtype] if fp8_kv_dequant else dtype
+    if fp8_kv_dequant:
+        assert arch // 10 == 9, "fp8_kv_dequant is an SM90-only forward (compute capability 9.x)"
+        # Compute is fp16 regardless of the (fp16/bf16) Q dtype: the fp8->fp16 cvt is the
+        # only single-instruction widening on SM90. The kernel derives the Q/O tensor
+        # dtypes from mQ/mO (which keep q.dtype / out_torch_dtype), narrowing bf16 Q to
+        # fp16 in-kernel and casting the fp32 accumulator to O's dtype in the epilogue.
+        dtype = torch2cute_dtype_map[torch.float16]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -639,6 +668,22 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if fp8_kv_dequant:
+        # Force RS-mode PV: frees sP for the fp8 staging buffer, keeping smem within
+        # budget at d=512 while preserving intra-WG overlap.
+        mma_pv_is_rs = True
+        # The SM90 fp8-KV-dequant producer is TMA-only (no cp.async fallback): a paged
+        # page_size != tile_n gives use_tma_KV=False -> a None TMA atom. Assert here so
+        # it fails with a clear message instead of crashing later.
+        assert page_size == tile_n, (
+            f"FA4 SM90 fp8-KV-dequant requires the paged-KV page_size == tile_n ({tile_n}); "
+            f"got page_size={page_size}. "
+        )
+        # Currently in this path we use one sStage buffer for both K and V, it needs more changes if head_dim != head_dim_v.
+        assert head_dim == head_dim_v, (
+            f"FA4 SM90 fp8-KV-dequant requires head_dim == head_dim_v (one staging buffer "
+            f"serves K and V); got head_dim={head_dim}, head_dim_v={head_dim_v}."
+        )
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -875,6 +920,12 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         output_quant_key,
+        fp8_kv_dequant,
+        # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
+        # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
+        # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
+        q.dtype,
+        out_torch_dtype,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -983,6 +1034,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, tile_n],
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
+                kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
+                fp8_kv_dequant=fp8_kv_dequant,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -1162,6 +1215,10 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
+            if arch // 10 == 9:
+                # SM90 fp8-KV descale slot: after aux, before output_scale (None unless
+                # fp8_kv_dequant), mirroring the SM90 kernel positional signature.
+                compile_args.append(descale_tensors_tensor)
             # TODO: thread output_scale into the hd256 (BlackwellFusedMultiHeadAttentionForward)
             # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there
             # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
@@ -1186,6 +1243,11 @@ def _flash_attn_fwd(
                 t.view(torch.uint8) if t is not None else None
                 for t in (q_call, k_call, v_call, qv_call)
             ]
+        elif fp8_kv_dequant:
+            # FP8-KV dequant: Q is fp16/bf16 but K/V are fp8 e4m3 -- apply the same uint8
+            # FFI workaround to K/V only (the compiled kernel takes them as uint8).
+            k_call = k_call.view(torch.uint8)
+            v_call = v_call.view(torch.uint8)
         out_call = out.detach()
         if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             out_call = out_call.view(torch.uint8)
@@ -1250,6 +1312,10 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
+            # SM90 descale slot (mirrors the compile_args insert): after aux_tensors,
+            # before output_scale. None unless fp8_kv_dequant.
+            if arch // 10 == 9:
+                call_args.append(descale_tensors)
             # See the TODO above: hd256/MLA kernels don't take output_scale yet.
             if not use_dedicated_hd256_kernel:
                 call_args.append(output_scale)

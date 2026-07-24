@@ -40,7 +40,7 @@ This is a beta release for testing / benchmarking before we integrate that with
 the rest of the repo.
 
 Currently released:
-- FP16 / BF16 forward and backward, FP8 forward
+- FP16 / BF16 forward and backward, FP8 forward, FP8 output quantization
 
 Requirements: H100 / H800 GPU, CUDA >= 12.3.
 

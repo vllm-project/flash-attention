@@ -666,7 +666,7 @@ def _flash_attn_fwd(
         output_quant_key = None
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
-    if qv is None:
+    if qv is None or arch // 10 == 9:
         lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     else:
         # num_head contiguous better for MQA in MLA absorbed
@@ -746,6 +746,17 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if arch // 10 == 9 and qv is not None:
+        # Match FA3's Hopper MLA specialization. These tiles leave room for
+        # the additional Qv tile and keep the first correctness-oriented port
+        # on the simpler non-overlapped, direct-head mainloop. PackGQA is an
+        # optimization rather than part of the MLA contract.
+        pack_gqa = False
+        if head_dim_v == 512:
+            tile_m, tile_n, mma_pv_is_rs = 64, 64, False
+        else:
+            tile_m, tile_n, mma_pv_is_rs = 128, 96, True
+        intra_wg_overlap = False
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -948,52 +959,57 @@ def _flash_attn_fwd(
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
 
     if qv is not None:
-        assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
         assert q is None or qv.shape[:-1] == q.shape[:-1]
         assert qv.shape[-1] == head_dim_v
-        assert head_dim_v == 512
-        assert q is None or head_dim == 64
         assert not local, "local not yet supported with qv"
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are not yet supported with qv"
         )
-        assert tile_n == 128
-
-        assert not is_split_kv, "split kv not supported with qv"
         assert learnable_sink is None
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
-
-        if page_table is not None:
-            assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
-        
         qv = maybe_contiguous(qv)
 
-        gather_kv_length = 2048  # dummy value
-        sparse_kv = gather_kv_indices is not None
-        # always use kv bitmask by default (handles -1 sentinel)
-        disable_sparse_kv_bitmask = False
-        if sparse_kv:
-            assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
-            gather_kv_length = gather_kv_indices.shape[-1]
-            assert gather_kv_length % 128 == 0
-            # if min_seqlen_k is None or causal:
-            #     disable_sparse_kv_bitmask = False
-            # else:
-            #     # seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
-            #     seqlen_k_boundary = min_seqlen_k
-            #     disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
-        
-        if requires_grad and sparse_kv:
-            if cu_seqlens_q is None:
-                p = torch.empty(batch_size, seqlen_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
-                row_max = torch.empty(batch_size, seqlen_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
-            else:
-                p = torch.empty(total_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
-                row_max = torch.empty(total_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
-        else:
+        if arch // 10 == 9:
+            assert q is not None and k is not None, "Hopper MLA requires both q and k"
+            assert head_dim == 64 and head_dim_v in [256, 512], (
+                "Hopper MLA requires head_dim=64 and head_dim_v in [256, 512]"
+            )
+            assert gather_kv_indices is None, "top-k gather is not supported by Hopper MLA"
+            assert not use_block_sparsity, "block sparsity is not supported by Hopper MLA"
+            gather_kv_length = None
+            sparse_kv = None
+            disable_sparse_kv_bitmask = None
             p = row_max = None
+        else:
+            assert arch // 10 in [10, 11], "qv is only supported on Hopper and Blackwell"
+            assert head_dim_v == 512
+            assert q is None or head_dim == 64
+            assert tile_n == 128
+            assert not is_split_kv, "split kv not supported with qv on Blackwell"
+
+            if page_table is not None:
+                assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
+
+            gather_kv_length = 2048  # dummy value
+            sparse_kv = gather_kv_indices is not None
+            # always use kv bitmask by default (handles -1 sentinel)
+            disable_sparse_kv_bitmask = False
+            if sparse_kv:
+                assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
+                gather_kv_length = gather_kv_indices.shape[-1]
+                assert gather_kv_length % 128 == 0
+
+            if requires_grad and sparse_kv:
+                if cu_seqlens_q is None:
+                    p = torch.empty(batch_size, seqlen_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
+                    row_max = torch.empty(batch_size, seqlen_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
+                else:
+                    p = torch.empty(total_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
+                    row_max = torch.empty(total_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
+            else:
+                p = row_max = None
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
         gather_kv_length = None
@@ -1172,6 +1188,7 @@ def _flash_attn_fwd(
                 use_persistent_varlen=use_persistent_varlen,
                 use_dynamic_varlen=use_dynamic_varlen,
                 persistent_scheduler_sm_count=persistent_scheduler_sm_count,
+                has_qv=qv is not None,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
             )
@@ -1304,7 +1321,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        if qv is not None:
+        if qv is not None and arch // 10 in [10, 11]:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
                 q_tensor,
@@ -1332,6 +1349,10 @@ def _flash_attn_fwd(
             compile_args = [
                 fa_fwd,
                 q_tensor,
+            ]
+            if arch // 10 == 9:
+                compile_args.append(qv_tensor)
+            compile_args.extend([
                 k_tensor,
                 v_tensor,
                 o_tensor,
@@ -1346,7 +1367,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-            ]
+            ])
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
@@ -1387,7 +1408,7 @@ def _flash_attn_fwd(
             if q_descale is not None or k_descale is not None or v_descale is not None
             else None
         )
-        if qv is not None:
+        if qv is not None and arch // 10 in [10, 11]:
             _flash_attn_fwd.compile_cache[compile_key](
                 q_call,
                 qv_call,
@@ -1411,6 +1432,10 @@ def _flash_attn_fwd(
         else:
             call_args = [
                 q_call,
+            ]
+            if arch // 10 == 9:
+                call_args.append(qv_call)
+            call_args.extend([
                 k_call,
                 v_call,
                 out_call if not is_split_kv else out_partial,
@@ -1425,7 +1450,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink,
-            ]
+            ])
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend([
@@ -3180,8 +3205,9 @@ def flash_attn_varlen_func(
     
     Return:
        out: (total_q, nheads, hdim) or (batch, seqlen_q, nheads, hdim)
-       lse: (nheads, total_q)       or (batch, nheads, seqlen_q) if not has_qv (standard)
-            (total_q, nheads)       or (batch, seqlen_q, nheads) if has_qv
+       lse: (nheads, total_q)       or (batch, nheads, seqlen_q) for standard
+            attention and Hopper qv
+            (total_q, nheads)       or (batch, seqlen_q, nheads) for Blackwell qv
 
     Explanation of some optional arguments & decisions:
 

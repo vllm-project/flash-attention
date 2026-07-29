@@ -67,13 +67,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         use_persistent_varlen: bool = False,
         use_dynamic_varlen: bool = False,
         persistent_scheduler_sm_count: Optional[int] = None,
+        has_qv: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         assert self.output_quant_key is None, (
             f"Fused quant output not implemented for {type(self).__name__}"
         )
-        self.intra_wg_overlap = intra_wg_overlap
+        self.has_qv = has_qv
+        # The correctness-oriented MLA path computes QK and QvV serially into
+        # the same score accumulator. The overlapped mainloop has different V
+        # pipeline ownership and is intentionally left for a later pass.
+        self.intra_wg_overlap = intra_wg_overlap and not self.has_qv
         self.use_paged_kv_overlap = _use_paged_kv_overlap_sm90(
             self.intra_wg_overlap,
             paged_kv_non_tma,
@@ -148,7 +153,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if self.mma_pv_is_rs
             else warpgroup.OperandSource.SMEM,
         )
-        return tiled_mma_qk, tiled_mma_pv
+        tiled_mma_qv = sm90_utils_basic.make_trivial_tiled_mma(
+            self.dtype,
+            self.dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
+            tiler_mn=(64, self.tile_n),
+        )
+        return tiled_mma_qk, tiled_mma_pv, tiled_mma_qv
 
     def _get_shared_storage_cls(self):
         sQ_struct, sK_struct, sV_struct = [
@@ -156,6 +170,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes
             ]
             for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+        ]
+        cosize_sQv = cute.cosize(self.sQv_layout) if const_expr(self.has_qv) else 0
+        sQv_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, cosize_sQv], self.buffer_align_bytes
         ]
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
@@ -178,6 +196,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
+            sQv: sQv_struct
             sP: sP_struct
 
         @cute.struct
@@ -188,6 +207,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             work_info: work_info_struct
             sQ: sQV_struct
             sK: sK_struct
+            sQv: sQv_struct
             sP: sP_struct
 
         return SharedStorageQKV if const_expr(not self.Q_in_regs) else SharedStorageSharedQV
@@ -196,6 +216,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def __call__(
         self,
         mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mQv: Optional[cute.Tensor],  # (b, s_q, h, dv) or (total_q, h, dv)
         mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
@@ -219,9 +240,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         """Configures and launches the flash attention kernel.
 
-        mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
+        mQ/mQv/mK/mV/mO have the same data type (fp16 or bf16) and layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        assert (mQv is not None) == self.has_qv
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -229,12 +251,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ),
             is_split_kv=self.is_split_kv,
         )
+        if const_expr(self.has_qv):
+            assert mQv.element_type == self.dtype, "Qv must have the same dtype as Q"
+            assert not self.pack_gqa, "SM90 Qv does not yet support PackGQA"
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        mQv = assume_tensor_aligned(mQv) if const_expr(self.has_qv) else None
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = layout_utils.select(mQ, Q_layout_transpose)
+        if const_expr(self.has_qv):
+            mQv = layout_utils.select(mQv, Q_layout_transpose)
         num_splits = Int32(1)
         if const_expr(not self.is_split_kv):
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -254,7 +282,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             else None
         )
 
-        tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
+        tiled_mma_qk, tiled_mma_pv, tiled_mma_qv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
         self.num_threads_per_warp_group = 128
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
@@ -273,9 +301,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self.intra_wg_overlap)
             else (self.num_wg_mma == 2)
         )
+        if const_expr(self.has_qv):
+            # Both warp groups consume the same completed QK + QvV scores
+            # before issuing PV. The standard round-robin scheduler barrier is
+            # for alternating QK/PV work and deadlocks the 64x64, Dv=512 MLA
+            # specialization, whose warp groups are partitioned across Dv.
+            self.use_scheduler_barrier = False
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
+        assert not self.has_qv or self.use_tma_Q, "SM90 Qv requires TMA query loads"
         self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
@@ -283,12 +318,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
-        self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
+        self.sQ_layout, self.sK_layout, self.sV_layout, self.sQv_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(mX.element_type, LayoutEnum.ROW_MAJOR, shape, stage)
             for mX, shape, stage in [
                 (mQ, (self.tile_m, self.tile_hdim), None),
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
                 (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
+                (mQv if const_expr(self.has_qv) else mQ, (self.tile_m, self.tile_hdimv), None),
                 # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
                 (mQ, (self.tile_m, self.tile_hdimv), None),
             ]
@@ -301,7 +337,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         SharedStorage = self._get_shared_storage_cls()
 
-        mQ_og, mO_og = mQ, mO
+        mQ_og, mQv_og, mO_og = mQ, mQv, mO
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -321,12 +357,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 ("V", mV, self.sV_layout),
             ]
         }
+        if const_expr(self.has_qv):
+            self.tma_copy_bytes["Qv"] = cute.size_in_bytes(
+                mQv.element_type, cute.select(self.sQv_layout, mode=[0, 1])
+            )
         make_tiled_tma_atom_fn = (
             partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
             if const_expr(self.pack_gqa)
             else cpasync.make_tiled_tma_atom
         )
         tma_atom_Q, tma_tensor_Q = None, None
+        tma_atom_Qv, tma_tensor_Qv = None, None
         if const_expr(self.use_tma_Q):
             tma_atom_Q, tma_tensor_Q = make_tiled_tma_atom_fn(
                 gmem_tiled_copy_Q,
@@ -334,6 +375,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.sQ_layout,
                 (self.tile_m, self.tile_hdim),  # No mcast
             )
+            if const_expr(self.has_qv):
+                tma_atom_Qv, tma_tensor_Qv = cpasync.make_tiled_tma_atom(
+                    gmem_tiled_copy_Q,
+                    mQv_og,
+                    self.sQv_layout,
+                    (self.tile_m, self.tile_hdimv),  # No mcast
+                )
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
         if const_expr(self.use_tma_KV):
@@ -429,6 +477,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         self.kernel(
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
+            tma_tensor_Qv if const_expr(self.has_qv) else None,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
@@ -440,6 +489,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mDynamicCausal,
             mPageTable,
             tma_atom_Q,
+            tma_atom_Qv,
             tma_atom_K,
             tma_atom_V,
             tma_atom_O,
@@ -452,6 +502,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
+            self.sQv_layout,
             self.sO_layout,
             self.sP_layout,
             self.gmem_tiled_copy_Q,
@@ -460,6 +511,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
+            tiled_mma_qv,
             tile_sched_params,
             TileScheduler,
             SharedStorage,
@@ -479,6 +531,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def kernel(
         self,
         mQ: cute.Tensor,
+        mQv: Optional[cute.Tensor],
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
@@ -490,6 +543,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mDynamicCausal: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
+        tma_atom_Qv: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
@@ -502,6 +556,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
+        sQv_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
@@ -510,6 +565,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
+        tiled_mma_qv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
@@ -522,7 +578,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
         if warp_idx == 0:
-            for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
+            for tma_atom in (tma_atom_Q, tma_atom_Qv, tma_atom_K, tma_atom_V, tma_atom_O):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
@@ -542,7 +598,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 num_stages=1,
                 producer_group=tma_warp,
                 consumer_group=mma_warps,
-                tx_count=self.tma_copy_bytes["Q"],
+                tx_count=self.tma_copy_bytes["Q"]
+                + (self.tma_copy_bytes["Qv"] if const_expr(self.has_qv) else 0),
                 defer_sync=True,
             )
         else:
@@ -600,6 +657,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
+        sQv = (
+            storage.sQv.get_tensor(sQv_layout.outer, swizzle=sQv_layout.inner)
+            if const_expr(self.has_qv)
+            else sQ
+        )
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         if const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
@@ -612,8 +674,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-        # reuse sQ's data iterator
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
+        # With MLA, Qv is dead after the score mainloop, so the epilogue can
+        # safely reuse its equally-shaped tile. The Q pipeline is released only
+        # after the epilogue, preventing the producer from overwriting sO.
+        sO_storage = storage.sQv if const_expr(self.has_qv) else storage.sQ
+        sO = sO_storage.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
         sWorkInfo = (
             storage.work_info.get_tensor(
                 cute.make_layout((5, 2), stride=(1, 5))
@@ -670,12 +735,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             self.load(
                 mQ,
+                mQv,
                 mK,
                 mV,
                 sQ,
+                sQv,
                 sK,
                 sV,
                 tma_atom_Q,
+                tma_atom_Qv,
                 tma_atom_K,
                 tma_atom_V,
                 pipeline_k,
@@ -702,10 +770,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
+                tiled_mma_qv,
                 mO,
                 mLSE,
                 sQ,
+                sQv,
                 sK,
+                sV,
                 sVt,
                 sP,
                 sO,
@@ -733,12 +804,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def load(
         self,
         mQ: cute.Tensor,
+        mQv: Optional[cute.Tensor],
         mK: cute.Tensor,
         mV: cute.Tensor,
         sQ: cute.Tensor,
+        sQv: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
         tma_atom_Q: Optional[cute.CopyAtom],
+        tma_atom_Qv: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         pipeline_k: pipeline.PipelineAsync,
@@ -788,16 +862,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+                mQv_cur = (
+                    seqlen.offset_batch_Q(mQv, batch_idx, dim=3)[None, None, head_idx]
+                    if const_expr(self.has_qv)
+                    else None
+                )
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 )
 
                 load_Q = None
+                load_Qv = None
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
                     )
+                    if const_expr(self.has_qv):
+                        gQv = cute.local_tile(
+                            mQv_cur, (self.tile_m, self.tile_hdimv), (m_block, 0)
+                        )
+                        load_Qv, _, _ = copy_utils.tma_get_copy_fn(
+                            tma_atom_Qv,
+                            0,
+                            cute.make_layout(1),
+                            gQv,
+                            sQv,
+                            single_stage=True,
+                        )
 
                 paged_kv_manager = None
                 tma_load_K_fn = None
@@ -919,7 +1011,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_barrier = pipeline_q.sync_object_full.get_barrier(0)
+                            load_Q(tma_bar_ptr=q_barrier)
+                            if const_expr(self.has_qv):
+                                load_Qv(tma_bar_ptr=q_barrier)
                             q_producer_phase ^= 1
                     else:
                         pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -1037,7 +1132,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_barrier = pipeline_q.sync_object_full.get_barrier(0)
+                            load_Q(tma_bar_ptr=q_barrier)
+                            if const_expr(self.has_qv):
+                                load_Qv(tma_bar_ptr=q_barrier)
                             q_producer_phase ^= 1
                     else:
                         pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -1183,10 +1281,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
+        tiled_mma_qv: cute.TiledMma,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         sQ: cute.Tensor,
+        sQv: cute.Tensor,
         sK: cute.Tensor,
+        sV: cute.Tensor,
         sVt: cute.Tensor,
         sP: Optional[cute.Tensor],
         sO: cute.Tensor,
@@ -1223,6 +1324,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mma_qk_fn = partial(
             sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
         )
+        tSrQv, tSrV = None, None
+        if const_expr(self.has_qv):
+            wg_mma_qv = tiled_mma_qv.get_slice(warp_group_thread_layout(warp_group_idx))
+            _, tSrQv, tSrV = sm90_utils.partition_fragment_ABC(
+                wg_mma_qv, (self.tile_m, self.tile_n, self.tile_hdimv), sQv, sV
+            )
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
@@ -1270,6 +1377,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self.intra_wg_overlap)
             else self.mma_one_n_block,
             mma_qk_fn=mma_qk_fn,
+            tiled_mma_qv=tiled_mma_qv,
+            tSrQv=tSrQv,
+            tSrV=tSrV,
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             acc_O=acc_O,
@@ -1562,8 +1672,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 split_idx,
             )
 
-            # sO aliases sQ. Each consumer warp releases Q only after its epilogue
-            # work, so the pipeline cannot become empty until all consumers finish.
+            # sO aliases the query tile (Qv for MLA, Q otherwise). Each consumer
+            # warp releases it only after the epilogue, so the pipeline cannot
+            # become empty until all consumers finish.
             pipeline_q.consumer_release_w_index(0)
             q_consumer_phase ^= 1
 
@@ -1660,6 +1771,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
         n_block: Int32,
         mma_qk_fn: Callable,
+        tiled_mma_qv: cute.TiledMma,
+        tSrQv: Optional[cute.Tensor],
+        tSrV: Optional[cute.Tensor],
         mma_pv_fn: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
@@ -1677,9 +1791,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        if const_expr(self.has_qv):
+            # V participates in both score formation and the later PV GEMM.
+            # Keep its pipeline stage owned until both operations complete.
+            pipeline_v.consumer_wait(
+                smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read)
+            )
+            sm90_utils.gemm(
+                tiled_mma_qv,
+                acc_S,
+                tSrQv,
+                tSrV[None, None, None, smem_pipe_read.index],
+                zero_init=False,
+                wg_wait=-1,
+            )
         self.warp_scheduler_barrier_arrive()
-        warpgroup.wait_group(0)
+        if const_expr(self.has_qv):
+            # QK is the older of the two committed WGMMA groups.
+            warpgroup.wait_group(1)
+        else:
+            warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(self.has_qv):
+            warpgroup.wait_group(0)
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):
@@ -1708,7 +1842,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
-        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+        if const_expr(not self.has_qv):
+            pipeline_v.consumer_wait(
+                smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read)
+            )
         self.warp_scheduler_barrier_sync()
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
@@ -1722,6 +1859,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
         n_block: Int32,
         mma_qk_fn: Callable,
+        tiled_mma_qv: cute.TiledMma,
+        tSrQv: Optional[cute.Tensor],
+        tSrV: Optional[cute.Tensor],
         mma_pv_fn: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,

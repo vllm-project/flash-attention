@@ -275,7 +275,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             assert mCpTotSeqUsedK is not None
         if const_expr(self.has_qv):
             assert mQv.element_type == self.dtype, "Qv must have the same dtype as Q"
-            assert not self.pack_gqa, "SM90 Qv does not yet support PackGQA"
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
@@ -332,7 +331,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
-        assert not self.has_qv or self.use_tma_Q, "SM90 Qv requires TMA query loads"
         self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
@@ -363,6 +361,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(self.has_qv):
+                mQv = pack_gqa_layout(mQv, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
@@ -398,9 +398,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.tile_m, self.tile_hdim),  # No mcast
             )
             if const_expr(self.has_qv):
-                tma_atom_Qv, tma_tensor_Qv = cpasync.make_tiled_tma_atom(
+                tma_atom_Qv, tma_tensor_Qv = make_tiled_tma_atom_fn(
                     gmem_tiled_copy_Q,
-                    mQv_og,
+                    mQv_og if const_expr(self.pack_gqa) else mQv,
                     self.sQv_layout,
                     (self.tile_m, self.tile_hdimv),  # No mcast
                 )
@@ -499,7 +499,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         self.kernel(
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
-            tma_tensor_Qv if const_expr(self.has_qv) else None,
+            (
+                tma_tensor_Qv if const_expr(self.use_tma_Q) else mQv
+            )
+            if const_expr(self.has_qv)
+            else None,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
@@ -987,10 +991,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
 
                 pack_gqa = None
+                pack_gqa_qv = None
                 if const_expr(not self.use_tma_Q):
                     pack_gqa = PackGQA(
                         self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
                     )
+                    if const_expr(self.has_qv):
+                        pack_gqa_qv = PackGQA(
+                            self.tile_m,
+                            self.tile_hdimv,
+                            self.check_hdim_v_oob,
+                            self.qhead_per_kvhead,
+                        )
 
                 if const_expr(not self.use_block_sparsity):
                     n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -1047,6 +1059,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         pack_gqa.load_Q(
                             mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
                         )
+                        if const_expr(self.has_qv):
+                            pack_gqa_qv.load_Q(
+                                mQv_cur,
+                                sQv,
+                                gmem_tiled_copy_Q,
+                                tidx,
+                                m_block,
+                                seqlen.seqlen_q,
+                            )
                         cute.arch.cp_async_commit_group()
                         pipeline_q.producer_commit_w_index(0)
                         q_producer_phase ^= 1
@@ -1168,6 +1189,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         pack_gqa.load_Q(
                             mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
                         )
+                        if const_expr(self.has_qv):
+                            pack_gqa_qv.load_Q(
+                                mQv_cur,
+                                sQv,
+                                gmem_tiled_copy_Q,
+                                tidx,
+                                m_block,
+                                seqlen.seqlen_q,
+                            )
                         cute.arch.cp_async_commit_group()
                         pipeline_q.producer_commit_w_index(0)
                         q_producer_phase ^= 1

@@ -786,10 +786,10 @@ def _flash_attn_fwd(
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
     if arch // 10 == 9 and qv is not None:
         # Match FA3's Hopper MLA specialization. These tiles leave room for
-        # the additional Qv tile and keep the first correctness-oriented port
-        # on the simpler non-overlapped, direct-head mainloop. PackGQA is an
-        # optimization rather than part of the MLA contract.
-        pack_gqa = False
+        # the additional Qv tile and keep the mainloop non-overlapped.
+        # The DCP mask still uses unpacked query rows.
+        if is_context_parallel:
+            pack_gqa = False
         if head_dim_v == 512:
             tile_m, tile_n, mma_pv_is_rs = 64, 64, False
         else:
@@ -1216,7 +1216,11 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1 if any(d > 256 for d in [head_dim, head_dim_v]) else 2,
+                num_stages=(
+                    2
+                    if qv is not None
+                    else 1 if any(d > 256 for d in [head_dim, head_dim_v]) else 2
+                ),
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,

@@ -68,6 +68,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         use_dynamic_varlen: bool = False,
         persistent_scheduler_sm_count: Optional[int] = None,
         has_qv: bool = False,
+        cp_world_size: int = 1,
+        cp_rank: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -75,6 +77,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.has_qv = has_qv
+        assert cp_world_size >= 1
+        assert 0 <= cp_rank < cp_world_size
+        assert cp_world_size == 1 or self.has_qv
+        self.cp_world_size = cp_world_size
+        self.cp_rank = cp_rank
         # The correctness-oriented MLA path computes QK and QvV serially into
         # the same score accumulator. The overlapped mainloop has different V
         # pipeline ownership and is intentionally left for a later pass.
@@ -226,6 +233,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mCpTotSeqUsedK: Optional[cute.Tensor] = None,
         mDynamicCausal: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
@@ -247,10 +255,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self._check_type(
             *(
                 t.element_type if t is not None else None
-                for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+                for t in (
+                    mQ,
+                    mK,
+                    mV,
+                    mO,
+                    mLSE,
+                    mCuSeqlensQ,
+                    mCuSeqlensK,
+                    mSeqUsedQ,
+                    mSeqUsedK,
+                )
             ),
             is_split_kv=self.is_split_kv,
         )
+        if const_expr(mCpTotSeqUsedK is not None):
+            assert mCpTotSeqUsedK.element_type == Int32
+        if const_expr(self.cp_world_size > 1):
+            assert mCpTotSeqUsedK is not None
         if const_expr(self.has_qv):
             assert mQv.element_type == self.dtype, "Qv must have the same dtype as Q"
             assert not self.pack_gqa, "SM90 Qv does not yet support PackGQA"
@@ -486,6 +508,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mCpTotSeqUsedK,
             mDynamicCausal,
             mPageTable,
             tma_atom_Q,
@@ -540,6 +563,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mCpTotSeqUsedK: Optional[cute.Tensor],
         mDynamicCausal: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
@@ -707,6 +731,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCpTotSeqUsedK=mCpTotSeqUsedK,
+            cp_world_size=self.cp_world_size,
+            cp_rank=self.cp_rank,
             mCuTotalMBlocks=(
                 blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
             ),
@@ -985,17 +1012,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             else:
                                 n_block_min = Int32(0)
                                 n_block_max = n_block_max_full
-                    # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
-                    # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
-                    # gracefully (fills zeros), but cp.async would crash on
-                    # out-of-bounds page table access.
+                    # Keep the dummy pipeline transaction when the range is empty.
+                    # TMA handles block=-1 for dense KV, while paged TMA needs a
+                    # valid page-table lookup; the consumer fully masks page 0.
                     n_block = (
                         n_block_max - 1
                         if const_expr(self.use_tma_KV)
                         else cutlass.max(n_block_max - 1, 0)
                     )
                     page_idx = (
-                        mPageTable[batch_idx, n_block]
+                        mPageTable[batch_idx, cutlass.max(n_block, 0)]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
                         else None
                     )

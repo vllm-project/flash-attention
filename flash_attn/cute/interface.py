@@ -499,6 +499,9 @@ def _flash_attn_fwd(
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
     compile_only: bool = False,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    cp_tot_seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -534,6 +537,8 @@ def _flash_attn_fwd(
         batch_size = cu_seqlens_q.shape[0] - 1
         seqlen_q = None
         total_q = q_shape[0]
+    if max_seqlen_q is None:
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
         assert page_table.dtype == torch.int32, "page_table must be int32"
@@ -571,6 +576,20 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
+    assert isinstance(cp_world_size, int) and cp_world_size >= 1, (
+        "cp_world_size must be an integer >= 1"
+    )
+    assert isinstance(cp_rank, int) and 0 <= cp_rank < cp_world_size, (
+        "cp_rank must be in [0, cp_world_size)"
+    )
+    if cp_world_size > 1:
+        assert cp_tot_seqused_k is not None, (
+            "cp_tot_seqused_k is required when cp_world_size > 1"
+        )
+    if cp_tot_seqused_k is not None:
+        assert cp_tot_seqused_k.shape == (batch_size,), (
+            "cp_tot_seqused_k must have shape (batch_size,)"
+        )
     assert v.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
@@ -586,13 +605,13 @@ def _flash_attn_fwd(
     q_dtype = q.dtype if q is not None else qv.dtype
     device = v.device
 
-    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, cp_tot_seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
+                "sequence length tensors must be int32"
             )
             assert t.stride(0) == 1, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
+                "sequence length tensors must be contiguous"
             )
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
@@ -613,6 +632,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+                cp_tot_seqused_k,
                 page_table,
                 learnable_sink,
                 output_scale,
@@ -620,6 +640,20 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    is_context_parallel = cp_world_size > 1
+    if is_context_parallel:
+        assert arch // 10 == 9, "context parallelism is only supported on SM90"
+        assert qv is not None, "context parallelism is only supported for Hopper MLA"
+        assert dynamic_causal is None, (
+            "dynamic_causal is not supported with context parallelism"
+        )
+        assert window_size_left is None and window_size_right is None, (
+            "local attention is not supported with context parallelism"
+        )
+        assert mask_mod is None, "mask_mod is not supported with context parallelism"
+        assert block_sparse_tensors is None, (
+            "block sparsity is not supported with context parallelism"
+        )
     if dynamic_causal is not None:
         assert arch // 10 == 9, "dynamic_causal is only supported on SM90 (Hopper)."
         _validate_tensor(
@@ -711,6 +745,10 @@ def _flash_attn_fwd(
     no_explicit_window = (
         window_size_left is None and window_size_right is None
     )
+    if is_context_parallel and causal and max_seqlen_q == 1 and no_explicit_window:
+        # Match FA3 decode semantics. With one query token every local key is
+        # visible, independent of how context-parallel ranks interleave keys.
+        causal = False
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
@@ -758,8 +796,6 @@ def _flash_attn_fwd(
             tile_m, tile_n, mma_pv_is_rs = 128, 96, True
         intra_wg_overlap = False
 
-    if max_seqlen_q is None:
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
@@ -1035,6 +1071,9 @@ def _flash_attn_fwd(
         cu_seqlens_k is None,
         seqused_q is None,
         seqused_k is None,
+        cp_world_size,
+        cp_rank,
+        cp_tot_seqused_k is None,
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
@@ -1077,6 +1116,7 @@ def _flash_attn_fwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            cp_tot_seqused_k_tensor,
             learnable_sink_tensor,
             output_scale_tensor, # 1d scalar tensor
             dynamic_scheduler_counter_tensor,
@@ -1089,6 +1129,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+                cp_tot_seqused_k,
                 learnable_sink,
                 output_scale,
                 dynamic_scheduler_counter,
@@ -1189,6 +1230,8 @@ def _flash_attn_fwd(
                 use_dynamic_varlen=use_dynamic_varlen,
                 persistent_scheduler_sm_count=persistent_scheduler_sm_count,
                 has_qv=qv is not None,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
             )
@@ -1362,6 +1405,10 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
+            ])
+            if arch // 10 == 9:
+                compile_args.append(cp_tot_seqused_k_tensor)
+            compile_args.extend([
                 dynamic_causal_tensor,
                 page_table_tensor,
                 window_size_left,
@@ -1445,6 +1492,10 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+            ])
+            if arch // 10 == 9:
+                call_args.append(cp_tot_seqused_k)
+            call_args.extend([
                 dynamic_causal,
                 page_table,
                 window_size_left,

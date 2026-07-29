@@ -284,7 +284,33 @@ class AttentionMask:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
 
         else:  # Causal or local
-            if const_expr(not self.swap_AB):
+            if const_expr(mask_causal and self.seqlen_info.cp_world_size > 1):
+                assert not self.swap_AB, "Context-parallel causal masking requires QK layout"
+                assert self.qhead_per_kvhead_packgqa == 1, (
+                    "Context-parallel causal masking does not support PackGQA"
+                )
+                for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                    row_idx = tScS_mn[r, 0][ROW] + m_block * self.tile_m
+                    global_k_limit = (
+                        row_idx + self.seqlen_info.tot_seqlen_k - self.seqlen_q
+                    )
+                    for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                        local_k_idx = (
+                            thr_col_offset
+                            + t0ScS_mn[0, c][COL]
+                            + n_block * self.tile_n
+                        )
+                        global_k_idx = (
+                            local_k_idx * self.seqlen_info.cp_world_size
+                            + self.seqlen_info.cp_rank
+                        )
+                        if (
+                            local_k_idx >= self.seqlen_k
+                            or global_k_idx > global_k_limit
+                            or global_k_idx >= self.seqlen_info.tot_seqlen_k
+                        ):
+                            acc_S_mn[r, c] = -Float32.inf
+            elif const_expr(not self.swap_AB):
                 # If PackGQA, we split the work of compute divmod among threads in the same row
                 threads_per_row = thr_mma.tv_layout_C.shape[0][0]
                 mma_m_idx = None

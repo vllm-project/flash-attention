@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.26)
 
 project(vllm_flash_attn LANGUAGES CXX CUDA)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(FA2_ENABLED ON)
@@ -174,6 +174,13 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
     )
+
+    # Pin the C++ standard on the target itself. When flash-attn is built as a
+    # vLLM subproject (FetchContent), the directory-level CMAKE_CXX_STANDARD set
+    # above does not propagate to targets created via define_gpu_extension_target,
+    # so the host .cpp sources would compile as C++17 and fail against PyTorch
+    # nightly's ATen headers, which now require C++20.
+    set_target_properties(_vllm_fa2_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 endif ()
 
 # FA3 requires CUDA 12.0 or later
@@ -306,6 +313,9 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
         CUTLASS_ENABLE_GDC_FOR_SM90
     )
+
+    # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.
+    set_target_properties(_vllm_fa3_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
 endif ()

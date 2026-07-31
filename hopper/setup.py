@@ -601,6 +601,7 @@ if not SKIP_CUDA_BUILD:
         )
     include_dirs = [
         Path(this_dir),
+        repo_dir / "csrc" / "common",
         cutlass_dir / "include",
     ]
 

@@ -668,7 +668,9 @@ mha_fwd_get_scheduler_metadata(
     params.page_size = page_size.has_value() ? page_size.value() : 1;
     params.page_table = !page_size.has_value() ? nullptr : reinterpret_cast<int*>(1);
 
-    bool const use_prepare_varlen = true;
+    // seqused_k is always present (required param) so does not indicate varlen
+    bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || leftpad_k_.has_value();
+    bool const use_prepare_varlen = is_varlen;
     params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
@@ -676,8 +678,6 @@ mha_fwd_get_scheduler_metadata(
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
-
-    bool is_varlen = true;
 
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing

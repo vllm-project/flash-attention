@@ -8,6 +8,7 @@
 #include "flash.h"
 
 inline bool use_one_mma_wg(Flash_fwd_params const& params) {
+    if (params.batch_invariant) { return false; }
     // assume pack_gqa for seqlen calculation
     return params.arch >= 90 && (params.d == 128 || params.d == 64) && !params.is_local && 
         params.seqlen_q * (params.h / params.h_k) <= 64;

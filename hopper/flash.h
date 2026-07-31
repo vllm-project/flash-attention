@@ -144,6 +144,8 @@ struct Flash_fwd_params : public Qkv_params {
     bool is_e4m3;
     bool is_causal;
     bool is_local;
+    // Keep numerically relevant kernel choices independent of batch-wide shapes.
+    bool batch_invariant;
 
     bool is_rotary_interleaved;
 

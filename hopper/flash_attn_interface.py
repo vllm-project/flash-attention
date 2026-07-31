@@ -52,7 +52,8 @@ def _flash_attn_forward(
         s_aux=None,
         cp_world_size=1,
         cp_rank=0,
-        cp_tot_seqused_k=None):
+        cp_tot_seqused_k=None,
+        batch_invariant=False):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -102,6 +103,7 @@ def _flash_attn_forward(
         cp_world_size,
         cp_rank,
         cp_tot_seqused_k,
+        batch_invariant,
     )
     return out, softmax_lse, *rest
 
@@ -675,6 +677,7 @@ def flash_attn_with_kvcache(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    batch_invariant=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -753,6 +756,8 @@ def flash_attn_with_kvcache(
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
+        batch_invariant: bool. Whether to keep numerically relevant kernel choices independent of
+            the other sequences in a variable-length batch.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -805,6 +810,7 @@ def flash_attn_with_kvcache(
         cp_world_size=cp_world_size,
         cp_rank=cp_rank,
         cp_tot_seqused_k=cp_tot_seqused_k,
+        batch_invariant=batch_invariant,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -826,6 +832,7 @@ def get_scheduler_metadata(
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
+    batch_invariant=False,
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -847,5 +854,6 @@ def get_scheduler_metadata(
         num_splits,
         pack_gqa,
         sm_margin,
+        batch_invariant,
     )
     return scheduler_metadata

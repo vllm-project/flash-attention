@@ -3,3 +3,4 @@
 // This file is auto-generated. See "generate_kernels.py"
 
 #include "flash_fwd_hdim192_128_e4m3_sm90.cu"
+#include "flash_fwd_hdim192_128_e4m3_fp8out_sm90.cu"

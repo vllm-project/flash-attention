@@ -40,6 +40,7 @@ def _flash_attn_forward(
         q_descale,
         k_descale,
         v_descale,
+        o_scale,
         softmax_scale,
         causal,
         window_size=(-1, -1),
@@ -88,6 +89,7 @@ def _flash_attn_forward(
         q_descale,
         k_descale,
         v_descale,
+        o_scale,
         softmax_scale,
         causal,
         window_size[0],
@@ -259,6 +261,7 @@ class FlashAttnFunc(torch.autograd.Function):
         causal,
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
+        o_scale=None,
         window_size=(-1, -1),
         softcap=0.0,
         num_splits=1,
@@ -286,6 +289,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
             None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
+            o_scale,
             softmax_scale,
             causal=causal,
             window_size=window_size,
@@ -335,7 +339,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -356,6 +360,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
+        o_scale=None,
         window_size=(-1, -1),
         softcap=0.0,
         num_splits=1,
@@ -387,6 +392,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None, None, None,   # page_table, kv_batch_idx, leftpad_k,
             None, None, None,  # rotary_cos/sin, seqlens_rotary
             q_descale, k_descale, v_descale,
+            o_scale,
             softmax_scale,
             causal=causal,
             window_size=window_size,
@@ -441,7 +447,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -508,6 +514,7 @@ def flash_attn_func(
     causal=False,
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
+    o_scale=None,
     window_size=(-1, -1),
     softcap=0.0,
     num_splits=1,
@@ -572,6 +579,7 @@ def flash_attn_func(
         causal,
         qv,
         q_descale, k_descale, v_descale,
+        o_scale,
         window_size,
         softcap,
         num_splits,
@@ -599,6 +607,7 @@ def flash_attn_varlen_func(
     causal=False,
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
+    o_scale=None,
     window_size=(-1, -1),
     softcap=0.0,
     num_splits=1,
@@ -624,6 +633,7 @@ def flash_attn_varlen_func(
         causal,
         qv,
         q_descale, k_descale, v_descale,
+        o_scale,
         window_size,
         softcap,
         num_splits,
@@ -661,6 +671,7 @@ def flash_attn_with_kvcache(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
+    o_scale: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
@@ -792,6 +803,7 @@ def flash_attn_with_kvcache(
         rotary_sin,
         rotary_seqlens,
         q_descale, k_descale, v_descale,
+        o_scale,
         softmax_scale,
         causal=causal,
         window_size=window_size,

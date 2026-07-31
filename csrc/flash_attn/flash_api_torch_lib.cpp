@@ -121,7 +121,7 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
             "int num_splits, Tensor? gen) -> Tensor[]");
 
-    ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
+    ops.def("fwd_kvcache(Tensor! q, Tensor! kcache, Tensor! vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, Tensor? block_table, "
             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits) -> Tensor[]");

@@ -48,6 +48,7 @@ def _flash_attn_forward(
         scheduler_metadata=None,
         num_splits=1,
         pack_gqa=None,
+        only_qv=False,
         sm_margin=0,
         s_aux=None,
         cp_world_size=1,
@@ -97,6 +98,7 @@ def _flash_attn_forward(
         scheduler_metadata,
         num_splits,
         pack_gqa,
+        only_qv,
         sm_margin,
         s_aux,
         cp_world_size,
@@ -263,6 +265,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
+        only_qv=False,
         deterministic=False,
         sm_margin=0,
         s_aux=None,
@@ -292,6 +295,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             s_aux=s_aux,
             cp_world_size=cp_world_size,
@@ -335,7 +339,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -360,6 +364,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softcap=0.0,
         num_splits=1,
         pack_gqa=None,
+        only_qv=False,
         deterministic=False,
         sm_margin=0,
         s_aux=None,
@@ -393,6 +398,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            only_qv=only_qv,
             sm_margin=sm_margin,
             s_aux=s_aux,
             cp_world_size=cp_world_size,
@@ -441,7 +447,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -512,6 +518,7 @@ def flash_attn_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     deterministic=False,
     sm_margin=0,
     s_aux=None,
@@ -576,6 +583,7 @@ def flash_attn_func(
         softcap,
         num_splits,
         pack_gqa,
+        only_qv,
         deterministic,
         sm_margin,
         s_aux,
@@ -603,6 +611,7 @@ def flash_attn_varlen_func(
     softcap=0.0,
     num_splits=1,
     pack_gqa=None,
+    only_qv=False,
     deterministic=False,
     sm_margin=0,
     s_aux=None,
@@ -628,6 +637,7 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
+        only_qv,
         deterministic,
         sm_margin,
         s_aux,
@@ -669,6 +679,7 @@ def flash_attn_with_kvcache(
     scheduler_metadata=None,
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
+    only_qv=False,
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     s_aux=None,
@@ -761,10 +772,17 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if only_qv and k_cache is None:
+        k_cache = torch.empty(1, 1, 1, 1, dtype=v_cache.dtype, device=v_cache.device)
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if only_qv and q is None:
+        q = torch.empty(1, 1, 1, 1, dtype=v_cache.dtype, device=v_cache.device)
     if softmax_scale is None:
-        softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        if only_qv:
+            softmax_scale = qv.shape[-1] ** (-0.5)
+        else:
+            softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
@@ -800,6 +818,7 @@ def flash_attn_with_kvcache(
         scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        only_qv=only_qv,
         sm_margin=sm_margin,
         s_aux=s_aux,
         cp_world_size=cp_world_size,

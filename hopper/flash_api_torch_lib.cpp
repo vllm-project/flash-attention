@@ -51,6 +51,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         std::optional<at::Tensor> &scheduler_metadata_,  // (b + 1)
         int num_splits,
         std::optional<bool> pack_gqa_,
+        bool only_qv,
         int const sm_margin,
         std::optional<const at::Tensor> &s_aux_,
         int const cp_world_size,
@@ -122,6 +123,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  scheduler_metadata,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
+            "    bool     only_qv,"
             "    int      sm_margin,"
             "    Tensor?  s_aux,"
             "    int      cp_world_size,"

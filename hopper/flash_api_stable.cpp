@@ -608,6 +608,7 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
+        bool only_qv,
         int64_t sm_margin) {
 
     STD_TORCH_CHECK(qkv_dtype == torch::headeronly::ScalarType::Half || qkv_dtype == torch::headeronly::ScalarType::BFloat16 || qkv_dtype == torch::headeronly::ScalarType::Float8_e4m3fn,
@@ -773,6 +774,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
+        bool only_qv,
         int64_t sm_margin
         ) {
 
@@ -1115,6 +1117,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+    STD_TORCH_CHECK(!only_qv || q_v_.has_value(), "only_qv requires q_v to be provided");
+    params.only_qv = only_qv;
 
     if (rotary_cos_.has_value()) {
         STD_TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
@@ -1790,9 +1794,10 @@ void boxed_mha_fwd(
     auto scheduler_metadata = to<std::optional<Tensor>>(stack[30]);
     auto num_splits = to<int64_t>(stack[31]);
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
-    auto sm_margin = to<int64_t>(stack[33]);
+    auto only_qv = to<bool>(stack[33]);
+    auto sm_margin = to<int64_t>(stack[34]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, only_qv, sm_margin);
 
 
     stack[0] = from(out_);
@@ -1924,6 +1929,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
+        "bool only_qv = False,"
         "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"

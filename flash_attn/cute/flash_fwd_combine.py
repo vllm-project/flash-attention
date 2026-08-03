@@ -29,7 +29,9 @@ class FlashAttentionForwardCombine:
         log_max_splits: int = 4,
         num_threads: int = 256,
         stages: int = 4,
+        skip_single_split: bool = False,
         output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        compact_varlen_grid: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -55,7 +57,9 @@ class FlashAttentionForwardCombine:
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
+        self.skip_single_split = skip_single_split
         self.output_quant_key = output_quant_key
+        self.compact_varlen_grid = compact_varlen_grid
 
     @staticmethod
     def can_implement(
@@ -209,6 +213,7 @@ class FlashAttentionForwardCombine:
         varlen_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
         output_scale: Optional[cute.Tensor] = None,
+        max_seqlen_q: Optional[Int32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -297,10 +302,24 @@ class FlashAttentionForwardCombine:
         seqlen_divmod = FastDivmodDivisor(seqlen)
         head_divmod = FastDivmodDivisor(num_head)
 
+        grid_seqlen = (
+            max_seqlen_q
+            if const_expr(cu_seqlens is not None and max_seqlen_q is not None)
+            else seqlen
+        )
         grid_dim = (
-            cute.ceil_div(seqlen * num_head, self.tile_m),
+            (
+                (seqlen * num_head + batch_size * (self.tile_m - 1))
+                // self.tile_m
+                if const_expr(cu_seqlens is not None and self.compact_varlen_grid)
+                else cute.ceil_div(grid_seqlen * num_head, self.tile_m)
+            ),
             cute.ceil_div(self.head_dim, self.k_block_size),
-            batch_size,
+            (
+                Int32(1)
+                if const_expr(cu_seqlens is not None and self.compact_varlen_grid)
+                else batch_size
+            ),
         )
 
         self.kernel(
@@ -357,7 +376,85 @@ class FlashAttentionForwardCombine:
     ):
         # Thread and block indices
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, k_block, maybe_virtual_batch = cute.arch.block_idx()
+        grid_m_block, k_block, grid_batch = cute.arch.block_idx()
+        skip_all_one = False
+        if const_expr(
+            self.skip_single_split and num_splits_dynamic_ptr is not None
+        ):
+            skip_all_one = num_splits_dynamic_ptr[0] < 0
+        m_block, maybe_virtual_batch = grid_m_block, grid_batch
+        num_head = mO_partial.shape[3]
+        batch_size = (
+            Int32(cu_seqlens.shape[0] - 1)
+            if const_expr(cu_seqlens is not None)
+            else mO_partial.shape[4]
+        )
+        if const_expr(cu_seqlens is not None and self.compact_varlen_grid):
+            tile_idx = -1 if skip_all_one else m_block
+            lane_idx = cute.arch.lane_idx()
+            batch_idx = Int32(0)
+            group_start_batch = Int32(0)
+            group_end_tile = Int32(0)
+            group_start_tile = Int32(0)
+            m_blocks_in_group = Int32(0)
+            num_m_blocks = Int32(0)
+            num_m_blocks_cumulative = Int32(0)
+            while group_end_tile <= tile_idx:
+                cur_cu_seqlen = Int32(0)
+                batch_lane = group_start_batch + lane_idx
+                if batch_lane <= batch_size:
+                    cur_cu_seqlen = cu_seqlens[batch_lane]
+                next_cu_seqlen = cute.arch.shuffle_sync_down(
+                    cur_cu_seqlen, offset=1
+                )
+                seqlen_lane = next_cu_seqlen - cur_cu_seqlen
+                num_m_blocks = (
+                    cute.ceil_div(seqlen_lane * num_head, self.tile_m)
+                    if batch_lane < batch_size
+                    and lane_idx < cute.arch.WARP_SIZE - 1
+                    else Int32(0)
+                )
+                num_m_blocks_cumulative = utils.warp_prefix_sum(
+                    num_m_blocks, lane_idx
+                )
+                m_blocks_in_group = cute.arch.shuffle_sync(
+                    num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+                )
+                group_start_tile = group_end_tile
+                group_end_tile += m_blocks_in_group
+                if (
+                    group_end_tile <= tile_idx
+                    and group_start_batch + cute.arch.WARP_SIZE - 1 < batch_size
+                ):
+                    group_start_batch += cute.arch.WARP_SIZE - 1
+                else:
+                    group_end_tile = tile_idx + 1
+
+            batch_idx_in_group = cute.arch.popc(
+                cute.arch.vote_ballot_sync(
+                    group_start_tile + num_m_blocks_cumulative <= tile_idx
+                )
+            )
+            batch_idx = group_start_batch + batch_idx_in_group
+            num_m_blocks_prev_lane = (
+                Int32(0)
+                if batch_idx_in_group == 0
+                else cute.arch.shuffle_sync(
+                    num_m_blocks_cumulative, batch_idx_in_group - 1
+                )
+            )
+            m_block = (
+                tile_idx
+                - group_start_tile
+                - num_m_blocks_prev_lane
+            )
+            if batch_idx >= batch_size:
+                batch_idx = batch_size - 1
+                m_block = mO_partial.shape[0] * num_head
+            maybe_virtual_batch = batch_idx
+            if skip_all_one:
+                m_block = mO_partial.shape[0] * num_head
+                maybe_virtual_batch = 0
 
         # Load FP8 output scale and invert in-kernel.
         if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
@@ -383,16 +480,22 @@ class FlashAttentionForwardCombine:
         if const_expr(semaphore_to_reset is not None):
             if (
                 tidx == 0
-                and m_block == cute.arch.grid_dim()[0] - 1
+                and grid_m_block == cute.arch.grid_dim()[0] - 1
                 and k_block == cute.arch.grid_dim()[1] - 1
-                and maybe_virtual_batch == cute.arch.grid_dim()[2] - 1
+                and grid_batch == cute.arch.grid_dim()[2] - 1
             ):
                 cute.arch.griddepcontrol_wait()
                 semaphore_to_reset[0] = 0
 
         # Get number of splits (use maybe_virtual_batch for per-batch-slot splits)
         num_splits = (
-            num_splits_dynamic_ptr[maybe_virtual_batch]
+            cutlass.max(
+                1,
+                cutlass.min(
+                    num_splits_dynamic_ptr[maybe_virtual_batch],
+                    mLSE_partial.shape[1],
+                ),
+            )
             if const_expr(num_splits_dynamic_ptr is not None)
             else mLSE_partial.shape[1]
         )
@@ -406,14 +509,14 @@ class FlashAttentionForwardCombine:
         )
         seqlen, offset = seqlen_info.seqlen, seqlen_info.offset
 
-        # Extract number of heads (head index will be determined dynamically)
-        num_head = mO_partial.shape[3]
         max_idx = seqlen * num_head
-
-        # Early exit for single split if dynamic
-        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (
-            const_expr(not varlen) or m_block * self.tile_m < max_idx
+        if const_expr(
+            self.skip_single_split and num_splits_dynamic_ptr is not None
         ):
+            if num_splits == 1:
+                max_idx = 0
+
+        if const_expr(not varlen) or m_block * self.tile_m < max_idx:
             # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)
             cute.arch.griddepcontrol_wait()
 

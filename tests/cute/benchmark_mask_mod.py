@@ -403,6 +403,7 @@ class FlashAttentionBenchmark:
         compiled = cute.compile(
             kernel,
             q_cute,
+            None,  # qv
             k_cute,
             v_cute,
             out_cute,
@@ -424,6 +425,7 @@ class FlashAttentionBenchmark:
 
         args = (
             q_cute,
+            None,  # qv
             k_cute,
             v_cute,
             out_cute,

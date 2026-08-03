@@ -37,6 +37,28 @@ class SchedulingMode(IntEnum):
     CLC = auto()
 
 
+def _sm90_gqa_l2_divisor(qhead_per_kvhead):
+    """Round a GQA ratio up to a power-of-two bucket, capped at 16."""
+    if qhead_per_kvhead <= 1:
+        return 1
+    if qhead_per_kvhead <= 2:
+        return 2
+    if qhead_per_kvhead <= 4:
+        return 4
+    if qhead_per_kvhead <= 8:
+        return 8
+    return 16
+
+
+def _decode_dynamic_split_mh_block(mh_block, num_m_blocks, num_splits):
+    """Decode the per-batch linear work coordinate used by FA3 split-varlen."""
+    head_split_idx = mh_block // num_m_blocks
+    block = mh_block - head_split_idx * num_m_blocks
+    head_idx = head_split_idx // num_splits
+    split_idx = head_split_idx - head_idx * num_splits
+    return block, head_idx, split_idx
+
+
 @dataclass
 class ClcState(ParamsBase):
     """Owns the runtime state shared by CLC-capable tile schedulers.
@@ -157,6 +179,7 @@ class TileSchedulerArguments(ParamsBase):
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
+    num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
@@ -164,6 +187,11 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+
+
+@dataclass
+class HopperTileSchedulerArguments(TileSchedulerArguments):
+    use_dynamic_gqa_l2_budget: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -796,6 +824,7 @@ class SingleTileVarlenScheduler:
         tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
@@ -817,6 +846,14 @@ class SingleTileVarlenScheduler:
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+            if const_expr(
+                isinstance(args, HopperTileSchedulerArguments)
+                and args.use_dynamic_gqa_l2_budget
+            ):
+                size_l2 = Int32(
+                    32 * 1024 * 1024
+                    // _sm90_gqa_l2_divisor(args.qhead_per_kvhead_packgqa)
+                )
             # if backward, this is qdo block size
             kv_block_size = (
                 (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
@@ -838,6 +875,7 @@ class SingleTileVarlenScheduler:
                 tile_shape_mn=args.tile_shape_mn,
                 mCuSeqlensQ=args.mCuSeqlensQ,
                 mSeqUsedQ=args.mSeqUsedQ,
+                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
                 is_split_kv=args.is_split_kv,
@@ -946,18 +984,42 @@ class SingleTileVarlenScheduler:
         )
 
     @cute.jit
-    def _varlen_coord_map(self) -> WorkTileInfo:
-        """Map self._tile_idx to (block, head, batch) via warp-level prefix sums."""
+    def _varlen_coord_map(
+        self, *, linearize_dynamic_splits: cutlass.Constexpr[bool] = False
+    ) -> WorkTileInfo:
+        """Map self._tile_idx to (block, head, batch, split) via warp prefix sums."""
         params = self.params
+        if const_expr(linearize_dynamic_splits):
+            assert params.is_split_kv
+            assert params.num_splits_dynamic_ptr is not None
         lane_idx = cute.arch.lane_idx()
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
-        num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
+        num_splits = Int32(1)
+        if const_expr(linearize_dynamic_splits):
+            batch_idx_lane = lane_idx
+            if batch_idx_lane < params.num_batch and lane_idx < cute.arch.WARP_SIZE - 1:
+                num_splits = cutlass.max(
+                    1,
+                    cutlass.min(
+                        params.num_splits_dynamic_ptr[batch_idx_lane],
+                        params.num_splits,
+                    ),
+                )
+            else:
+                num_splits = Int32(0)
+        num_linear_m_blocks = num_m_blocks * num_splits
+        num_m_blocks_cumulative = utils.warp_prefix_sum(num_linear_m_blocks, lane_idx)
         # Total number of blocks for the next 31 batches
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         # Same for all lanes
         group_end_tile = m_blocks_in_group * params.num_head
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
-        block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
+        block, head_idx, batch_idx, split_idx = (
+            Int32(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+        )
         next_tile_idx = self._tile_idx // params.cluster_shape_m
         while group_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
@@ -966,7 +1028,25 @@ class SingleTileVarlenScheduler:
                 group_end_tile = next_tile_idx + 1
             else:
                 num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-                num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
+                if const_expr(linearize_dynamic_splits):
+                    batch_idx_lane = lane_idx + batch_idx
+                    if (
+                        batch_idx_lane < params.num_batch
+                        and lane_idx < cute.arch.WARP_SIZE - 1
+                    ):
+                        num_splits = cutlass.max(
+                            1,
+                            cutlass.min(
+                                params.num_splits_dynamic_ptr[batch_idx_lane],
+                                params.num_splits,
+                            ),
+                        )
+                    else:
+                        num_splits = Int32(0)
+                num_linear_m_blocks = num_m_blocks * num_splits
+                num_m_blocks_cumulative = utils.warp_prefix_sum(
+                    num_linear_m_blocks, lane_idx
+                )
                 m_blocks_in_group = cute.arch.shuffle_sync(
                     num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
                 )
@@ -985,13 +1065,19 @@ class SingleTileVarlenScheduler:
                 )
             )
             batch_idx += batch_idx_in_group
-            num_m_blocks_prev_lane = (
+            num_linear_m_blocks_prev_lane = (
                 0
                 if batch_idx_in_group == 0
                 else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_idx_in_group - 1)
             )
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * params.num_head
+            if const_expr(linearize_dynamic_splits):
+                num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
+            mh_block = (
+                next_tile_idx
+                - group_start_tile
+                - num_linear_m_blocks_prev_lane * params.num_head
+            )
             if cutlass.const_expr(params.lpt or params.head_swizzle):
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
@@ -1020,29 +1106,72 @@ class SingleTileVarlenScheduler:
                     )
                 )
                 nheads_in_l2 = min(nheads_in_l2, params.num_head)
-                mh_in_l2 = nheads_in_l2 * num_m_blocks
-                section_idx = mh_block // mh_in_l2
-                l2_mod = mh_block - section_idx * mh_in_l2
-                # Deal with tail section
-                nheads_in_this_section = (
-                    nheads_in_l2
-                    if nheads_in_l2 * (section_idx + 1) <= params.num_head
-                    else params.num_head - section_idx * nheads_in_l2
-                )
-                block = l2_mod // nheads_in_this_section
-                head_idx_residual = l2_mod - block * nheads_in_this_section
-                head_idx = section_idx * nheads_in_l2 + head_idx_residual
+                split_idx = Int32(0)
+                if const_expr(linearize_dynamic_splits):
+                    if num_splits == 1:
+                        mh_in_l2 = nheads_in_l2 * num_m_blocks
+                        section_idx = mh_block // mh_in_l2
+                        l2_mod = mh_block - section_idx * mh_in_l2
+                        nheads_in_this_section = (
+                            nheads_in_l2
+                            if nheads_in_l2 * (section_idx + 1) <= params.num_head
+                            else params.num_head - section_idx * nheads_in_l2
+                        )
+                        block = l2_mod // nheads_in_this_section
+                        head_idx_residual = l2_mod - block * nheads_in_this_section
+                        head_idx = section_idx * nheads_in_l2 + head_idx_residual
+                    else:
+                        block, head_idx, split_idx = (
+                            _decode_dynamic_split_mh_block(
+                                mh_block, num_m_blocks, num_splits
+                            )
+                        )
+                else:
+                    mh_in_l2 = nheads_in_l2 * num_m_blocks
+                    section_idx = mh_block // mh_in_l2
+                    l2_mod = mh_block - section_idx * mh_in_l2
+                    # Deal with tail section
+                    nheads_in_this_section = (
+                        nheads_in_l2
+                        if nheads_in_l2 * (section_idx + 1) <= params.num_head
+                        else params.num_head - section_idx * nheads_in_l2
+                    )
+                    block = l2_mod // nheads_in_this_section
+                    head_idx_residual = l2_mod - block * nheads_in_this_section
+                    head_idx = section_idx * nheads_in_l2 + head_idx_residual
                 if cutlass.const_expr(params.lpt):
                     block = num_m_blocks - 1 - block
             else:
-                head_idx = mh_block // num_m_blocks
-                block = mh_block - head_idx * num_m_blocks
+                if const_expr(linearize_dynamic_splits):
+                    block, head_idx, split_idx = _decode_dynamic_split_mh_block(
+                        mh_block, num_m_blocks, num_splits
+                    )
+                else:
+                    head_idx = mh_block // num_m_blocks
+                    block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
             if cutlass.const_expr(params.cluster_shape_m > 1 and not params.use_cluster_idx):
                 bidx_in_cluster = cute.arch.block_in_cluster_idx()
                 block = block * params.cluster_shape_m + bidx_in_cluster[0]
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
-        split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        if const_expr(linearize_dynamic_splits):
+            split_idx |= num_splits << 16
+        else:
+            split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        if const_expr(
+            params.num_splits_dynamic_ptr is not None and not linearize_dynamic_splits
+        ):
+            num_splits = Int32(1)
+            if batch_idx < params.num_batch:
+                num_splits = cutlass.max(
+                    1,
+                    cutlass.min(
+                        params.num_splits_dynamic_ptr[batch_idx],
+                        params.num_splits,
+                    ),
+                )
+            is_valid = is_valid and split_idx < num_splits
+            split_idx |= num_splits << 16
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
     @cute.jit
@@ -1115,6 +1244,197 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*obj_list, loc=self._loc)
+
+
+class BatchOneDynamicSplitVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Direct q1 mapping for a graph-stable runtime split count."""
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> SingleTileVarlenScheduler.Params:
+        assert scheduling_mode == SchedulingMode.STATIC
+        assert args.is_split_kv
+        assert args.num_splits_dynamic_ptr is not None
+        return SingleTileVarlenScheduler.to_underlying_arguments(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "BatchOneDynamicSplitVarlenTileScheduler":
+        tile_idx, split_idx, _ = cute.arch.block_idx()
+        return BatchOneDynamicSplitVarlenTileScheduler(
+            params, tile_idx, split_idx, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        sm_count: int,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        return SingleTileVarlenScheduler.get_grid_shape(params)
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        num_splits = cutlass.max(
+            1,
+            cutlass.min(
+                params.num_splits_dynamic_ptr[0],
+                params.num_splits,
+            ),
+        )
+        split_idx = self._split_idx
+        is_valid = (
+            self._is_first_block
+            and self._tile_idx < params.num_head
+            and split_idx < num_splits
+        )
+        split_idx |= num_splits << 16
+        return WorkTileInfo(
+            (
+                Int32(0),
+                Int32(self._tile_idx),
+                Int32(0),
+                split_idx,
+            ),
+            is_valid,
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work()
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._is_first_block = False
+        return self.get_current_work()
+
+
+class StaticPersistentVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Static persistent scheduler for non-split variable-length attention."""
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> SingleTileVarlenScheduler.Params:
+        assert scheduling_mode == SchedulingMode.STATIC, (
+            f"StaticPersistentVarlenTileScheduler only supports STATIC, got {scheduling_mode!r}"
+        )
+        assert not args.is_split_kv, "Static persistent varlen does not support split-KV"
+        return SingleTileVarlenScheduler.to_underlying_arguments(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "StaticPersistentVarlenTileScheduler":
+        assert not params.is_split_kv, "Static persistent varlen does not support split-KV"
+        tile_idx = cute.arch.block_idx()[0]
+        return StaticPersistentVarlenTileScheduler(params, tile_idx, Int32(0), loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        sm_count: int,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        max_grid_x = SingleTileVarlenScheduler.get_grid_shape(params)[0]
+        # A second wave balances causal tiles while retaining several tiles per CTA.
+        return (cutlass.min(sm_count * 2, max_grid_x), Int32(1), Int32(1))
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
+
+
+class DynamicPersistentVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Atomic persistent scheduler for variable-length attention."""
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        *,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> SingleTileVarlenScheduler.Params:
+        assert scheduling_mode == SchedulingMode.STATIC
+        assert not args.is_split_kv or args.num_splits_dynamic_ptr is not None
+        return SingleTileVarlenScheduler.to_underlying_arguments(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "DynamicPersistentVarlenTileScheduler":
+        return DynamicPersistentVarlenTileScheduler(
+            params, Int32(0), Int32(0), loc=loc, ip=ip
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        sm_count: int,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        if const_expr(params.is_split_kv):
+            return (Int32(sm_count), Int32(1), Int32(1))
+        max_grid_x = SingleTileVarlenScheduler.get_grid_shape(params)[0]
+        return (cutlass.min(sm_count, max_grid_x), Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        return self._varlen_coord_map(
+            linearize_dynamic_splits=self.params.is_split_kv
+        )
+
+    @cute.jit
+    def claim_next_work(self, mWorkCounter: cute.Tensor) -> WorkTileInfo:
+        lane_idx = cute.arch.lane_idx()
+        tile_idx = Int32(0)
+        if lane_idx == 0:
+            tile_idx = cute.arch.atomic_add(
+                mWorkCounter.iterator.llvm_ptr,
+                Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+        self._tile_idx = cute.arch.shuffle_sync(tile_idx, 0)
+        return self.get_current_work()
 
 
 # -----------------------------------------------------------------------------

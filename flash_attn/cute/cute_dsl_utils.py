@@ -103,13 +103,14 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def to_cute_aux_tensor(t, enable_tvm_ffi=True):
+def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
     This allows the user to specify alignment and leading dimension for aux tensors used in
     custom score_mod callables.
     """
     assumed_align: int = getattr(t, "__assumed_align__", None)
-    leading_dim: int = getattr(t, "__leading_dim__", None)
+    if leading_dim is None:
+        leading_dim = getattr(t, "__leading_dim__", None)
     fully_dynamic: bool = leading_dim is None
 
     return to_cute_tensor(
@@ -121,14 +122,28 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
     )
 
 
-def get_aux_tensor_metadata(aux_tensors):
+def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
+    if aux_tensor_leading_dims is not None:
+        assert len(aux_tensor_leading_dims) == len(aux_tensors)
+
     return tuple(
         (
             getattr(t, "__assumed_align__", 0),
-            getattr(t, "__leading_dim__", -1),
-            hasattr(t, "__leading_dim__"),
+            (
+                leading_dim
+                if leading_dim is not None
+                else getattr(t, "__leading_dim__", -1)
+            ),
+            leading_dim is not None or hasattr(t, "__leading_dim__"),
         )
-        for t in aux_tensors
+        for t, leading_dim in zip(
+            aux_tensors,
+            (
+                aux_tensor_leading_dims
+                if aux_tensor_leading_dims is not None
+                else [None] * len(aux_tensors)
+            ),
+        )
     )
 
 

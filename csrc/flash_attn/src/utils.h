@@ -7,6 +7,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <optional>
 
 #include <cuda_fp16.h>
 

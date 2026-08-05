@@ -99,9 +99,17 @@ class FlashAttentionForwardSm90Fp8(FlashAttentionForwardSm90):
             destination[destination_coord] = source[source_coord]
         cute.arch.fence_view_async_shared()
         cute.arch.barrier(
-            # FP8 is RS-PV without the asymmetric P handoff, so PFull is free.
-            barrier_id=int(NamedBarrierFwd.PFull),
+            # FP8 D128 is RS-PV without the asymmetric P handoff, so PEmpty is
+            # free.  All consumers must finish sVt before any of them launch PV.
+            barrier_id=int(NamedBarrierFwd.PEmpty),
             number_of_threads=self.num_mma_threads,
+        )
+        cute.arch.barrier_arrive(
+            # PFull is likewise free and returns source-stage ownership to the
+            # producer without requiring both roles to execute the same bar.sync.
+            barrier_id=int(NamedBarrierFwd.PFull),
+            number_of_threads=self.v_transpose_barrier_threads,
+            aligned=False,
         )
 
     def _check_type(

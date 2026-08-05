@@ -473,6 +473,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert self.num_wg_mma in [1, 2, 3]
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
+        self.v_transpose_barrier_threads = self.num_mma_threads + (
+            self.num_producer_threads
+            if const_expr(self.use_tma_KV)
+            else self.num_threads_per_warp_group
+        )
         self.num_Q_load_threads = self.num_threads_per_warp_group  # If not TMA_Q
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
@@ -1601,6 +1606,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We only need producer_tail on V since that's the last that's loaded, we don't
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
+                if const_expr(self.transpose_v):
+                    # Complete the final source-stage return; every earlier
+                    # phase was consumed immediately before the following V load.
+                    cute.arch.barrier(
+                        barrier_id=int(NamedBarrierFwd.PFull),
+                        number_of_threads=self.v_transpose_barrier_threads,
+                    )
                 pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
@@ -1666,6 +1678,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         page_idx: Optional[Int32] = None,
         mask_seqlen: cutlass.Constexpr[bool] = True,
     ):
+        if const_expr(self.transpose_v and K_or_V == "V"):
+            # The first phase is supplied by the consumers before their loop;
+            # later phases return the preceding source stage after transpose.
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PFull),
+                number_of_threads=self.v_transpose_barrier_threads,
+            )
         if const_expr(self.use_tma_KV):
             src_idx = block if const_expr(page_idx is None) else page_idx
             tma_load_fn(src_idx=src_idx, producer_state=producer_state)
@@ -1908,6 +1927,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax=softmax,
             acc_O=acc_O,
         )
+        if const_expr(self.transpose_v):
+            # Seed the producer's first V-load phase.  Each completed transpose
+            # supplies the next phase, including the producer's final drain.
+            cute.arch.barrier_arrive(
+                barrier_id=int(NamedBarrierFwd.PFull),
+                number_of_threads=self.v_transpose_barrier_threads,
+                aligned=False,
+            )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
 

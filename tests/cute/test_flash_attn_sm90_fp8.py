@@ -216,8 +216,8 @@ def _quantize_query(values: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
     from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
-    quantizer = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
     with set_current_vllm_config(VllmConfig()):
+        quantizer = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         quantized, returned_scale = quantizer(
             values.reshape(-1, HEAD_DIM).cuda(), scale.reshape(1)
         )
@@ -820,10 +820,12 @@ def test_fp8_precompile(fp8_scale_manifest, fp8_record):
     def compile_cache_keys():
         return {
             "forward": tuple(
-                sorted(repr(key) for key in _flash_attn_fwd.compile_cache)
+                sorted(repr(key) for key in _flash_attn_fwd.compile_cache.cache)
             ),
             "combine": tuple(
-                sorted(repr(key) for key in _flash_attn_fwd_combine.compile_cache)
+                sorted(
+                    repr(key) for key in _flash_attn_fwd_combine.compile_cache.cache
+                )
             ),
         }
 

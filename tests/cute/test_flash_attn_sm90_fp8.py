@@ -160,14 +160,26 @@ def _arithmetic_cases() -> tuple[AttentionCase, ...]:
                 32,
                 True,
             ),
+            AttentionCase(
+                "persistent-single-token-decode",
+                17,
+                (1,),
+                (16,),
+                ((7,),),
+                32,
+                64,
+                1,
+                True,
+            ),
         )
     )
-    assert len(cases) == 13
+    assert len(cases) == 14
     assert all(case.input_causal for case in cases)
     return tuple(cases)
 
 
 ARITHMETIC_CASES = _arithmetic_cases()
+PERSISTENT_DECODE_CASE = ARITHMETIC_CASES[13]
 
 
 def _scale_pair(manifest: dict[str, Any], seed: int) -> tuple[float, float]:
@@ -832,6 +844,7 @@ def test_fp8_precompile(fp8_scale_manifest, fp8_record):
     representatives = (
         ARITHMETIC_CASES[3],
         ARITHMETIC_CASES[6],
+        PERSISTENT_DECODE_CASE,
         ARITHMETIC_CASES[7],
         ARITHMETIC_CASES[8],
         ARITHMETIC_CASES[9],
@@ -846,9 +859,9 @@ def test_fp8_precompile(fp8_scale_manifest, fp8_record):
         _run_fp8_case(case, fp8_scale_manifest, return_lse=True)
     _run_masked_semantics(fp8_scale_manifest)
     test_only = compile_cache_keys()
-    assert len(production["forward"]) == 8
+    assert len(production["forward"]) == 9
     assert len(production["combine"]) == 1
-    assert len(test_only["forward"]) == 17
+    assert len(test_only["forward"]) == 19
     assert len(test_only["combine"]) == 2
     fp8_record(
         {

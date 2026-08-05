@@ -30,24 +30,24 @@ std::vector<Tensor>
 mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         const Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
         const Tensor &v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
-        std::optional<const Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-        std::optional<const Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
-        std::optional<const Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+        const std::optional<Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
+        const std::optional<Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
+        const std::optional<Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
         std::optional<Tensor> &out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        std::optional<const Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+        const std::optional<Tensor> &cu_seqlens_q_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_new_,  // b+1
+        const std::optional<Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        const std::optional<Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
         std::optional<int> max_seqlen_q_,
         // TODO: check if we need max_seqlen_k
         std::optional<int> max_seqlen_k_,
-        std::optional<const Tensor> &page_table_, // (b_k, max_num_pages_per_seq)
-        std::optional<const Tensor> &kv_batch_idx_, // b. indices to index into the KV cache
-        std::optional<const Tensor> &leftpad_k_, // b
-        std::optional<const Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const Tensor> &seqlens_rotary_, // b
+        const std::optional<Tensor> &page_table_, // (b_k, max_num_pages_per_seq)
+        const std::optional<Tensor> &kv_batch_idx_, // b. indices to index into the KV cache
+        const std::optional<Tensor> &leftpad_k_, // b
+        const std::optional<Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+        const std::optional<Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        const std::optional<Tensor> &seqlens_rotary_, // b
         std::optional<Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<Tensor> &k_descale_,  // (b, h_k)
         std::optional<Tensor> &v_descale_,  // (b, h_k)
@@ -61,10 +61,10 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const Tensor> &s_aux_,
+        const std::optional<Tensor> &s_aux_,
         int const cp_world_size,
         int const cp_rank,
-        std::optional<const Tensor> &cp_tot_seqused_k
+        const std::optional<Tensor> &cp_tot_seqused_k
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -79,11 +79,11 @@ mha_fwd_get_scheduler_metadata(
         int headdim_v,
         ScalarType qkv_dtype,
         const Tensor &seqused_k, // b
-        std::optional<const Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const Tensor> &leftpad_k_, // b
+        const std::optional<Tensor> &cu_seqlens_q_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_new_,  // b+1
+        const std::optional<Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        const std::optional<Tensor> &leftpad_k_, // b
         std::optional<int> page_size,
         int max_seqlen_k_new,  // 0 means we're not appending new KV
         bool is_causal,
@@ -111,14 +111,6 @@ inline float narrow_double_to_float(double v, const char* name) {
   STD_TORCH_CHECK(std::abs(v) <= static_cast<double>(std::numeric_limits<float>::max()),
                   name, " is too large to convert to float");
   return static_cast<float>(v);
-}
-
-// Bridge TORCH_BOX-friendly optional<Tensor> into the
-// optional<const Tensor>& form expected by mha_* implementations.
-inline std::optional<const Tensor>& as_const_tensor_opt(
-    std::optional<Tensor>& opt) {
-  return const_cast<std::optional<const Tensor>&>(
-      reinterpret_cast<const std::optional<const Tensor>&>(opt));
 }
 
 inline std::optional<int> narrow_optional_int(const std::optional<int64_t>& v) {
@@ -168,23 +160,23 @@ std::vector<Tensor> mha_fwd_stable(
     std::optional<Tensor> cp_tot_seqused_k) {
   return mha_fwd(
       q, k, v,
-      as_const_tensor_opt(k_new),
-      as_const_tensor_opt(v_new),
-      as_const_tensor_opt(q_v),
+      k_new,
+      v_new,
+      q_v,
       out,
-      as_const_tensor_opt(cu_seqlens_q),
-      as_const_tensor_opt(cu_seqlens_k),
-      as_const_tensor_opt(cu_seqlens_k_new),
-      as_const_tensor_opt(seqused_q),
-      as_const_tensor_opt(seqused_k),
+      cu_seqlens_q,
+      cu_seqlens_k,
+      cu_seqlens_k_new,
+      seqused_q,
+      seqused_k,
       narrow_optional_int(max_seqlen_q),
       narrow_optional_int(max_seqlen_k),
-      as_const_tensor_opt(page_table),
-      as_const_tensor_opt(kv_batch_idx),
-      as_const_tensor_opt(leftpad_k),
-      as_const_tensor_opt(rotary_cos),
-      as_const_tensor_opt(rotary_sin),
-      as_const_tensor_opt(seqlens_rotary),
+      page_table,
+      kv_batch_idx,
+      leftpad_k,
+      rotary_cos,
+      rotary_sin,
+      seqlens_rotary,
       q_descale,
       k_descale,
       v_descale,
@@ -198,10 +190,10 @@ std::vector<Tensor> mha_fwd_stable(
       narrow_int64_to_int(num_splits, "num_splits"),
       pack_gqa,
       narrow_int64_to_int(sm_margin, "sm_margin"),
-      as_const_tensor_opt(s_aux),
+      s_aux,
       narrow_int64_to_int(cp_world_size, "cp_world_size"),
       narrow_int64_to_int(cp_rank, "cp_rank"),
-      as_const_tensor_opt(cp_tot_seqused_k));
+      cp_tot_seqused_k);
 }
 
 Tensor mha_fwd_get_scheduler_metadata_stable(
@@ -238,11 +230,11 @@ Tensor mha_fwd_get_scheduler_metadata_stable(
       narrow_int64_to_int(headdim_v, "headdim_v"),
       qkv_dtype,
       seqused_k,
-      as_const_tensor_opt(cu_seqlens_q),
-      as_const_tensor_opt(cu_seqlens_k),
-      as_const_tensor_opt(cu_seqlens_k_new),
-      as_const_tensor_opt(seqused_q),
-      as_const_tensor_opt(leftpad_k),
+      cu_seqlens_q,
+      cu_seqlens_k,
+      cu_seqlens_k_new,
+      seqused_q,
+      leftpad_k,
       narrow_optional_int(page_size),
       narrow_int64_to_int(max_seqlen_k_new, "max_seqlen_k_new"),
       is_causal,

@@ -19,6 +19,8 @@
 #include <torch/headeronly/util/shim_utils.h>
 
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <deque>
 #include <mutex>
@@ -589,11 +591,11 @@ mha_fwd_get_scheduler_metadata(
         int headdim_v,
         ScalarType qkv_dtype,
         const Tensor &seqused_k, // b
-        std::optional<const Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const Tensor> &leftpad_k_, // b
+        const std::optional<Tensor> &cu_seqlens_q_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_new_,  // b+1
+        const std::optional<Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        const std::optional<Tensor> &leftpad_k_, // b
         std::optional<int> page_size,
         int max_seqlen_k_new,  // 0 means we're not appending new KV
         bool is_causal,
@@ -735,24 +737,24 @@ std::vector<Tensor>
 mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         const Tensor &k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
         const Tensor &v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
-        std::optional<const Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
-        std::optional<const Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
-        std::optional<const Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
+        const std::optional<Tensor> &k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
+        const std::optional<Tensor> &v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
+        const std::optional<Tensor> &q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
         std::optional<Tensor> &out_,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        std::optional<const Tensor> &cu_seqlens_q_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_,  // b+1
-        std::optional<const Tensor> &cu_seqlens_k_new_,  // b+1
-        std::optional<const Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-        std::optional<const Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+        const std::optional<Tensor> &cu_seqlens_q_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_,  // b+1
+        const std::optional<Tensor> &cu_seqlens_k_new_,  // b+1
+        const std::optional<Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+        const std::optional<Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
         std::optional<int> max_seqlen_q_,
         // TODO: check if we need max_seqlen_k
         std::optional<int> max_seqlen_k_,
-        std::optional<const Tensor> &page_table_, // (b_k, max_num_pages_per_seq)
-        std::optional<const Tensor> &kv_batch_idx_, // b. indices to index into the KV cache
-        std::optional<const Tensor> &leftpad_k_, // b
-        std::optional<const Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-        std::optional<const Tensor> &seqlens_rotary_, // b
+        const std::optional<Tensor> &page_table_, // (b_k, max_num_pages_per_seq)
+        const std::optional<Tensor> &kv_batch_idx_, // b. indices to index into the KV cache
+        const std::optional<Tensor> &leftpad_k_, // b
+        const std::optional<Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+        const std::optional<Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+        const std::optional<Tensor> &seqlens_rotary_, // b
         std::optional<Tensor> &q_descale_,  // (b, h_k), not (b, h)
         std::optional<Tensor> &k_descale_,  // (b, h_k)
         std::optional<Tensor> &v_descale_,  // (b, h_k)
@@ -766,10 +768,10 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const Tensor> &s_aux_, // (h)
+        const std::optional<Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        std::optional<const Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        const std::optional<Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
         ) {
 
     auto dprops = get_device_prop();
@@ -1378,10 +1380,10 @@ std::vector<Tensor> mha_bwd(
     std::optional<Tensor> &dq_,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     std::optional<Tensor> &dk_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
     std::optional<Tensor> &dv_,   // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
-    std::optional<const Tensor> &cu_seqlens_q_,   // b+1
-    std::optional<const Tensor> &cu_seqlens_k_,   // b+1
-    std::optional<const Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
-    std::optional<const Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+    const std::optional<Tensor> &cu_seqlens_q_,   // b+1
+    const std::optional<Tensor> &cu_seqlens_k_,   // b+1
+    const std::optional<Tensor> &seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
+    const std::optional<Tensor> &seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int> max_seqlen_q_,
     std::optional<int> max_seqlen_k_,
     float const softmax_scale,

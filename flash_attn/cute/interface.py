@@ -666,6 +666,7 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
+    descale_views = q_descale, k_descale, v_descale
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
     q_shape = q.shape if q is not None else qv.shape
     num_head, head_dim = q_shape[-2:]
@@ -831,6 +832,8 @@ def _flash_attn_fwd(
         pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    if is_fp8 and arch // 10 == 9:
+        q_descale, k_descale, v_descale = descale_views
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
@@ -890,7 +893,69 @@ def _flash_attn_fwd(
 
     dtype = torch2cute_dtype_map[q_dtype]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        if arch // 10 == 9:
+            assert q_dtype == torch.float8_e4m3fn, (
+                "SM90 FP8 supports E4M3FN only"
+            )
+            assert head_dim == head_dim_v == 128, (
+                "SM90 FP8 requires D == Dv == 128"
+            )
+            assert qv is None, "SM90 FP8 does not support Qv"
+            assert all(t is not None for t in (q_descale, k_descale, v_descale)), (
+                "SM90 FP8 requires Q, K, and V descales"
+            )
+            assert all(t.stride() == (0, 0) for t in (q_descale, k_descale, v_descale)), (
+                "SM90 FP8 requires static per-tensor descales expanded as stride-(0,0) views"
+            )
+            assert output_scale is None, "SM90 FP8 output quantization is unsupported"
+            assert q is not None and k is not None, "SM90 FP8 requires Q, K, and V"
+            assert num_head == 32 and num_head_kv == 8, (
+                "SM90 FP8 requires Hq == 32 and Hkv == 8"
+            )
+            assert pack_gqa, "SM90 FP8 requires PackGQA with ratio four"
+            assert page_table is None or page_size == 16, (
+                "SM90 FP8 supports dense or page-16 KV only"
+            )
+            assert dynamic_causal is None, (
+                "SM90 FP8 does not support dynamic causal masking"
+            )
+            assert causal, "SM90 FP8 requires causal attention"
+            assert window_size_left is None and window_size_right is None, (
+                "SM90 FP8 supports global attention only"
+            )
+            assert softcap is None, "SM90 FP8 does not support softcap"
+            assert learnable_sink is None, (
+                "SM90 FP8 does not support attention sinks"
+            )
+            assert block_sparse_tensors is None, (
+                "SM90 FP8 does not support block sparsity"
+            )
+            assert score_mod is None and mask_mod is None, (
+                "SM90 FP8 does not support score or mask modifications"
+            )
+            assert aux_tensors is None and aux_scalars is None, (
+                "SM90 FP8 does not support auxiliary feature inputs"
+            )
+            assert gather_kv_indices is None, (
+                "SM90 FP8 does not support gathered KV"
+            )
+            assert cp_world_size == 1 and cp_tot_seqused_k is None, (
+                "SM90 FP8 does not support context parallelism"
+            )
+            assert tile_mn is None or tile_mn in ((64, 128), (128, 128)), (
+                "SM90 FP8 supports 64x128 and 128x128 tiles only"
+            )
+            assert mma_pv_is_rs in (None, True), (
+                "SM90 FP8 requires register-sourced PV"
+            )
+            assert intra_wg_overlap in (None, False), (
+                "SM90 FP8 does not support intra-warpgroup overlap"
+            )
+        else:
+            assert arch // 10 == 10, (
+                "FP8 is supported on SM90 for E4M3 D128 static descales "
+                "and on SM100"
+            )
     use_block_sparsity = block_sparse_tensors is not None
 
     no_explicit_window = (
@@ -964,6 +1029,9 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+    if is_fp8 and arch // 10 == 9:
+        mma_pv_is_rs = True
+        intra_wg_overlap = False
     if arch // 10 == 9 and qv is not None:
         # Match FA3's Hopper MLA specialization. These tiles leave room for
         # the additional Qv tile and keep the mainloop non-overlapped.
@@ -1433,10 +1501,16 @@ def _flash_attn_fwd(
             else None
         )
 
-        q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
-            for t in (q_descale, k_descale, v_descale)
-        )
+        if arch // 10 == 9 and is_fp8:
+            q_descale_tensor, k_descale_tensor, v_descale_tensor = (
+                to_cute_tensor(t, assumed_align=4, fully_dynamic=True)
+                for t in (q_descale, k_descale, v_descale)
+            )
+        else:
+            q_descale_tensor, k_descale_tensor, v_descale_tensor = (
+                to_cute_tensor(t, assumed_align=4, leading_dim=1)
+                for t in (q_descale, k_descale, v_descale)
+            )
         descale_tensors_tensor = (
             DescaleTensors(
                 q_descale=q_descale_tensor,
@@ -1485,7 +1559,15 @@ def _flash_attn_fwd(
                 output_quant_key=output_quant_key,
             )
         elif arch // 10 == 9:
-            fa_fwd = FlashAttentionForwardSm90(
+            if is_fp8:
+                from flash_attn.cute.flash_fwd_sm90_fp8 import (
+                    FlashAttentionForwardSm90Fp8,
+                )
+
+                sm90_fwd_cls = FlashAttentionForwardSm90Fp8
+            else:
+                sm90_fwd_cls = FlashAttentionForwardSm90
+            fa_fwd = sm90_fwd_cls(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -1713,7 +1795,11 @@ def _flash_attn_fwd(
             # and MLA (FlashAttentionMLAForwardSm100) kernels so fused FP8 output works there
             # too, then drop this special-casing and the qv/hd256 fp8-output guards above.
             if not use_dedicated_hd256_kernel:
-                compile_args.append(output_scale_tensor)
+                compile_args.append(
+                    descale_tensors_tensor
+                    if arch // 10 == 9 and is_fp8
+                    else output_scale_tensor
+                )
             if arch // 10 == 9:
                 compile_args.append(dynamic_scheduler_counter_tensor)
                 compile_args.append(num_splits_dynamic_tensor)
@@ -1814,7 +1900,9 @@ def _flash_attn_fwd(
             ])
             # See the TODO above: hd256/MLA kernels don't take output_scale yet.
             if not use_dedicated_hd256_kernel:
-                call_args.append(output_scale)
+                call_args.append(
+                    descale_tensors if arch // 10 == 9 and is_fp8 else output_scale
+                )
             if arch // 10 == 9:
                 call_args.append(dynamic_scheduler_counter)
                 call_args.append(num_splits_dynamic_ptr)

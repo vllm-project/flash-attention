@@ -1893,7 +1893,7 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
     )
 
     # ---- kernel under test: fp16 Q + fp8 paged K/V, cast in-kernel ----
-    out, _ = _flash_attn_fwd(
+    out, *_ = _flash_attn_fwd(
         q=q,
         k=k_paged_fp8,
         v=v_paged_fp8,

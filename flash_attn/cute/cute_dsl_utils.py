@@ -129,11 +129,7 @@ def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
     return tuple(
         (
             getattr(t, "__assumed_align__", 0),
-            (
-                leading_dim
-                if leading_dim is not None
-                else getattr(t, "__leading_dim__", -1)
-            ),
+            (leading_dim if leading_dim is not None else getattr(t, "__leading_dim__", -1)),
             leading_dim is not None or hasattr(t, "__leading_dim__"),
         )
         for t, leading_dim in zip(

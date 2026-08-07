@@ -1,9 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
+import os
 from typing import Tuple
 from functools import lru_cache
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 try:
     from triton.tools.disasm import extract
@@ -14,7 +16,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
-from quack.compile_utils import make_fake_tensor as fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -42,6 +43,75 @@ def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
 
 
+@lru_cache
+def _get_device_arch_and_num_sms(device_index: int) -> tuple[int, int]:
+    properties = torch.cuda.get_device_properties(device_index)
+    return properties.major * 10 + properties.minor, properties.multi_processor_count
+
+
+def get_num_sms_for_selection(device_index: int, arch: int) -> int:
+    """Return the SM count of the matching local GPU or cross-compilation target."""
+    override = os.getenv("FLASH_ATTENTION_NUM_SMS")
+    if override is not None:
+        num_sms = int(override)
+        if num_sms <= 0:
+            raise ValueError("FLASH_ATTENTION_NUM_SMS must be positive")
+        return num_sms
+    if torch.cuda.is_available():
+        device_arch, num_sms = _get_device_arch_and_num_sms(device_index)
+        if device_arch == arch:
+            return num_sms
+    raise RuntimeError(
+        "Cannot determine the target GPU's SM count; set FLASH_ATTENTION_NUM_SMS "
+        "when cross-compiling without a matching local GPU"
+    )
+
+
+def _has_aligned_pointer(tensor: torch.Tensor, align_bytes: int) -> bool:
+    address = (
+        tensor.storage_offset() * tensor.element_size()
+        if isinstance(tensor, FakeTensor)
+        else tensor.data_ptr()
+    )
+    return address % align_bytes == 0
+
+
+def _is_aligned_layout(tensor: torch.Tensor, align_bytes: int) -> bool:
+    """Return whether a tensor satisfies the pointer and stride ABI kernels assume."""
+    if tensor.stride(-1) != 1 or not _has_aligned_pointer(tensor, align_bytes):
+        return False
+    stride_alignment = max(1, align_bytes // tensor.element_size())
+    return all(stride == 0 or stride % stride_alignment == 0 for stride in tensor.stride()[:-1])
+
+
+def maybe_contiguous(tensor: torch.Tensor | None, align_bytes: int = 16):
+    """Canonicalize inputs to the pointer and stride alignment kernels assume."""
+    if tensor is None:
+        return None
+    if tensor.is_contiguous():
+        return (
+            tensor
+            if _has_aligned_pointer(tensor, align_bytes)
+            else tensor.clone(memory_format=torch.contiguous_format)
+        )
+    if not _has_aligned_pointer(tensor, align_bytes):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor if _is_aligned_layout(tensor, align_bytes) else tensor.contiguous()
+
+
+def validate_output_layout(tensor: torch.Tensor, name: str, align_bytes: int) -> None:
+    """Validate a caller-provided output or SplitKV workspace."""
+    assert 0 not in tensor.stride(), f"{name} must not have broadcast dimensions"
+    if tensor.is_contiguous():
+        assert _has_aligned_pointer(tensor, align_bytes), (
+            f"{name} must have aligned strides and a contiguous last dimension"
+        )
+        return
+    assert _is_aligned_layout(tensor, align_bytes), (
+        f"{name} must have aligned strides and a contiguous last dimension"
+    )
+
+
 def assume_strides_aligned(t):
     """Assume all strides except the last are divisible by 128 bits.
 
@@ -64,24 +134,6 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
-    if hasattr(t, "_cute_tensor"):
-        # Compile-only fake tensor. cutlass-dsl 4.6.0 removed mark_layout_dynamic()
-        # on fake tensors, so express the dynamic layout at construction instead
-        # (equivalent to from_dlpack(...).mark_layout_dynamic(leading_dim=...)).
-        cute_dtype = t._cute_tensor.element_type
-        ndim = t.ndim
-        if fully_dynamic:
-            leading_dim = None
-        elif leading_dim == -1:
-            leading_dim = ndim - 1
-        divisibility = max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
-        return fake_tensor(
-            cute_dtype,
-            tuple(cute.sym_int() for _ in range(ndim)),
-            divisibility=divisibility,
-            leading_dim=leading_dim,
-        )
-
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
@@ -103,14 +155,13 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
+def to_cute_aux_tensor(t, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
     This allows the user to specify alignment and leading dimension for aux tensors used in
     custom score_mod callables.
     """
     assumed_align: int = getattr(t, "__assumed_align__", None)
-    if leading_dim is None:
-        leading_dim = getattr(t, "__leading_dim__", None)
+    leading_dim: int = getattr(t, "__leading_dim__", None)
     fully_dynamic: bool = leading_dim is None
 
     return to_cute_tensor(
@@ -122,25 +173,37 @@ def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
     )
 
 
-def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
-    if aux_tensor_leading_dims is not None:
-        assert len(aux_tensor_leading_dims) == len(aux_tensors)
+def _resolve_aux_leading_dim(tensor: torch.Tensor) -> int | None:
+    """Pick the mode CuTe keeps as a static stride-1 leading dimension."""
+    leading_dim = getattr(tensor, "__leading_dim__", None)
+    if leading_dim is not None:
+        if tensor.ndim == 0:
+            raise ValueError("Scalar aux tensors cannot declare __leading_dim__")
+        leading_dim %= tensor.ndim
+        if tensor.stride(leading_dim) != 1:
+            raise ValueError("Aux tensor __leading_dim__ must identify a stride-1 dimension")
+        return leading_dim
 
-    return tuple(
-        (
-            getattr(t, "__assumed_align__", 0),
-            (leading_dim if leading_dim is not None else getattr(t, "__leading_dim__", -1)),
-            leading_dim is not None or hasattr(t, "__leading_dim__"),
+    unit_stride_dims = [dim for dim, stride in enumerate(tensor.stride()) if stride == 1]
+    if len(unit_stride_dims) <= 1:
+        return unit_stride_dims[0] if unit_stride_dims else None
+    nontrivial_dims = [dim for dim in unit_stride_dims if tensor.shape[dim] > 1]
+    if len(nontrivial_dims) != 1:
+        raise ValueError("Aux tensor layout has no unique stride-1 leading dimension")
+    return nontrivial_dims[0]
+
+
+def get_aux_tensor_metadata(aux_tensors):
+    """Return the static aux-tensor ABI facts that must key the compile cache."""
+    metadata = []
+    for tensor in aux_tensors:
+        leading_dim = _resolve_aux_leading_dim(tensor)
+        static_strides = tuple(
+            0 if stride == 0 else 1 if dim == leading_dim else None
+            for dim, stride in enumerate(tensor.stride())
         )
-        for t, leading_dim in zip(
-            aux_tensors,
-            (
-                aux_tensor_leading_dims
-                if aux_tensor_leading_dims is not None
-                else [None] * len(aux_tensors)
-            ),
-        )
-    )
+        metadata.append((tensor.dtype, getattr(tensor, "__assumed_align__", None), static_strides))
+    return tuple(metadata)
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
@@ -150,7 +213,11 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     stride=0 as static, meaning kernels compiled with different broadcast
     patterns are not interchangeable.
     """
-    return tuple(s == 0 for s in tensor.stride())
+    strides = tensor.stride()
+    # Written this way for speed.
+    if 0 not in strides:
+        return (False,) * len(strides)
+    return tuple(stride == 0 for stride in strides)
 
 
 # credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)

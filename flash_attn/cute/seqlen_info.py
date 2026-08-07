@@ -78,6 +78,9 @@ class SeqlenInfoQK:
     has_cu_seqlens_k: cutlass.Constexpr[bool]
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
+    tot_seqlen_k: Optional[Int32] = None
+    cp_world_size: cutlass.Constexpr[int] = 1
+    cp_rank: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
@@ -88,10 +91,13 @@ class SeqlenInfoQK:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mCpTotSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        cp_world_size: cutlass.Constexpr[int] = 1,
+        cp_rank: cutlass.Constexpr[int] = 0,
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
@@ -121,6 +127,11 @@ class SeqlenInfoQK:
                 if const_expr(mCuSeqlensK is None)
                 else mCuSeqlensK[batch_idx + 1] - offset_k
             )
+        tot_seqlen_k = (
+            seqlen_k
+            if const_expr(mCpTotSeqUsedK is None)
+            else mCpTotSeqUsedK[batch_idx]
+        )
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
         block_idx_offset = (
@@ -142,6 +153,9 @@ class SeqlenInfoQK:
             has_cu_seqlens_k=mCuSeqlensK is not None,
             has_seqused_q=mSeqUsedQ is not None,
             has_seqused_k=mSeqUsedK is not None,
+            tot_seqlen_k=tot_seqlen_k,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
         )
 
     def offset_batch_Q(

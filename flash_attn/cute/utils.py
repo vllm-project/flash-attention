@@ -13,7 +13,9 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir.dialects import nvvm, llvm, nvgpu
+from cutlass._mlir_helpers.arith import recast_type
+from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -672,6 +674,16 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
         assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
         for i in cutlass.range_constexpr(cute.size(dst_i32)):
             dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
+
+
+def cvt_fp8_to_f16_packed(src_ssa: cute.TensorSSA, dtype) -> cute.TensorSSA:
+    """
+    fp8 e4m3 -> fp16 via the packed hardware cvt only (no f32 round-trip).
+    TODO(qixiangl): drop once TensorSSA.to() handles fp8->fp16 correctly. It emits a
+    degenerate extf that fails IR verification (nvidia-cutlass-dsl 4.4.2).
+    """
+    res_ty = recast_type(src_ssa.type, dtype.mlir_type)
+    return TensorSSA(nvgpu.cvt_fpext(res_ty, src_ssa), src_ssa.shape, dtype)
 
 
 @dsl_user_op

@@ -52,7 +52,7 @@ void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) 
                     // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                     // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
                     if (smem_size >= 48 * 1024) {
-                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                        STD_CUDA_CHECK(cudaFuncSetAttribute(
                             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                     }
                     // int ctas_per_sm;
@@ -60,7 +60,7 @@ void run_flash_sparse_fwd(Flash_fwd_params_sparse &params, cudaStream_t stream) 
                     //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                     // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                     kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                    STD_CUDA_KERNEL_LAUNCH_CHECK();
                 });
             });
         });

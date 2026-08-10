@@ -183,7 +183,7 @@ def _use_wide_paged_d64_sm90(
     total_mblocks,
 ):
     return (
-        arch == 90
+        arch // 10 == 9
         and tile_mn is None
         and paged_kv_non_tma
         and max_seqlen_q == 1
@@ -212,7 +212,7 @@ def _use_page16_paged_d64_loader_sm90(
     total_mblocks,
 ):
     return (
-        arch == 90
+        arch // 10 == 9
         and tile_mn is None
         and paged_kv_non_tma
         and page_size == 16
@@ -467,7 +467,7 @@ def _num_splits_sm90(
 
 
 def _combine_max_seqlen_q_sm90(arch, max_seqlen_q, is_packed_varlen):
-    return max_seqlen_q if arch == 90 and is_packed_varlen else None
+    return max_seqlen_q if arch // 10 == 9 and is_packed_varlen else None
 
 
 def _use_dynamic_varlen_scheduler_sm90(
@@ -485,8 +485,8 @@ def _use_dynamic_varlen_scheduler_sm90(
     mask_mod,
     aux_tensors,
 ):
-    """Select the measured Hopper regimes that benefit from dynamic work."""
-    if arch != 90 or mask_mod is not None or aux_tensors is not None:
+    """Return whether this Hopper workload benefits from dynamic scheduling."""
+    if arch // 10 != 9 or mask_mod is not None or aux_tensors is not None:
         return False
     if head_dim_v == 512:
         return False
@@ -530,7 +530,7 @@ def _use_dynamic_split_varlen_scheduler_sm90(
     num_splits=None,
 ):
     supported = (
-        arch == 90
+        arch // 10 == 9
         and batch_size > 1
         and cp_world_size == 1
         and is_split_kv
@@ -566,7 +566,7 @@ def _use_batch_one_dynamic_split_varlen_scheduler_sm90(
 ):
     """Select direct runtime-split mapping for Hopper batch-one decode."""
     return (
-        arch == 90
+        arch // 10 == 9
         and batch_size == 1
         and max_seqlen_q == 1
         and num_m_blocks == 1
@@ -816,10 +816,14 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     if cp_tot_seqused_k is not None:
-        assert arch == 90, "context-parallel sequence totals require exact SM90"
+        assert arch // 10 == 9, (
+            "context-parallel sequence totals require SM90 (Hopper)"
+        )
     is_context_parallel = cp_world_size > 1
     if is_context_parallel:
-        assert arch == 90, "context parallelism is only supported on exact SM90"
+        assert arch // 10 == 9, (
+            "context parallelism is only supported on SM90 (Hopper)"
+        )
         assert qv is not None, "context parallelism is only supported for Hopper MLA"
         assert dynamic_causal is None, (
             "dynamic_causal is not supported with context parallelism"
@@ -877,7 +881,7 @@ def _flash_attn_fwd(
         output_quant_key = None
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
 
-    if qv is None or arch == 90:
+    if qv is None or arch // 10 == 9:
         lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     else:
         # num_head contiguous better for MQA in MLA absorbed
@@ -942,7 +946,7 @@ def _flash_attn_fwd(
         window_size_left is None and window_size_right is None
     )
     if (
-        arch == 90
+        arch // 10 == 9
         and causal
         and max_seqlen_q == 1
         and no_explicit_window
@@ -954,7 +958,7 @@ def _flash_attn_fwd(
         causal,
         window_size_left,
         window_size_right,
-        mask_mod if arch // 10 not in (10, 11) else None,
+        mask_mod if arch // 10 == 9 else None,
     )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
@@ -989,7 +993,7 @@ def _flash_attn_fwd(
                 sparse_block_size_q=sparse_q,
             )
             paged_kv_non_tma = page_size not in [None, fwd_cfg.n_block_size]
-            if paged_kv_non_tma and arch == 90:
+            if paged_kv_non_tma:
                 # Keep the provisional loader mode after tile reselection.
                 fwd_cfg = _tile_size_fwd_sm90(
                     head_dim,
@@ -1013,12 +1017,12 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
-    if arch == 90 and qv is not None:
-        # Match FA3's Hopper MLA specialization. These tiles leave room for
-        # the additional Qv tile and keep the mainloop non-overlapped.
-        # Multi-token DCP causal masking still uses unpacked query rows. A q1
-        # decode has already been canonicalized to non-causal above, so it can
-        # safely retain PackGQA and avoid one CTA per query head.
+    if arch // 10 == 9 and qv is not None:
+        # Use FA3's Hopper MLA tile shapes, which reserve shared memory for the
+        # additional Qv tile and therefore disable mainloop overlap. Keep query
+        # heads unpacked for multi-token context-parallel attention. A
+        # single-token decode was canonicalized to non-causal above, so it can
+        # retain PackGQA and avoid launching one CTA per query head.
         if is_context_parallel and (max_seqlen_q != 1 or causal):
             pack_gqa = False
         if head_dim_v == 512:
@@ -1053,7 +1057,7 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if (
-        arch == 90
+        arch // 10 == 9
         and tile_mn is None
         and head_dim == head_dim_v
         and head_dim in (64, 128)
@@ -1125,7 +1129,7 @@ def _flash_attn_fwd(
                 head_dim,
                 head_dim_v,
             )
-            if arch == 90
+            if arch // 10 == 9
             else num_splits_heuristic(
                 total_mblocks, num_SMs, num_n_blocks, 128
             )
@@ -1144,7 +1148,9 @@ def _flash_attn_fwd(
     is_split_kv = num_splits > 1
     use_dynamic_splits = num_splits_dynamic_ptr is not None
     if use_dynamic_splits:
-        assert arch == 90, "dynamic split counts are only supported on exact SM90"
+        assert arch // 10 == 9, (
+            "dynamic split counts are only supported on SM90 (Hopper)"
+        )
         assert is_split_kv, "dynamic split counts require num_splits > 1"
         assert num_splits <= 256, "dynamic split counts require num_splits <= 256"
         assert cu_seqlens_q is not None or seqused_q is not None, (
@@ -1163,14 +1169,14 @@ def _flash_attn_fwd(
         )
     )
     persistent_varlen_capable = (
-        arch == 90
+        arch // 10 == 9
         and not fp8_kv_dequant
         and (cu_seqlens_q is not None or seqused_q is not None)
         and batch_size == 1
         and not is_split_kv
     )
     dynamic_varlen_capable = (
-        arch == 90
+        arch // 10 == 9
         and not fp8_kv_dequant
         and (cu_seqlens_q is not None or seqused_q is not None)
     )
@@ -1345,7 +1351,7 @@ def _flash_attn_fwd(
         assert mask_mod is None
         qv = maybe_contiguous(qv)
 
-        if arch == 90:
+        if arch // 10 == 9:
             assert q is not None and k is not None, "Hopper MLA requires both q and k"
             assert head_dim == 64 and head_dim_v in [256, 512], (
                 "Hopper MLA requires head_dim=64 and head_dim_v in [256, 512]"
@@ -1605,7 +1611,6 @@ def _flash_attn_fwd(
                 has_qv=qv is not None,
                 cp_world_size=cp_world_size,
                 cp_rank=cp_rank,
-                enable_sm90_extensions=arch == 90,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
@@ -1935,7 +1940,7 @@ def _flash_attn_fwd(
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             semaphore_to_reset=dynamic_scheduler_counter,
             skip_single_split=use_direct_single_split,
-            compact_varlen_grid=arch == 90,
+            compact_varlen_grid=arch // 10 == 9,
             max_seqlen_q=_combine_max_seqlen_q_sm90(
                 arch, max_seqlen_q, cu_seqlens_q is not None
             ),
@@ -3883,8 +3888,8 @@ def _flash_attn_fwd_combine(
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
         skip_single_split: Skip dynamic rows whose main kernel wrote final output
-        compact_varlen_grid: Pack variable-length rows into a one-dimensional
-            launch grid. The SM90 caller enables this.
+        compact_varlen_grid: Whether to launch variable-length rows on a compact
+            one-dimensional grid.
         max_seqlen_q: Maximum query sequence length for packed variable-length
             input. It must be at least the true maximum; a smaller value leaves
             output rows unwritten. Defaults to total_q, preserving the previous

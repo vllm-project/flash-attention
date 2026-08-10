@@ -81,7 +81,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         has_qv: bool = False,
         cp_world_size: int = 1,
         cp_rank: int = 0,
-        enable_sm90_extensions: bool = False,
         kv_dtype=None,
         fp8_kv_dequant: bool = False,
         **kwargs,
@@ -96,21 +95,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert cp_world_size == 1 or self.has_qv
         self.cp_world_size = cp_world_size
         self.cp_rank = cp_rank
-        self.enable_sm90_extensions = enable_sm90_extensions
-        assert self.enable_sm90_extensions or not (
-            has_qv
-            or cp_world_size != 1
-            or use_persistent_varlen
-            or use_dynamic_varlen
-            or use_dynamic_splits
-            or paged_kv_aligned_page_size != 0
-        )
-        # The correctness-oriented MLA path computes QK and QvV serially into
-        # the same score accumulator. The overlapped mainloop has different V
-        # pipeline ownership and is intentionally left for a later pass.
+        # TODO: Support MLA intra-WG overlap. QK and QvV share acc_S, and V
+        # pipeline ownership must span both QvV and PV.
         self.intra_wg_overlap = intra_wg_overlap and not self.has_qv
         self.use_paged_kv_overlap = _use_paged_kv_overlap_sm90(
-            self.enable_sm90_extensions and self.intra_wg_overlap,
+            self.intra_wg_overlap,
             paged_kv_non_tma,
             self.tile_n,
         )
@@ -165,14 +154,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         n_block: Int32,
         blocks_per_page: Int32,
     ) -> Int32:
-        if const_expr(self.enable_sm90_extensions):
-            n_block = cutlass.max(n_block, 0)
-            return (
-                mPageTable[batch_idx, n_block // blocks_per_page]
-                * blocks_per_page
-                + n_block % blocks_per_page
-            )
-        return mPageTable[batch_idx, n_block]
+        n_block = cutlass.max(n_block, 0)
+        return (
+            mPageTable[batch_idx, n_block // blocks_per_page] * blocks_per_page
+            + n_block % blocks_per_page
+        )
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -1431,32 +1417,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         # Paged TMA: keep page dimension indexable
                         mK_cur = mK[None, None, head_idx_kv, None]
                         mV_cur = mV[None, None, head_idx_kv, None]
-                        if const_expr(self.enable_sm90_extensions):
-                            gK = cute.local_tile(
-                                mK_cur,
-                                (self.tile_n, self.tile_hdim),
-                                (None, 0, None),
-                            )
-                            gV = cute.local_tile(
-                                mV_cur,
-                                (self.tile_n, self.tile_hdimv),
-                                (None, 0, None),
-                            )
-                            # Flatten (tile-within-page, physical-page) into the
-                            # single residual coordinate expected by the TMA copy.
-                            gK = cute.group_modes(gK, 2, 4)
-                            gV = cute.group_modes(gV, 2, 4)
-                        else:
-                            gK = cute.local_tile(
-                                mK_cur,
-                                (self.tile_n, self.tile_hdim),
-                                (0, 0, None),
-                            )
-                            gV = cute.local_tile(
-                                mV_cur,
-                                (self.tile_n, self.tile_hdimv),
-                                (0, 0, None),
-                            )
+                        gK = cute.local_tile(
+                            mK_cur,
+                            (self.tile_n, self.tile_hdim),
+                            (None, 0, None),
+                        )
+                        gV = cute.local_tile(
+                            mV_cur,
+                            (self.tile_n, self.tile_hdimv),
+                            (None, 0, None),
+                        )
+                        # Flatten (tile-within-page, physical-page) into the
+                        # single residual coordinate expected by the TMA copy.
+                        gK = cute.group_modes(gK, 2, 4)
+                        gV = cute.group_modes(gV, 2, 4)
                     else:
                         # Non-paged TMA
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
@@ -1561,11 +1535,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
                     paged_tma_blocks_per_page = (
                         mK.shape[0] // self.tile_n
-                        if const_expr(
-                            self.enable_sm90_extensions
-                            and mPageTable is not None
-                            and self.use_tma_KV
-                        )
+                        if const_expr(mPageTable is not None and self.use_tma_KV)
                         else 1
                     )
                     page_idx = (
@@ -1638,21 +1608,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 if const_expr(not self.use_tma_KV):
                                     paged_kv_manager.load_page_table(
                                         n_block,
-                                        mask_seqlen=not self.enable_sm90_extensions,
+                                        mask_seqlen=False,
                                     )
                                 pipeline_k.producer_acquire(kv_producer_state)
                                 load_K(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
-                                    mask_seqlen=not self.enable_sm90_extensions,
+                                    mask_seqlen=False,
                                 )
                                 pipeline_v.producer_acquire(kv_producer_state)
                                 load_V(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
-                                    mask_seqlen=not self.enable_sm90_extensions,
+                                    mask_seqlen=False,
                                 )
                                 kv_producer_state.advance()
                         else:
@@ -1684,14 +1654,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 if const_expr(not self.use_tma_KV):
                                     paged_kv_manager.load_page_table(
                                         n_block,
-                                        mask_seqlen=not self.enable_sm90_extensions,
+                                        mask_seqlen=False,
                                     )
                                 pipeline_k.producer_acquire(kv_producer_state)
                                 load_K(
                                     block=n_block,
                                     producer_state=kv_producer_state,
                                     page_idx=page_idx,
-                                    mask_seqlen=not self.enable_sm90_extensions,
+                                    mask_seqlen=False,
                                 )
                                 pipeline_v.producer_acquire(kv_producer_state_prev)
                                 if const_expr(self.use_tma_KV):
@@ -1792,12 +1762,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     work_info_phase ^= 1
                 else:
                     tile_scheduler.prefetch_next_work()
-                    next_work_tile = tile_scheduler.advance_to_next_work()
-                    work_tile = (
-                        next_work_tile
-                        if const_expr(self.enable_sm90_extensions)
-                        else tile_scheduler.get_current_work()
-                    )
+                    work_tile = tile_scheduler.advance_to_next_work()
                 # End of persistent scheduler loop
 
             # Producer tail is only useful for cluster to avoid early exit of blocks.
@@ -2356,9 +2321,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
                 interior_mask_fn = (
                     partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
-                    if const_expr(
-                        not self.enable_sm90_extensions or self.mask_mod is not None
-                    )
+                    if const_expr(self.mask_mod is not None)
                     else None
                 )
                 # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
@@ -2370,9 +2333,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=interior_mask_fn,
                         check_inf=(
-                            not self.enable_sm90_extensions
-                            or self.mask_mod is not None
-                            or self.score_mod is not None
+                            self.mask_mod is not None or self.score_mod is not None
                         ),
                     )
                     O_should_accumulate = True
@@ -2388,9 +2349,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
-                if const_expr(not self.enable_sm90_extensions):
-                    # Preserve the legacy Q/KV overlap outside exact SM90.
-                    pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = process_last_half_block_tile(
@@ -2427,16 +2385,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
                 )
-                if const_expr(not self.enable_sm90_extensions):
-                    # Preserve the legacy Q/KV overlap outside exact SM90.
-                    pipeline_q.consumer_release_w_index(0)
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax_tile.reset()
                     acc_O.fill(0.0)
-
-            if const_expr(not self.enable_sm90_extensions):
-                q_consumer_phase ^= 1
 
             sink_val = None
             if const_expr(learnable_sink is not None):
@@ -2504,22 +2456,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 num_splits_cur,
             )
 
-            if const_expr(self.enable_sm90_extensions):
-                # sO aliases the query tile (Qv for MLA, Q otherwise). The
-                # exact-SM90 extension releases it only after the epilogue.
-                pipeline_q.consumer_release_w_index(0)
-                q_consumer_phase ^= 1
+            # sO aliases the query tile (Qv for MLA, Q otherwise), so release
+            # the Q pipeline only after the epilogue is finished with it.
+            pipeline_q.consumer_release_w_index(0)
+            q_consumer_phase ^= 1
 
             if const_expr(self.use_dynamic_varlen):
                 work_tile = self.wait_dynamic_work(sWorkInfo, work_info_phase)
                 work_info_phase ^= 1
             else:
-                next_work_tile = tile_scheduler.advance_to_next_work()
-                work_tile = (
-                    next_work_tile
-                    if const_expr(self.enable_sm90_extensions)
-                    else tile_scheduler.get_current_work()
-                )
+                work_tile = tile_scheduler.advance_to_next_work()
 
     @cute.jit
     def epilogue_split_or_final(

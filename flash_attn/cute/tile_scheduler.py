@@ -1365,7 +1365,7 @@ class StaticPersistentVarlenTileScheduler(SingleTileVarlenScheduler):
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         max_grid_x = SingleTileVarlenScheduler.get_grid_shape(params)[0]
-        # A second wave balances causal tiles while retaining several tiles per CTA.
+        # Use up to two CTA waves to balance causal work while preserving persistence.
         return (cutlass.min(sm_count * 2, max_grid_x), Int32(1), Int32(1))
 
     def advance_to_next_work(self, *, loc=None, ip=None):

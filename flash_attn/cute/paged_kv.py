@@ -64,9 +64,9 @@ class PagedKVManager(ParamsBase):
         cache_v_ptr: cutlass.Constexpr[bool] = False,
         aligned_page_size: cutlass.Constexpr[int] = 0,
     ):
-        # SM100 transposes V in gmem to (dv, page_size, num_pages);
-        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
-        v_gmem_transposed = arch != 90
+        # Hopper stores V like K: (page_size, d, num_pages). SM100/110 use
+        # (d, page_size, num_pages) for V.
+        v_gmem_transposed = arch // 10 != 9
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -98,7 +98,7 @@ class PagedKVManager(ParamsBase):
                 else n_block_size // num_threads
             ),
         )
-        assert not cache_v_ptr or arch == 90
+        assert not cache_v_ptr or arch // 10 == 9
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
@@ -121,7 +121,7 @@ class PagedKVManager(ParamsBase):
         else:
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
-            # When V is transposed in gmem, dv is shape[0]; otherwise dv is shape[1] (same as K)
+            # The V head dimension is mode 0 when transposed and mode 1 otherwise.
             V_limit = cute.size(mV_paged.shape[0 if v_gmem_transposed else 1])
             tVpV = utils.predicate_k(tVcV, limit=V_limit)
 
@@ -218,8 +218,8 @@ class PagedKVManager(ParamsBase):
     def compute_X_ptr(self, K_or_V: str, d_offset: int = 0):
         tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
         mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
-        # K is always (page_size, d, num_pages). V matches K when not transposed,
-        # but is (dv, page_size, num_pages) when transposed (SM100).
+        # K is always (page_size, d, num_pages). V either matches K or uses
+        # (d, page_size, num_pages), as selected when the manager is created.
         transposed = const_expr(K_or_V == "V" and self.v_gmem_transposed)
         for i in cutlass.range(
             self.page_entry_per_thread,
@@ -239,7 +239,7 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def update_V_ptr(self):
-        assert self.arch == 90
+        assert self.arch // 10 == 9
         assert self.tPrVPtr is not None
         for i in cutlass.range(
             self.page_entry_per_thread,
@@ -310,11 +310,11 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        if const_expr(self.arch == 90):
-            # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
+        if const_expr(self.arch // 10 == 9):
+            # Hopper: sX is already stage-sliced by caller (sK[None, None, stage]).
             # Flatten hierarchical modes to get (n_block_size, head_dim).
             sX_pi = cute.group_modes(sX, 0, 1)
-            # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
+            # V is transposed via utils.transpose_view before MMA.
         else:
             sX_pi = self._flatten_smem_sm100(sX, K_or_V)
 
@@ -356,7 +356,7 @@ class PagedKVManager(ParamsBase):
         sV: cute.Tensor,
         update_cache: cutlass.Constexpr[bool] = True,
     ):
-        assert self.arch == 90
+        assert self.arch // 10 == 9
         assert self.tPrVPtr is not None
         # Keep this separate from load_KV: passing the cached rmem pointer tensor
         # through a nested JIT helper violates CuTeDSL region dominance.

@@ -626,6 +626,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         assert self.output_quant_key is None, (
             f"Fused quant output not implemented for {type(self).__name__}"
         )
+        self.is_split_kv = False
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
@@ -793,6 +794,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             aux_data,
             fastdiv_mods,
             output_scale,
+            mDynamicCausal,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -833,6 +835,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         output_scale: Optional[cute.Tensor] = None,
+        mDynamicCausal: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()

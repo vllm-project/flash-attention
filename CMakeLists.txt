@@ -173,6 +173,10 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
+        # Stable-ABI build: USE_CUDA allows access to CUDA shims
+        USE_CUDA
+        # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage
+        TORCH_TARGET_VERSION=0x020A000000000000ULL
     )
 
     # Pin the C++ standard on the target itself. When flash-attn is built as a
@@ -312,6 +316,8 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_DISABLE_APPENDKV
         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
         CUTLASS_ENABLE_GDC_FOR_SM90
+        TORCH_TARGET_VERSION=0x020A000000000000ULL
+        USE_CUDA
     )
 
     # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.

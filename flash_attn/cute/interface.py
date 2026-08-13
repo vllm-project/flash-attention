@@ -1198,6 +1198,13 @@ def _flash_attn_fwd(
         num_m_blocks=num_m_blocks,
         num_splits=num_splits,
     )
+    # Unsupported runtime schedules fall back to the fixed maximum split count.
+    # This keeps runtime split metadata out of the single-tile scheduler.
+    if use_dynamic_splits and not (
+        use_batch_one_dynamic_splits or use_dynamic_split_varlen
+    ):
+        num_splits_dynamic_ptr = None
+        use_dynamic_splits = False
     use_dynamic_varlen = (
         dynamic_varlen_capable
         and (

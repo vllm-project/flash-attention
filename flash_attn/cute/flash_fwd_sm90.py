@@ -38,7 +38,7 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    HopperTileSchedulerArguments,
+    TileSchedulerArguments,
     WorkTileInfo,
     SingleTileScheduler,
     SingleTileLPTScheduler,
@@ -225,26 +225,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         zero_init: cutlass.Constexpr[bool] = False,
         wg_wait: cutlass.Constexpr[int] = -1,
     ) -> None:
-        """Issue WGMMA with a literal stage slice in each runtime branch."""
+        """Issue WGMMA using the current two-stage pipeline slot."""
         assert self.num_stages == 2
-        if B_idx == 0:
-            sm90_utils.gemm(
-                tiled_mma,
-                acc,
-                tCrA,
-                tCrB[None, None, None, 0],
-                zero_init=zero_init,
-                wg_wait=wg_wait,
-            )
-        else:
-            sm90_utils.gemm(
-                tiled_mma,
-                acc,
-                tCrA,
-                tCrB[None, None, None, 1],
-                zero_init=zero_init,
-                wg_wait=wg_wait,
-            )
+        sm90_utils.gemm(
+            tiled_mma,
+            acc,
+            tCrA,
+            tCrB[None, None, None, B_idx],
+            zero_init=zero_init,
+            wg_wait=wg_wait,
+        )
 
     def _get_shared_storage_cls(self):
         sQ_struct = cute.struct.Align[
@@ -276,8 +266,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        num_work_info_buffers = 2
+        # m_block, head_idx, batch_idx, split_idx, is_valid_tile
+        num_work_info_fields = 5
         work_info_struct = cute.struct.MemRange[
-            cutlass.Int32, 2 * 5 if const_expr(self.use_dynamic_varlen) else 0
+            cutlass.Int32,
+            num_work_info_buffers * num_work_info_fields
+            if const_expr(self.use_dynamic_varlen)
+            else 0,
         ]
 
         if const_expr(self.fp8_kv_dequant):
@@ -500,11 +496,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # explicitly. Neither follows the alternating QK/PV scheduler.
             self.use_scheduler_barrier = False
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
-            self.pack_gqa
-            and (
-                self.tile_m % self.qhead_per_kvhead != 0
-                or (self.has_qv and self.qhead_per_kvhead == 16)
-            )
+            self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
@@ -668,7 +660,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not self.is_causal or self.is_local)
                 else SingleTileLPTScheduler
             )
-        tile_sched_args = HopperTileSchedulerArguments(
+        tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
@@ -692,9 +684,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
-            use_dynamic_gqa_l2_budget=self.use_dynamic_varlen
-            and self.pack_gqa
-            and self.tile_hdim == 128,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = (
@@ -1414,21 +1403,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.use_tma_KV):
                     # === TMA path (non-paged and paged with page_size divisible by tile_n) ===
                     if const_expr(mPageTable is not None):
-                        # Paged TMA: keep page dimension indexable
+                        # Keep Rest[0] (tile within page) and Rest[2] (physical page).
                         mK_cur = mK[None, None, head_idx_kv, None]
                         mV_cur = mV[None, None, head_idx_kv, None]
-                        gK = cute.local_tile(
-                            mK_cur,
-                            (self.tile_n, self.tile_hdim),
-                            (None, 0, None),
-                        )
-                        gV = cute.local_tile(
-                            mV_cur,
-                            (self.tile_n, self.tile_hdimv),
-                            (None, 0, None),
-                        )
-                        # Flatten (tile-within-page, physical-page) into the
-                        # single residual coordinate expected by the TMA copy.
+                        gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0, None))
+                        gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0, None))
+                        # Flatten both retained Rest modes into the single residual
+                        # coordinate expected by the TMA copy.
                         gK = cute.group_modes(gK, 2, 4)
                         gV = cute.group_modes(gV, 2, 4)
                     else:

@@ -1059,69 +1059,31 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
-            if const_expr(self.use_asym_dv512):
-                if tidx < self.num_score_threads:
-                    self.mma(
-                        tiled_mma_qk,
-                        tiled_mma_pv,
-                        tiled_mma_qv,
-                        mO,
-                        mLSE,
-                        sQ,
-                        sQv,
-                        sK,
-                        sV,
-                        sVt,
-                        sP,
-                        sScale,
-                        sO,
-                        sQ_mma,
-                        learnable_sink,
-                        pipeline_k,
-                        pipeline_v,
-                        pipeline_q,
-                        gmem_tiled_copy_O,
-                        tma_atom_O,
-                        tidx,
-                        softmax_scale_log2,
-                        softmax_scale,
-                        block_info,
-                        SeqlenInfoCls,
-                        AttentionMaskCls,
-                        TileSchedulerCls,
-                        sWorkInfo,
-                        blocksparse_tensors,
-                        aux_data,
-                        fastdiv_mods,
-                        num_splits,
-                        mOFinal,
-                        mLSEFinal,
-                        sStage,
-                        pipeline_stage,
-                        descale_tensors,
-                    )
-                else:
-                    self.mma_pv_only(
-                        tiled_mma_pv,
-                        mO,
-                        sVt,
-                        sP,
-                        sScale,
-                        sO,
-                        pipeline_v,
-                        pipeline_q,
-                        gmem_tiled_copy_O,
-                        tma_atom_O,
-                        tidx,
-                        softmax_scale_log2,
-                        softmax_scale,
-                        block_info,
-                        SeqlenInfoCls,
-                        TileSchedulerCls,
-                        sWorkInfo,
-                        num_splits,
-                        mOFinal,
-                    )
+            # Match FA3's LargeHeadDimV dispatch in hopper/flash_fwd_kernel_sm90.h:
+            # d64/dV512 has one score WG and two PV WGs. Only the second WG takes
+            # the PV-only path, consuming shared P/scales for its 256-wide output slice.
+            if const_expr(self.use_asym_dv512) and tidx >= self.num_score_threads:
+                self.mma_pv_only(
+                    tiled_mma_pv,
+                    mO,
+                    sVt,
+                    sP,
+                    sScale,
+                    sO,
+                    pipeline_v,
+                    pipeline_q,
+                    gmem_tiled_copy_O,
+                    tma_atom_O,
+                    tidx,
+                    softmax_scale_log2,
+                    softmax_scale,
+                    block_info,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                    sWorkInfo,
+                    num_splits,
+                    mOFinal,
+                )
             else:
                 self.mma(
                     tiled_mma_qk,

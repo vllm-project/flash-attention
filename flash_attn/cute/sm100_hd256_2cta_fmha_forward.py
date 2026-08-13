@@ -1379,6 +1379,31 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        seqlen_q_static=mQ_qdl.shape[0],
+                        seqlen_k_static=(
+                            mK_kdl.shape[0]
+                            if cutlass.const_expr(mPageTable is None)
+                            else max_seqlen_k
+                        ),
+                        mCuSeqlensQ=cum_seqlen_q,
+                        mCuSeqlensK=cum_seqlen_k,
+                        tile_m=self.qk_mma_tiler[0],
+                        tile_n=self.qk_mma_tiler[1],
+                    )
+                    tile_fastdiv_mods = fastdiv_mods
+                    if cutlass.const_expr(tile_fastdiv_mods is not None):
+                        seqlen_q_divmod, seqlen_k_divmod = tile_fastdiv_mods
+                        tile_fastdiv_mods = (
+                            FastDivmodDivisor(seqlen_info.seqlen_q)
+                            if cutlass.const_expr(seqlen_info.has_cu_seqlens_q)
+                            else seqlen_q_divmod,
+                            FastDivmodDivisor(seqlen_info.seqlen_k)
+                            if cutlass.const_expr(seqlen_info.has_cu_seqlens_k)
+                            else seqlen_k_divmod,
+                        )
+
                     row_max = -Float32.inf
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
@@ -1441,7 +1466,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         ) = self.softmax_step(
                             (
                                 need_apply_mask,
-                                mask_seqlen,
                                 window_size_left,
                                 window_size_right,
                                 mma_block_coord[0],
@@ -1619,7 +1643,6 @@ class BlackwellFusedMultiHeadAttentionForward:
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         (
             need_apply_mask,
-            mask_seqlen,
             window_size_left,
             window_size_right,
             m_block,
@@ -1659,7 +1682,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 n_block,
                 qk_thr_mma,
                 thr_load,
-                mask_seqlen,
+                True,
                 False,
                 mask_mod=self.mask_mod,
                 batch_idx=batch_idx,

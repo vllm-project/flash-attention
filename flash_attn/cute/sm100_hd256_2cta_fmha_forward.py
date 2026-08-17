@@ -769,7 +769,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             is_two_cta=True,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
-        tmem.allocate(self.tmem_alloc_cols)
 
         # Cluster arrive after barrier init
         pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
@@ -828,6 +827,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Cluster wait
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        tmem.allocate(self.tmem_alloc_cols)
         tmem.wait_for_alloc()
 
         # ///////////////////////////////////////////////////////////////////////////////

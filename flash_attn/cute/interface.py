@@ -251,6 +251,29 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     if not is_fake_mode():
         assert t.is_cuda, f"{name} must be on CUDA"
 
+def _is_aligned_16b_output(t):
+    if isinstance(t, _CompileOnlyTensorSpec):
+        strides = t.stride()
+        elements_per_16b = 16 // t.element_size()
+        return (
+            isinstance(t._assumed_align, int)
+            and t._assumed_align % 16 == 0
+            and isinstance(strides[-1], int)
+            and strides[-1] == 1
+            and all(
+                isinstance(stride, int) and stride % elements_per_16b == 0
+                for stride in strides[:-1]
+            )
+        )
+    if is_fake_mode():
+        return False
+    elements_per_16b = 16 // t.element_size()
+    return (
+        t.data_ptr() % 16 == 0
+        and t.stride(-1) == 1
+        and all(stride % elements_per_16b == 0 for stride in t.stride()[:-1])
+    )
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -276,6 +299,7 @@ class _CompileOnlyTensorSpec:
         self.device = torch.device("cuda")
         self.requires_grad = False
         self.is_cuda = True
+        self._assumed_align = assumed_align
         self._stride = (
             tuple(
                 cute.sym_int64(divisibility=1) if item is None else item
@@ -757,6 +781,26 @@ def _flash_attn_fwd(
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel:
+        o_aligned_16b = _is_aligned_16b_output(out)
+        hd256_varlen_b1 = cu_seqlens_q is not None and batch_size == 1
+        hd256_l2_swizzle = (
+            causal
+            and not local
+            and seqused_q is None
+            and page_table is None
+            and batch_size == 1
+            and qhead_per_kvhead == 1
+            and max_seqlen_q <= 8192
+            and max_seqlen_k <= 8192
+        )
+        hd256_mask_residual = not (
+            cu_seqlens_q is None
+            and seqused_q is None
+            and page_table is None
+            and max_seqlen_q == max_seqlen_k
+            and max_seqlen_q % 256 == 0
+        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -929,6 +973,13 @@ def _flash_attn_fwd(
         q.dtype,
         out_torch_dtype,
     )
+    if use_dedicated_hd256_kernel:
+        compile_key += (
+            o_aligned_16b,
+            hd256_varlen_b1,
+            hd256_l2_swizzle,
+            hd256_mask_residual,
+        )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -953,9 +1004,17 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
-        ]
+        if use_dedicated_hd256_kernel:
+            q_tensor, k_tensor, v_tensor = [
+                to_cute_tensor(t) for t in (q, k, v)
+            ]
+            o_source = out if not is_split_kv else out_partial
+            o_assumed_align = 16 if o_aligned_16b else o_source.element_size()
+            o_tensor = to_cute_tensor(o_source, assumed_align=o_assumed_align)
+        else:
+            q_tensor, k_tensor, v_tensor, o_tensor = [
+                to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            ]
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         else:
@@ -1105,20 +1164,15 @@ def _flash_attn_fwd(
                         pack_gqa=pack_gqa,
                         m_block_size=tile_m,
                         n_block_size=tile_n,
-                        q_stage=q_stage,
-                        is_persistent=not causal
-                            and not local
-                            and cu_seqlens_q is None
-                            and seqused_q is None
-                            and not is_split_kv,
                         score_mod=score_mod,
                         mask_mod=mask_mod,
                         has_aux_tensors=aux_tensors is not None,
                         paged_kv_non_tma=page_size not in [None, tile_n],
-                        is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                        is_varlen_b1=hd256_varlen_b1,
                         q_subtile_factor=q_subtile_factor,
-                        use_2cta_instrs=use_2cta_instrs,
-                        use_clc_scheduler=use_clc_scheduler,
+                        o_aligned_16b=o_aligned_16b,
+                        l2_swizzle=hd256_l2_swizzle,
+                        mask_residual=hd256_mask_residual,
                     )
                 else:
                     fa_fwd = FlashAttentionForwardSm100(

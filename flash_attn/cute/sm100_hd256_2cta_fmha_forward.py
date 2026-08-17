@@ -131,11 +131,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=1,
-            num_threads=(
-                len(self.softmax_warp_ids) + len(self.correction_warp_ids) + 1
-            )
-            * self.threads_per_warp,
+            barrier_id=1, num_threads=self.threads_per_cta
         )
 
         self.tmem_s_offset = 0
@@ -832,6 +828,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Cluster wait
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        tmem.wait_for_alloc()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -1066,7 +1063,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, tOtO_staged = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
@@ -1318,7 +1314,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_corr_producer.tail()
 
         if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax_warp_ids[0]:
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, _ = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
             # increase register after decreasing
@@ -1442,7 +1437,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
-            tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, tOtO_staged = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)

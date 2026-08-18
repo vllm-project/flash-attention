@@ -25,6 +25,7 @@ from flash_attn.cute.interface import (
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 
 
@@ -287,6 +288,197 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
     assert dq_in.abs().max().item() > 0, "dq is all zeros"
     assert dk_in.abs().max().item() > 0, "dk is all zeros"
     assert dv_in.abs().max().item() > 0, "dv is all zeros"
+
+# ---------------------------------------------------------------------------
+# Forward-only SM100 2CTA seqused coverage (d=dv=256)
+# ---------------------------------------------------------------------------
+
+def _assert_fwd_matches_ref(actual, reference, pytorch_reference):
+    finite = torch.isfinite(reference)
+    assert torch.equal(actual[~finite], reference[~finite])
+    if finite.any():
+        actual, reference, pytorch_reference = (
+            tensor[finite] for tensor in (actual, reference, pytorch_reference)
+        )
+        atol = 2 * (reference + 0.3 - 0.3 - reference).abs().max().item()
+        assert (actual - reference).abs().max().item() <= 2 * (
+            pytorch_reference - reference
+        ).abs().max().item() + atol
+
+_SM100_SEQUSED_CASES = [
+    pytest.param("padded", "both", torch.bfloat16, "mha", "noncausal", id="padded-boundaries"),
+    pytest.param("packed", "q", torch.float16, "gqa", "causal", id="packed-q"),
+    pytest.param("packed", "k", torch.bfloat16, "mqa", "local", id="packed-k"),
+    pytest.param("packed", "both", torch.float16, "mha", "noncausal", id="packed-both"),
+]
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 2CTA hdim256-only coverage")
+@pytest.mark.parametrize(
+    "storage_mode,metadata_mode,dtype,mha_type,attention_mode", _SM100_SEQUSED_CASES
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_hdim256_seqused_fwd(
+    storage_mode, metadata_mode, dtype, mha_type, attention_mode
+):
+    """Exercise logical used lengths independently of physical storage lengths."""
+    device = "cuda"
+    d = seqlen = 256
+    nheads = 4
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    torch.random.manual_seed(256)
+
+    def lengths(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    if storage_mode == "padded":
+        physical_lengths_q = physical_lengths_k = lengths([seqlen] * 7)
+        logical_lengths_q = lengths([0, 1, 127, 128, 129, 255, 256])
+        logical_lengths_k = lengths([256, 255, 129, 128, 127, 1, 0])
+    else:
+        physical_lengths_q = lengths([256, 255, 192, 160, 144, 96, 32])
+        physical_lengths_k = lengths([32, 96, 144, 160, 192, 255, 256])
+        logical_lengths_q = (
+            lengths([255, 1, 127, 128, 129, 64, 0])
+            if metadata_mode in ("q", "both")
+            else physical_lengths_q
+        )
+        logical_lengths_k = (
+            lengths([0, 1, 127, 128, 129, 254, 255])
+            if metadata_mode in ("k", "both")
+            else physical_lengths_k
+        )
+
+    batch_size = physical_lengths_q.numel()
+    positions = torch.arange(seqlen, device=device)
+    physical_mask_q = positions[None, :] < physical_lengths_q[:, None]
+    physical_mask_k = positions[None, :] < physical_lengths_k[:, None]
+    logical_mask_q = positions[None, :] < logical_lengths_q[:, None]
+    logical_mask_k = positions[None, :] < logical_lengths_k[:, None]
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads_kv, d, device=device, dtype=dtype)
+    # Make physically present but logically unused KV rows conspicuous.
+    k.masked_fill_(~logical_mask_k[:, :, None, None], 4.0)
+    v.masked_fill_(~logical_mask_k[:, :, None, None], 32.0)
+
+    (
+        q_unpad, k_unpad, v_unpad, _,
+        cu_seqlens_q, cu_seqlens_k, _, _, _, _,
+        q_padded, k_padded, v_padded, _,
+        output_pad_fn, _, _,
+    ) = generate_qkv(q, k, v, physical_mask_q, physical_mask_k)
+
+    packed = storage_mode == "packed"
+    use_seqused_q = metadata_mode in ("q", "both")
+    use_seqused_k = metadata_mode in ("k", "both")
+    causal = attention_mode == "causal"
+    window_size = (64, 32) if attention_mode == "local" else (None, None)
+    out_buffer = (
+        torch.empty(
+            batch_size * seqlen * nheads * d + 1, device=device, dtype=dtype
+        )[1:].view(batch_size, seqlen, nheads, d)
+        if not packed
+        else None
+    )
+    out_raw, lse = flash_attn_varlen_func(
+        q_unpad if packed else q_padded,
+        k_unpad if packed else k_padded,
+        v_unpad if packed else v_padded,
+        cu_seqlens_q=cu_seqlens_q if packed else None,
+        cu_seqlens_k=cu_seqlens_k if packed else None,
+        seqused_q=logical_lengths_q if use_seqused_q else None,
+        seqused_k=logical_lengths_k if use_seqused_k else None,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        causal=causal,
+        window_size=window_size,
+        pack_gqa=False,
+        out=out_buffer,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+
+    out = output_pad_fn(out_raw) if packed else out_raw
+    lse_padded = output_pad_fn(lse.transpose(0, 1)) if packed else lse.permute(0, 2, 1)
+    ref_args = (q, k, v, logical_mask_q, logical_mask_k)
+    ref_kwargs = dict(causal=causal, window_size=window_size, return_lse=True)
+    out_ref, _, lse_ref = attention_ref(*ref_args, **ref_kwargs)
+    out_pt, _, lse_pt = attention_ref(
+        *ref_args, upcast=False, reorder_ops=True, **ref_kwargs
+    )
+
+    # Used-length tails are undefined for both padded and packed storage.
+    active = logical_mask_q[:, :, None, None].expand_as(out)
+    _assert_fwd_matches_ref(out[active], out_ref[active], out_pt[active])
+    lse_mask = logical_mask_q[:, :, None].expand(-1, -1, nheads)
+    _assert_fwd_matches_ref(
+        lse_padded[lse_mask],
+        lse_ref.permute(0, 2, 1)[lse_mask],
+        lse_pt.permute(0, 2, 1)[lse_mask],
+    )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 2CTA hdim256-only coverage")
+@pytest.mark.parametrize(
+    "use_seqused_k",
+    [True, False],
+    ids=["padded-seqused-k", "dense-no-metadata"],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_hdim256_causal_empty_prefix_fwd(use_seqused_k):
+    """Cover bottom-right causal rows with no keys, with and without seqused."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k_used = 1, 2048, 1024
+    seqlen_k = seqlen_q if use_seqused_k else seqlen_k_used
+    nheads, d = 1, 256
+    torch.random.manual_seed(256)
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    seqused_k = (
+        torch.full((batch_size,), seqlen_k_used, device=device, dtype=torch.int32)
+        if use_seqused_k
+        else None
+    )
+    key_padding_mask = torch.arange(seqlen_k, device=device)[None, :] < seqlen_k_used
+    k.masked_fill_(~key_padding_mask[:, :, None, None], 4.0)
+    v.masked_fill_(~key_padding_mask[:, :, None, None], 32.0)
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        causal=True,
+        pack_gqa=False,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+
+    empty_rows = seqlen_q - seqlen_k_used
+    assert torch.equal(out[:, :empty_rows], torch.zeros_like(out[:, :empty_rows]))
+    assert torch.equal(
+        lse[:, :, :empty_rows],
+        torch.full_like(lse[:, :, :empty_rows], float("-inf")),
+    )
+
+    ref_args = (q, k, v, None, key_padding_mask)
+    ref_kwargs = dict(causal=True, return_lse=True)
+    out_ref, _, lse_ref = attention_ref(*ref_args, **ref_kwargs)
+    out_pt, _, lse_pt = attention_ref(
+        *ref_args, upcast=False, reorder_ops=True, **ref_kwargs
+    )
+    _assert_fwd_matches_ref(
+        out[:, empty_rows:], out_ref[:, empty_rows:], out_pt[:, empty_rows:]
+    )
+    _assert_fwd_matches_ref(lse, lse_ref, lse_pt)
 
 
 # ---------------------------------------------------------------------------

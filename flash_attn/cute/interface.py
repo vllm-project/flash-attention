@@ -797,6 +797,7 @@ def _flash_attn_fwd(
         hd256_mask_residual = not (
             cu_seqlens_q is None
             and seqused_q is None
+            and seqused_k is None
             and page_table is None
             and max_seqlen_q == max_seqlen_k
             and max_seqlen_q % 256 == 0
@@ -1136,8 +1137,6 @@ def _flash_attn_fwd(
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     assert learnable_sink is None, \
                         "SM100 forward with head_dim=256 does not support learnable_sink"
-                    assert seqused_q is None and seqused_k is None, \
-                        "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
                         assert max_seqlen_k % page_size == 0, (
                             f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "

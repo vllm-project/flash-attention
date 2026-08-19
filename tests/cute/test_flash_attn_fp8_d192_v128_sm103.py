@@ -68,9 +68,10 @@ def test_fp8_rescale_threshold_rejects_invalid_value():
 
 
 @pytest.mark.skipif(not _is_sm103_available(), reason="requires an SM103 GPU")
-def test_fp8_rescale_threshold_rejects_non_k3_configuration():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e5m2])
+def test_fp8_rescale_threshold_rejects_non_k3_configuration(dtype):
     device = torch.device("cuda")
-    q, k, v = _target_tensors(device, dtype=torch.bfloat16)
+    q, k, v = _target_tensors(device, dtype=dtype)
     with pytest.raises(AssertionError, match="only supported"):
         flash_attn_varlen_func(
             q,
@@ -82,6 +83,31 @@ def test_fp8_rescale_threshold_rejects_non_k3_configuration():
             max_seqlen_k=512,
             causal=True,
             fp8_rescale_threshold=0.75,
+        )
+
+
+@pytest.mark.skipif(not _is_sm103_available(), reason="requires an SM103 GPU")
+@pytest.mark.parametrize("aux_kind", ["tensor", "scalar"])
+def test_fp8_rescale_threshold_rejects_k3_unsupported_aux(aux_kind):
+    device = torch.device("cuda")
+    q, k, v = _target_tensors(device)
+    extra_kwargs = (
+        {"aux_tensors": [torch.empty(1, device=device)]}
+        if aux_kind == "tensor"
+        else {"aux_scalars": (1.0,)}
+    )
+    with pytest.raises(AssertionError, match="only supported"):
+        flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=_cumulative((384,), device),
+            cu_seqlens_k=_cumulative((512,), device),
+            max_seqlen_q=384,
+            max_seqlen_k=512,
+            causal=True,
+            fp8_rescale_threshold=0.75,
+            **extra_kwargs,
         )
 
 
@@ -109,7 +135,8 @@ def _reference(q, k, v, q_lengths, kv_lengths, softmax_scale):
         scores.masked_fill_(
             (kv_idx > q_idx + kv_len - q_len).unsqueeze(-1), float("-inf")
         )
-        outputs.append(torch.einsum("qkh,khd->qhd", scores.softmax(dim=1), v_i))
+        probabilities = torch.nan_to_num(scores.softmax(dim=1))
+        outputs.append(torch.einsum("qkh,khd->qhd", probabilities, v_i))
         lses.append(scores.logsumexp(dim=1))
         q_offset += q_len
         kv_offset += kv_len
@@ -161,6 +188,57 @@ def test_fp8_d192_v128_k3_varlen_causal(fp8_rescale_threshold):
         fp8_rescale_threshold=fp8_rescale_threshold,
     )
     if lse.shape == (num_q_heads, sum(q_lengths)):
+        lse = lse.transpose(0, 1).contiguous()
+
+    out_ref, lse_ref = _reference(q, k, v, q_lengths, kv_lengths, softmax_scale)
+    torch.testing.assert_close(out.float(), out_ref, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not _is_sm103_available(), reason="requires an SM103 GPU")
+@pytest.mark.parametrize(
+    "q_lengths,kv_lengths",
+    [
+        ((384,), (128,)),
+        ((0, 384), (64, 512)),
+        ((384, 257), (0, 320)),
+    ],
+)
+def test_fp8_d192_v128_k3_varlen_sequence_boundaries(q_lengths, kv_lengths):
+    device = torch.device("cuda")
+    num_heads = 2
+    torch.manual_seed(3)
+    q = (
+        torch.randn(sum(q_lengths), num_heads, 192, device=device, dtype=torch.bfloat16)
+        / 10
+    ).to(torch.float8_e4m3fn)
+    k = (
+        torch.randn(
+            sum(kv_lengths), num_heads, 192, device=device, dtype=torch.bfloat16
+        )
+        / 10
+    ).to(torch.float8_e4m3fn)
+    v = (
+        torch.randn(
+            sum(kv_lengths), num_heads, 128, device=device, dtype=torch.bfloat16
+        )
+        / 10
+    ).to(torch.float8_e4m3fn)
+    softmax_scale = 1.0 / math.sqrt(192)
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_cumulative(q_lengths, device),
+        cu_seqlens_k=_cumulative(kv_lengths, device),
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(kv_lengths),
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_lse=True,
+    )
+    if lse.shape == (num_heads, sum(q_lengths)):
         lse = lse.transpose(0, 1).contiguous()
 
     out_ref, lse_ref = _reference(q, k, v, q_lengths, kv_lengths, softmax_scale)

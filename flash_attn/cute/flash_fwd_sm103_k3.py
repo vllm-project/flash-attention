@@ -610,12 +610,16 @@ class FlashAttentionForwardSm103K3:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        assert self.q_dtype.width == 8, "K3 is FP8-only"
+        assert self.q_dtype == cutlass.Float8E4M3FN, "K3 requires FP8 E4M3FN Q"
+        assert self.k_dtype == cutlass.Float8E4M3FN, "K3 requires FP8 E4M3FN K"
+        assert self.v_dtype == cutlass.Float8E4M3FN, "K3 requires FP8 E4M3FN V"
+        assert self.o_dtype == cutlass.BFloat16, "K3 requires BF16 output"
         assert mCuSeqlensQ is not None and mCuSeqlensK is not None
         assert mSeqUsedQ is None and mSeqUsedK is None
         assert mDynamicCausal is None and mPageTable is None
         assert learnable_sink is None and blocksparse_tensors is None
-        assert aux_data.tensors is None and output_scale is None
+        assert aux_data.tensors is None and aux_data.scalars is None
+        assert output_scale is None
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         # Packed-varlen layouts: (total, heads, dim) -> (total, dim, heads).
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[0, 2, 1]))

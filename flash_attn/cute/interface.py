@@ -402,9 +402,9 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
-    fp8_rescale_threshold: Optional[float] = None,
     compile_only: bool = False,
     fp8_kv_dequant: bool = False,
+    fp8_rescale_threshold: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -423,10 +423,12 @@ def _flash_attn_fwd(
         output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
             FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
             dequant = out_fp8 * output_scale. SM100/SM110 only.
-        fp8_rescale_threshold: Rescale threshold for the SM103 FP8 d192/v128 K3
-            profile. Supported values are 0.0, 0.75, and 8.0. The default is 8.0.
         compile_only: If True, compile the selected kernel and return without
             launching it.
+        fp8_rescale_threshold: Rescale threshold for the SM103 FP8 d192/v128 K3
+            profile. Supported values are 0.0, 0.75, and 8.0. When omitted, an
+            eligible K3 workload selects 8.0 and all other workloads retain the
+            existing generic-kernel dispatch.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
@@ -763,23 +765,26 @@ def _flash_attn_fwd(
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     k3_signature = (
-        arch, is_fp8, head_dim, head_dim_v, causal, local, is_split_kv,
-        qhead_per_kvhead, pack_gqa, tile_m, tile_n, q_stage,
-    ) == (103, True, 192, 128, True, False, False, 1, False, 128, 128, 2)
-    k3_has_unsupported_feature = any(
-        x is not None
-        for x in (
-            seqused_q, seqused_k, page_table, block_sparse_tensors,
-            softcap, score_mod, mask_mod, learnable_sink,
-            q_descale, k_descale, v_descale, output_scale,
-        )
-    )
-    use_sm103_k3 = (
-        k3_signature
-        and cu_seqlens_q is not None
-        and cu_seqlens_k is not None
+        arch == 103
+        and q_dtype == torch.float8_e4m3fn
+        and k is not None and k.dtype == torch.float8_e4m3fn
+        and v.dtype == torch.float8_e4m3fn
+        and q is not None and qv is None
+        and head_dim == 192 and head_dim_v == 128
+        and causal and not local and not is_split_kv
+        and qhead_per_kvhead == 1 and not pack_gqa
+        and tile_m == 128 and tile_n == 128 and q_stage == 2
         and num_m_blocks >= 2
-        and not k3_has_unsupported_feature
+        and cu_seqlens_q is not None and cu_seqlens_k is not None
+    )
+    k3_unsupported_features = (
+        seqused_q, seqused_k, dynamic_causal, page_table,
+        block_sparse_tensors, softcap, score_mod, mask_mod, learnable_sink,
+        q_descale, k_descale, v_descale, gather_kv_indices, output_scale,
+        aux_tensors, aux_tensor_leading_dims, aux_scalars,
+    )
+    use_sm103_k3 = k3_signature and all(
+        x is None for x in k3_unsupported_features
     )
 
     if fp8_rescale_threshold is not None:
@@ -3116,7 +3121,8 @@ def flash_attn_varlen_func(
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
 
     fp8_rescale_threshold: Rescale threshold for the SM103 FP8 d192/v128 K3
-        profile. Supported values are 0.0, 0.75, and 8.0. Defaults to 8.0.
+        profile. Supported values are 0.0, 0.75, and 8.0. When omitted, eligible
+        K3 workloads use 8.0; other workloads retain the existing dispatch.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -3169,7 +3175,6 @@ def compile_flash_attn_varlen_func_from_specs(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     num_splits: int = 1,
     return_lse: bool = False,
-    fp8_rescale_threshold: Optional[float] = None,
 ):
     q = _make_compile_only_tensor_spec(q_shape, q_dtype)
     k = _make_compile_only_tensor_spec(k_shape, q_dtype)
@@ -3211,7 +3216,6 @@ def compile_flash_attn_varlen_func_from_specs(
         window_size_left=window_size[0],
         window_size_right=window_size[1],
         num_splits=num_splits,
-        fp8_rescale_threshold=fp8_rescale_threshold,
         return_lse=return_lse,
         out=out,
         lse=lse,

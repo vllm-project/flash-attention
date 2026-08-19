@@ -37,6 +37,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_sm103_k3 import FlashAttentionForwardSm103K3
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -401,6 +402,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    fp8_rescale_threshold: Optional[float] = None,
     compile_only: bool = False,
     fp8_kv_dequant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -421,6 +423,8 @@ def _flash_attn_fwd(
         output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
             FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
             dequant = out_fp8 * output_scale. SM100/SM110 only.
+        fp8_rescale_threshold: Rescale threshold for the SM103 FP8 d192/v128 K3
+            profile. Supported values are 0.0, 0.75, and 8.0. The default is 8.0.
         compile_only: If True, compile the selected kernel and return without
             launching it.
     """
@@ -758,6 +762,39 @@ def _flash_attn_fwd(
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
+    k3_signature = (
+        arch, is_fp8, head_dim, head_dim_v, causal, local, is_split_kv,
+        qhead_per_kvhead, pack_gqa, tile_m, tile_n, q_stage,
+    ) == (103, True, 192, 128, True, False, False, 1, False, 128, 128, 2)
+    k3_has_unsupported_feature = any(
+        x is not None
+        for x in (
+            seqused_q, seqused_k, page_table, block_sparse_tensors,
+            softcap, score_mod, mask_mod, learnable_sink,
+            q_descale, k_descale, v_descale, output_scale,
+        )
+    )
+    use_sm103_k3 = (
+        k3_signature
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and num_m_blocks >= 2
+        and not k3_has_unsupported_feature
+    )
+
+    if fp8_rescale_threshold is not None:
+        fp8_rescale_threshold = float(fp8_rescale_threshold)
+        assert use_sm103_k3, (
+            "fp8_rescale_threshold is only supported for the SM103 FP8 "
+            "d192/v128 packed-varlen causal K3 profile"
+        )
+        assert fp8_rescale_threshold in (0.0, 0.75, 8.0), (
+            "fp8_rescale_threshold must be one of 0.0, 0.75, or 8.0"
+        )
+
+    k3_rescale_threshold = (
+        8.0 if fp8_rescale_threshold is None else fp8_rescale_threshold
+    ) if use_sm103_k3 else None
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
@@ -913,6 +950,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        k3_rescale_threshold,
         q is not None,
         qv is not None,
         p is not None,
@@ -1120,6 +1158,8 @@ def _flash_attn_fwd(
                         use_2cta_instrs=use_2cta_instrs,
                         use_clc_scheduler=use_clc_scheduler,
                     )
+                elif k3_rescale_threshold is not None:
+                    fa_fwd = FlashAttentionForwardSm103K3(k3_rescale_threshold)
                 else:
                     fa_fwd = FlashAttentionForwardSm100(
                         head_dim,
@@ -2823,6 +2863,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
+        fp8_rescale_threshold: Optional[float] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2862,6 +2903,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             out=out,
             output_scale=output_scale,
+            fp8_rescale_threshold=fp8_rescale_threshold,
         )
         ctx.save_for_backward(
             q,
@@ -3043,6 +3085,7 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
+    fp8_rescale_threshold: Optional[float] = None,
 ):
     """
     Tensor arguments:
@@ -3071,6 +3114,9 @@ def flash_attn_varlen_func(
         so we arrange for nheads as the contiguous mode for better vectorization.
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
+
+    fp8_rescale_threshold: Rescale threshold for the SM103 FP8 d192/v128 K3
+        profile. Supported values are 0.0, 0.75, and 8.0. Defaults to 8.0.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -3103,6 +3149,7 @@ def flash_attn_varlen_func(
         return_lse,
         out,
         output_scale,
+        fp8_rescale_threshold,
     )
 
 
@@ -3122,6 +3169,7 @@ def compile_flash_attn_varlen_func_from_specs(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     num_splits: int = 1,
     return_lse: bool = False,
+    fp8_rescale_threshold: Optional[float] = None,
 ):
     q = _make_compile_only_tensor_spec(q_shape, q_dtype)
     k = _make_compile_only_tensor_spec(k_shape, q_dtype)
@@ -3163,6 +3211,7 @@ def compile_flash_attn_varlen_func_from_specs(
         window_size_left=window_size[0],
         window_size_right=window_size[1],
         num_splits=num_splits,
+        fp8_rescale_threshold=fp8_rescale_threshold,
         return_lse=return_lse,
         out=out,
         lse=lse,

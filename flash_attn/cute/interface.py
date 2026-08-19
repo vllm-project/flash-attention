@@ -50,7 +50,7 @@ from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardS
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA kernel imports
+# SM100 dedicated head_dim=256 kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
@@ -778,7 +778,7 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
+    # hd=256 forward uses the dedicated Blackwell-family kernel.
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
     if use_dedicated_hd256_kernel:
@@ -801,6 +801,16 @@ def _flash_attn_fwd(
             and page_table is None
             and max_seqlen_q == max_seqlen_k
             and max_seqlen_q % 256 == 0
+        )
+        hd256_use_2cta = not (
+            seqused_q is not None
+            and cu_seqlens_q is None
+            and page_table is None
+            and not local
+            and (
+                (not causal and max_seqlen_q <= 1024)
+                or (causal and max_seqlen_q <= 2048 and max_seqlen_k <= 2048)
+            )
         )
 
     if softcap is not None:
@@ -980,6 +990,7 @@ def _flash_attn_fwd(
             hd256_varlen_b1,
             hd256_l2_swizzle,
             hd256_mask_residual,
+            hd256_use_2cta,
         )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -1131,7 +1142,7 @@ def _flash_attn_fwd(
                 )
             else:
                 if use_dedicated_hd256_kernel:
-                    # hd=256 2CTA forward: check for currently unsupported features
+                    # Dedicated hd=256 forward: check for currently unsupported features
                     assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
@@ -1172,6 +1183,7 @@ def _flash_attn_fwd(
                         o_aligned_16b=o_aligned_16b,
                         l2_swizzle=hd256_l2_swizzle,
                         mask_residual=hd256_mask_residual,
+                        use_2cta=hd256_use_2cta,
                     )
                 else:
                     fa_fwd = FlashAttentionForwardSm100(

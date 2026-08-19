@@ -52,6 +52,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_aligned_16b: bool = False,
         l2_swizzle: bool = False,
         mask_residual: bool = True,
+        use_2cta: bool = True,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -86,20 +87,22 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_tiler[1],
             mma_tiler[2],
         )
+        self.use_2cta = use_2cta
+        cluster_size_m = 2 if use_2cta else 1
         self.qk_mma_tiler = (
-            2 * mma_tiler[0],
+            cluster_size_m * mma_tiler[0],
             mma_tiler[1],
             min(self.cta_tiler[2], 128),
         )
         self.pv_mma_tiler = self.qk_mma_tiler
         self.pv_block_tiler = (
-            self.pv_mma_tiler[0] // 2,
+            self.pv_mma_tiler[0] // cluster_size_m,
             self.pv_mma_tiler[1],
             self.pv_mma_tiler[2],
         )
         self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
-        self.cluster_shape_mn = (2, 1)
+        self.cluster_shape_mn = (cluster_size_m, 1)
         self.tmem_warp_shape_mn = (4, 1)
         # Dedicated hd256 kernel uses fixed scheduling policy.
         self.is_persistent = False
@@ -139,21 +142,22 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_o_offset = 256
         self.tmem_p_offset = self.tmem_s_offset
 
-        _tune_key = (True, is_causal, 256, False)  # hd256: always 2cta, no sm103 variant
+        # Reuse the established hd256 math/register tuning for both CTA-group forms.
+        _tune_key = (True, is_causal, 256, False)
         _tune = _TUNING_CONFIG.get(_tune_key, {})
         self.num_regs_softmax = _tune.get("num_regs_softmax", 256)
         self.num_regs_correction = _tune.get("num_regs_correction", 160)
         self.num_regs_other = 56 if is_causal else 32
-        self.ex2_emu_freq = _tune.get("ex2_emu_freq", 4)
+        self.ex2_emu_freq = _tune.get("ex2_emu_freq", 4) if self.use_2cta else 0
         self.ex2_emu_res = _tune.get("ex2_emu_res", 3)
         self.ex2_emu_start_frg = _tune.get("ex2_emu_start_frg", 0)
 
         self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
-        self.q_stage = self.iterations_qk
-        self.k_stage = 4
-        self.v_stage = 4
+        self.q_stage = 2
+        self.k_stage = 4 if self.use_2cta else 2
+        self.v_stage = 4 if self.use_2cta else 3
         self.qk_acc_stage = 2
         self.mma_corr_stage = 1
 
@@ -443,7 +447,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
 
-        cta_group = tcgen05.CtaGroup.TWO
+        cta_group = tcgen05.CtaGroup.TWO if self.use_2cta else tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
@@ -679,9 +683,15 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
 
-        bidx, _, _ = cute.arch.block_idx()
-        mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        if cutlass.const_expr(self.use_2cta):
+            bidx, _, _ = cute.arch.block_idx()
+            mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            is_leader_cta = mma_tile_coord_v == 0
+        else:
+            mma_tile_coord_v = 0
+            cta_rank_in_cluster = 0
+            is_leader_cta = True
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
 
         # Alloc
@@ -772,7 +782,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.correction_warp_ids[0],
-            is_two_cta=True,
+            is_two_cta=self.use_2cta,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
@@ -826,10 +836,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tile_sched_params)
         else:
             blk_idx = cute.arch.block_idx()
+            if cutlass.const_expr(not self.use_2cta):
+                # Reverse batch groups without disturbing per-batch head locality.
+                blk_idx = (blk_idx[0], blk_idx[1], cute.arch.grid_dim()[2] - 1 - blk_idx[2])
             tile_sched = FmhaStaticTileScheduler(
                 tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
             )
         work_tile = tile_sched.initial_work_tile_info()
+
         has_seqused = mSeqUsedQ is not None or mSeqUsedK is not None
         seqlen_info_args = (
             mQ_qdl.shape[0],
@@ -1097,8 +1111,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             if cutlass.const_expr(has_seqused):
                 sTripMma = storage.trip_start_count_smem.get_tensor(cute.make_layout(2))
 
-            cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            is_leader_cta = cta_rank_in_cluster % 2 == 0
+            # For the 1CTA specialization this is the compile-time constant True,
+            # so issuer-only work has no generated leader predicate.
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
@@ -1566,7 +1580,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_q,
                     )
                 work_tile = tile_sched.advance_to_next_work()
-            # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
+            # TMEM is released after every role has completed below.
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Empty warps reg dealloc
@@ -1575,12 +1589,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
-        #  Cooperative TMEM Deallocation (2CTA)
+        #  Cooperative TMEM Deallocation
         # ///////////////////////////////////////////////////////////////////////////////
-        # All warps (including scheduler) have finished by this point.
-        # Cluster-wide sync ensures both CTAs reach here before dealloc.
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
+        # The paired allocator requires both CTAs to finish before either frees TMEM.
+        if cutlass.const_expr(self.use_2cta):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+        else:
+            self.tmem_alloc_barrier.arrive_and_wait()
         tmem.relinquish_alloc_permit()
         tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
         tmem.free(tmem_ptr)

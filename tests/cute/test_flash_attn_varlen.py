@@ -1,9 +1,13 @@
 from typing import Optional
+
 import pytest
 
 import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
+
+IS_SM100 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
@@ -47,6 +51,67 @@ def test_varlen(
         mha_type=mha_type,
     )
     assert ok
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 hd256-only regression")
+@pytest.mark.parametrize(
+    "k_lengths",
+    [
+        pytest.param((256, 129), id="full-then-residual"),
+        pytest.param((129, 256), id="residual-then-full"),
+    ],
+)
+def test_sm100_hd256_dense_q_packed_k_masks_residual(k_lengths):
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, nheads, head_dim = 2, 256, 1, 256
+    value_per_sequence = (1.0, 4.0)
+
+    q = torch.zeros(
+        batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype
+    )
+    k = torch.zeros(
+        sum(k_lengths), nheads, head_dim, device=device, dtype=dtype
+    )
+    v = torch.cat(
+        [
+            torch.full(
+                (length, nheads, head_dim),
+                value,
+                device=device,
+                dtype=dtype,
+            )
+            for length, value in zip(k_lengths, value_per_sequence)
+        ]
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, k_lengths[0], sum(k_lengths)],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=256,
+        max_seqlen_k=256,
+        causal=False,
+    )
+
+    reference = torch.stack(
+        [
+            torch.full(
+                (seqlen_q, nheads, head_dim),
+                value,
+                device=device,
+                dtype=dtype,
+            )
+            for value in value_per_sequence
+        ]
+    )
+    torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+
 
 def check_varlen_vs_torch_flash(
     q, k, v,

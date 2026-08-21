@@ -375,9 +375,7 @@ def test_flash_attn_sm100_hdim256_seqused_fwd(
     causal = attention_mode == "causal"
     window_size = (64, 32) if attention_mode == "local" else (None, None)
     out_buffer = (
-        torch.empty(
-            batch_size * seqlen * nheads * d + 1, device=device, dtype=dtype
-        )[1:].view(batch_size, seqlen, nheads, d)
+        torch.empty(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
         if not packed
         else None
     )
@@ -418,6 +416,47 @@ def test_flash_attn_sm100_hdim256_seqused_fwd(
         lse_ref.permute(0, 2, 1)[lse_mask],
         lse_pt.permute(0, 2, 1)[lse_mask],
     )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 1CTA hdim256 odd-tile coverage")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_hdim256_1cta_causal_odd_q_tiles_fwd():
+    """Cover 1CTA causal scheduling when the Q tile count is odd."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads, d = 1, 384, 1, 256
+    torch.random.manual_seed(256)
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    seqused_q = torch.full(
+        (batch_size,), seqlen, device=device, dtype=torch.int32
+    )
+    out_buffer = torch.full_like(q, float("nan"))
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        seqused_q=seqused_q,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        causal=True,
+        pack_gqa=False,
+        out=out_buffer,
+    )
+    if is_fake_mode():
+        return
+
+    assert torch.isfinite(out).all(dim=-1).all()
+    ref_args = (q, k, v, None, None)
+    ref_kwargs = dict(causal=True)
+    out_ref, _ = attention_ref(*ref_args, **ref_kwargs)
+    out_pt, _ = attention_ref(
+        *ref_args, upcast=False, reorder_ops=True, **ref_kwargs
+    )
+    _assert_fwd_matches_ref(out, out_ref, out_pt)
 
 
 @pytest.mark.skipif(not IS_SM100, reason="SM100 2CTA hdim256-only coverage")

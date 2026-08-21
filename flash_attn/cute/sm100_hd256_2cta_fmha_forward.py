@@ -49,7 +49,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         has_aux_tensors: bool = False,
         paged_kv_non_tma: bool = False,
         is_varlen_b1: bool = False,
-        o_aligned_16b: bool = False,
         l2_swizzle: bool = False,
         mask_residual: bool = True,
         use_2cta: bool = True,
@@ -111,7 +110,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
 
-        self.o_aligned_16b = o_aligned_16b
         self.is_varlen_b1 = is_varlen_b1
         self.l2_swizzle = l2_swizzle
         self.mask_residual = mask_residual
@@ -209,7 +207,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
 
-        q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, assume_tensor_aligned(mO) if cutlass.const_expr(self.o_aligned_16b) else mO
+        q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, assume_tensor_aligned(mO)
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
@@ -394,7 +392,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 (s_q, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 False,
-                lpt=self.is_causal and not self.is_local,
+                lpt=self.use_2cta and self.is_causal and not self.is_local,
                 l2_swizzle=self.l2_swizzle,
             )
         elif cutlass.const_expr(cum_seqlen_q is not None):
@@ -424,7 +422,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 o.shape,
                 self.cta_tiler,
                 False,
-                lpt=self.is_causal and not self.is_local,
+                lpt=self.use_2cta and self.is_causal and not self.is_local,
                 l2_swizzle=self.l2_swizzle,
             )
 
@@ -505,7 +503,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, 1
         )
-        universal_copy_bits = 128 if cutlass.const_expr(self.o_aligned_16b) else self.o_dtype.width
+        universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.o_dtype.width
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),

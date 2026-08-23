@@ -251,7 +251,6 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     if not is_fake_mode():
         assert t.is_cuda, f"{name} must be on CUDA"
 
-
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -777,8 +776,8 @@ def _flash_attn_fwd(
             and seqused_q is None
             and seqused_k is None
             and page_table is None
-            and max_seqlen_q == max_seqlen_k
-            and max_seqlen_q % 256 == 0
+            and seqlen_q == seqlen_k
+            and seqlen_q % 256 == 0
         )
         hd256_use_2cta = not (
             seqused_q is not None

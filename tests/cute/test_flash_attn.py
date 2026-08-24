@@ -935,7 +935,7 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
+                or (IS_SM100 and d == dv == 256 and unpad_q and unpad_kv)
             )
             and not has_learnable_sink
             and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
@@ -1833,6 +1833,126 @@ def _generate_block_kvcache(
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+_SM100_PAGED_SEQUSED_CASES = [
+    pytest.param(False, torch.bfloat16, "mha", "noncausal", id="k-bf16-mha-noncausal"),
+    pytest.param(True, torch.float16, "gqa", "causal", id="both-fp16-gqa-causal"),
+    pytest.param(True, torch.bfloat16, "mqa", "local", id="both-bf16-mqa-local"),
+]
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100 2CTA hdim256-only coverage")
+@pytest.mark.parametrize(
+    "use_seqused_q,dtype,mha_type,attention_mode", _SM100_PAGED_SEQUSED_CASES
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_hdim256_seqused_paged_kv_fwd(
+    use_seqused_q, dtype, mha_type, attention_mode
+):
+    """Exercise seqused_k through a nontrivial page table, without backward."""
+    device = "cuda"
+    d = seqlen = 256
+    page_size = 128
+    lengths_q = torch.tensor(
+        [0, 1, 127, 128, 129, 255, 256], device=device, dtype=torch.int32
+    )
+    lengths_k = torch.tensor(
+        [256, 255, 129, 128, 127, 1, 0], device=device, dtype=torch.int32
+    )
+    batch_size, nheads = lengths_q.numel(), 4
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    torch.random.manual_seed(512)
+
+    q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    (
+        k,
+        v,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        _,
+    ) = _generate_block_kvcache(
+        seqlen, page_size, batch_size, nheads_kv, d, d, device, dtype, dtype
+    )
+    num_logical_blocks = seqlen // page_size
+    page_table = page_table[:, :num_logical_blocks]
+    # Poison only logical tail positions, after translating through the page
+    # table, so an incorrect seqused_k mask is visible for paged storage too.
+    # Fake tensors do not permit the data-dependent scalar extraction below.
+    if not is_fake_mode():
+        for batch_idx, used_k in enumerate(lengths_k.tolist()):
+            for logical_block in range(num_logical_blocks):
+                tail_start = min(max(used_k - logical_block * page_size, 0), page_size)
+                physical_block = page_table[batch_idx, logical_block].item()
+                k_cache_paged[physical_block, tail_start:].fill_(4.0)
+                v_cache_paged[physical_block, tail_start:].fill_(32.0)
+
+    positions = torch.arange(seqlen, device=device)
+    query_padding_mask = positions[None, :] < lengths_q[:, None]
+    key_padding_mask = positions[None, :] < lengths_k[:, None]
+    (
+        q_unpad, _, _, _, cu_seqlens_q, _, seqused_q, seqused_k, _, _,
+        q_padded, _, _, _, output_pad_fn, *_,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
+    causal = attention_mode == "causal"
+    window_size = (64, 32) if attention_mode == "local" else (None, None)
+
+    out_raw, lse = flash_attn_varlen_func(
+        q_padded if use_seqused_q else q_unpad,
+        k_cache_paged,
+        v_cache_paged,
+        cu_seqlens_q=None if use_seqused_q else cu_seqlens_q,
+        seqused_q=seqused_q if use_seqused_q else None,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        page_table=page_table,
+        causal=causal,
+        window_size=window_size,
+        pack_gqa=False,
+        return_lse=True,
+    )
+    if is_fake_mode():
+        return
+
+    out = out_raw if use_seqused_q else output_pad_fn(out_raw)
+    ref_args = (
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+    )
+    ref_kwargs = dict(
+        causal=causal,
+        window_size=window_size,
+        return_lse=True,
+    )
+    out_ref, _, lse_ref = attention_ref(*ref_args, **ref_kwargs)
+    out_pt, _, lse_pt = attention_ref(
+        *ref_args, upcast=False, reorder_ops=True, **ref_kwargs
+    )
+
+    # Never inspect padded Q rows or their LSE entries: both are undefined.
+    active = query_padding_mask[:, :, None, None].expand_as(out)
+    check_tensor_vs_ref("out", out[active], out_ref[active], out_pt[active])
+    active_lse_mask = query_padding_mask[:, :, None].expand(-1, -1, nheads)
+    lse_active = (
+        lse.permute(0, 2, 1)[active_lse_mask]
+        if use_seqused_q
+        else lse.transpose(0, 1).reshape(-1)
+    )
+    lse_ref_active = lse_ref.permute(0, 2, 1)[active_lse_mask]
+    lse_pt_active = lse_pt.permute(0, 2, 1)[active_lse_mask]
+    finite_lse = torch.isfinite(lse_ref_active)
+    assert torch.equal(lse_active[~finite_lse], lse_ref_active[~finite_lse])
+    check_tensor_vs_ref(
+        "lse",
+        lse_active[finite_lse],
+        lse_ref_active[finite_lse],
+        lse_pt_active[finite_lse],
+    )
 
 
 @pytest.mark.skipif(not IS_SM90, reason="fp8-KV dequant forward is SM90-only")

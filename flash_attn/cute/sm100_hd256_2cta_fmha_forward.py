@@ -24,7 +24,6 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
-from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -119,7 +118,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mma_warp_id = 8
         self.load_warp_id = 9
         self.empty_warp_id = (10, 11)
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
@@ -431,11 +430,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -448,9 +447,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta else tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = cute.nvgpu.OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.k_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
@@ -458,6 +458,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -827,7 +828,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # ///////////////////////////////////////////////////////////////////////////////
         for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
             if warp_idx == self.empty_warp_id[_i]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         if cutlass.const_expr(TileScheduler is SingleTileVarlenScheduler):
             tile_sched = TileScheduler.create(
@@ -889,7 +890,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             if cutlass.const_expr(has_seqused):
                 sTripLoad = storage.trip_start_count_smem.get_tensor(cute.make_layout(2))
             while work_tile.is_valid_tile:
@@ -1105,7 +1106,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.mma_warp_id:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, tOtO_staged = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             if cutlass.const_expr(has_seqused):
                 sTripMma = storage.trip_start_count_smem.get_tensor(cute.make_layout(2))
 
@@ -1349,7 +1350,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, _ = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
             # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+            cute.arch.setmaxregister_increase(self.num_regs_softmax)
             if cutlass.const_expr(has_seqused):
                 sTripSoftmax = storage.trip_start_count_smem.get_tensor(cute.make_layout(2))
 
@@ -1469,7 +1470,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             tStS, tOtO_staged = self.get_tmem_views(qk_thr_mma, pv_thr_mma)
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
+            cute.arch.setmaxregister_decrease(self.num_regs_correction)
             if cutlass.const_expr(has_seqused):
                 sTripCorrection = storage.trip_start_count_smem.get_tensor(cute.make_layout(2))
 
@@ -1584,7 +1585,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Empty warps reg dealloc
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx > self.load_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cooperative TMEM Deallocation

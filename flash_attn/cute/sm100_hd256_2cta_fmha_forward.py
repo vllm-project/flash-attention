@@ -1854,6 +1854,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         scale = scale_softmax_log2 * (tTMEM_LOADrStats[0] - tTMEM_LOADrStats[1])
         scale = cute.math.exp2(scale, fastmath=True)
+        # tcgen05.wait::ld: loads must complete before the slot is released
+        cute.arch.fence_view_async_tmem_load()
         stats_handle.release()
         o_handle = mma_o_consumer.wait_and_advance()
         for iter in cutlass.range(self.iterations_pv, unroll_full=True):
@@ -1886,6 +1888,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             tTMEM_LOADtO_0 = tTMEM_LOADtO[None, 0, 0]
             cute.copy(tmem_tiled_load, tTMEM_LOADtO_0, tTMrO[None, 0])
             iter_num = cute.size(tTMEM_LOADtO, mode=[1])
+            # No tcgen05.wait::ld needed in this ld -> scale -> st ring: the st to tile i-1
+            # consumes every register the ld of tile i-1 produced, so that load has completed.
             for i in cutlass.range(1, iter_num, unroll_full=True):
                 tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
                 cute.copy(tmem_tiled_load, tTMEM_LOADtO_i, tTMrO[None, i % 2])
@@ -1913,6 +1917,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_STOREtO[None, iter_num - 1, 0],
             )
         cute.arch.fence_view_async_tmem_store()
+        # tcgen05.wait::ld: loads must complete before the slot is released
+        cute.arch.fence_view_async_tmem_load()
         o_handle.release()
         return mma_o_consumer, s_corr_consumer
 
@@ -1956,6 +1962,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 tTMEM_LOADsO_i = tTMEM_LOADsO[None, i, 0]
                 tTMrO = cute.make_rmem_tensor(tTMEM_LOADsO[None, 0, i].shape, self.pv_acc_dtype)
                 cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                # tcgen05.wait::ld: load must complete before the O slot is released
+                # (register use alone does not order the TMEM read)
+                cute.arch.fence_view_async_tmem_load()
                 for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
                     tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
                         (tTMrO[j], tTMrO[j + 1]),

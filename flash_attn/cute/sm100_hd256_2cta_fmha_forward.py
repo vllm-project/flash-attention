@@ -12,9 +12,14 @@ import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.utils import ClcDynamicPersistentTileScheduler
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
 from cutlass.cute import FastDivmodDivisor
 from flash_attn.cute.tile_scheduler import (
+    ClcState,
+    SchedulingMode,
     TileSchedulerArguments,
     SingleTileVarlenScheduler,
     compute_sm100_fmha_grid as compute_grid,
@@ -59,6 +64,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         l2_swizzle: bool = False,
         mask_residual: bool = True,
         use_2cta: bool = True,
+        use_clc_scheduler: bool = False,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -108,14 +114,26 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.iterations_pv = self.cta_tiler[2] // self.pv_mma_tiler[1]
         self.cluster_shape_mn = (cluster_size_m, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        # Dedicated hd256 kernel uses fixed scheduling policy.
+        # Dedicated hd256 uses a static scheduler except for the selected short
+        # causal-varlen path, where Cluster Launch Control makes it persistent.
         self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.mask_mod = mask_mod
         self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         self.use_semantic_trip_range = is_causal or is_local
-        self.use_clc_scheduler = False
+        self.use_clc_scheduler = use_clc_scheduler
+        if use_clc_scheduler:
+            assert self.cluster_shape_mn[1] == 1, (
+                f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
+            )
+            assert self.cluster_shape_mn[0] in (1, 2), (
+                f"bad CLC cluster M: {self.cluster_shape_mn}"
+            )
+        self.scheduling_mode = (
+            SchedulingMode.CLC if use_clc_scheduler else SchedulingMode.STATIC
+        )
+        self.sched_stages = 1
 
         self.is_varlen_b1 = is_varlen_b1
         self.l2_swizzle = l2_swizzle
@@ -126,6 +144,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mma_warp_id = 8
         self.load_warp_id = 9
         self.empty_warp_id = (10, 11)
+        self.clc_scheduler_warp_id = self.empty_warp_id[0] if use_clc_scheduler else None
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
         self.threads_per_warp = 32
@@ -148,7 +167,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_p_offset = self.tmem_s_offset
 
         # Reuse the established hd256 math/register tuning for both CTA-group forms.
-        _tune_key = (True, is_causal, 256, False)
+        self.arch = BaseDSL._get_dsl().get_arch_enum()
+        self.is_sm103 = self.arch.is_family_of(Arch.sm_103f)
+        _tune_key = (True, is_causal, 256, self.is_sm103)
         _tune = _TUNING_CONFIG.get(_tune_key, {})
         self.num_regs_softmax = _tune.get("num_regs_softmax", 256)
         self.num_regs_correction = _tune.get("num_regs_correction", 160)
@@ -207,6 +228,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            assert mCuSeqlensQ is not None and not self.is_varlen_b1, (
+                "SM100 hd256 CLC scheduling requires the varlen (non-b1) tile scheduler"
+            )
+            assert mSeqUsedQ is None and mSeqUsedK is None, (
+                "SM100 hd256 CLC scheduling does not support seqused_q/seqused_k"
+            )
 
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, assume_tensor_aligned(mO)
         lse_tensor = mLSE
@@ -423,8 +451,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                 nested_mbh_coord=True,
                 is_persistent=False,
                 lpt=False,
+                m_block_slowest=(
+                    self.use_clc_scheduler and self.is_causal and not self.is_local
+                ),
             )
-            self.tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+            self.tile_sched_params = TileScheduler.to_underlying_arguments(
+                tile_sched_args, scheduling_mode=self.scheduling_mode
+            )
             grid = TileScheduler.get_grid_shape(self.tile_sched_params)
         else:
             TileScheduler = FmhaStaticTileScheduler
@@ -575,6 +608,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tma_copy_k_bytes = k_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
         self.tma_copy_v_bytes = v_copy_size * cute.size(pv_tiled_mma.thr_id.shape)
         trip_start_count_smem_size = 2 if mSeqUsedQ is not None or mSeqUsedK is not None else 0
+        clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
+        clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
 
         @cute.struct
         class SharedStorage:
@@ -599,10 +634,14 @@ class BlackwellFusedMultiHeadAttentionForward:
             mma_corr_mbar_ptr: cute.struct.MemRange[
                 Int64, self.mma_corr_stage * 2
             ]  # mma_corr_{producer,consumer}
+            clc_mbar_ptr: cute.struct.MemRange[Int64, clc_mbar_size]
             # A CTA-wide "TMEM lifetime" barrier used to safely deallocate TMEM after all users finish.
             tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
+            clc_response: cute.struct.Align[
+                cute.struct.MemRange[Int32, clc_response_size], 16
+            ]
             trip_start_count_smem: cute.struct.MemRange[Int32, trip_start_count_smem_size]
 
         self.shared_storage = SharedStorage
@@ -809,10 +848,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             swizzle=q_smem_layout_staged.inner,
             byte_alignment=128,
         )
-        sO = cute.make_tensor(
-            cute.recast_ptr(sQ.iterator, o_smem_layout_staged.inner, self.o_dtype),
-            o_smem_layout_staged.outer,
-        )
+        if cutlass.const_expr(self.use_clc_scheduler):
+            sO = smem.allocate_tensor(
+                element_type=self.o_dtype,
+                layout=o_smem_layout_staged.outer,
+                swizzle=o_smem_layout_staged.inner,
+                byte_alignment=128,
+            )
+        else:
+            sO = cute.make_tensor(
+                cute.recast_ptr(sQ.iterator, o_smem_layout_staged.inner, self.o_dtype),
+                o_smem_layout_staged.outer,
+            )
         sK = smem.allocate_tensor(
             element_type=self.k_dtype,
             layout=k_smem_layout_staged.outer,
@@ -838,25 +885,28 @@ class BlackwellFusedMultiHeadAttentionForward:
         tSrK = qk_thr_mma.make_fragment_B(sK)
         tOrV = pv_thr_mma.make_fragment_B(sV)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
-        # ///////////////////////////////////////////////////////////////////////////////
-        for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
-            if warp_idx == self.empty_warp_id[_i]:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
+        # The CLC scheduler is initialized only after the cluster pipeline
+        # handshake. Static schedulers remain on their existing setup path.
+        if cutlass.const_expr(not self.use_clc_scheduler):
+            for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
+                if warp_idx == self.empty_warp_id[_i]:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
 
-        if cutlass.const_expr(TileScheduler is SingleTileVarlenScheduler):
-            tile_sched = TileScheduler.create(
-                tile_sched_params)
-        else:
-            blk_idx = cute.arch.block_idx()
-            if cutlass.const_expr(not self.use_2cta):
-                # Reverse batch groups without disturbing per-batch head locality.
-                blk_idx = (blk_idx[0], blk_idx[1], cute.arch.grid_dim()[2] - 1 - blk_idx[2])
-            tile_sched = FmhaStaticTileScheduler(
-                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
-            )
-        work_tile = tile_sched.initial_work_tile_info()
+            if cutlass.const_expr(TileScheduler is SingleTileVarlenScheduler):
+                tile_sched = TileScheduler.create(tile_sched_params)
+            else:
+                blk_idx = cute.arch.block_idx()
+                if cutlass.const_expr(not self.use_2cta):
+                    # Reverse batch groups without disturbing per-batch head locality.
+                    blk_idx = (
+                        blk_idx[0],
+                        blk_idx[1],
+                        cute.arch.grid_dim()[2] - 1 - blk_idx[2],
+                    )
+                tile_sched = FmhaStaticTileScheduler(
+                    tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
+                )
+            work_tile = tile_sched.initial_work_tile_info()
 
         has_seqused = mSeqUsedQ is not None or mSeqUsedK is not None
         seqlen_info_args = (
@@ -897,9 +947,58 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         # Cluster wait
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        if cutlass.const_expr(self.use_clc_scheduler):
+            num_clc_consumer_warps = (
+                self.threads_per_cta // self.threads_per_warp
+            ) * self.cluster_shape_mnk[0]
+            clc = ClcState.create(
+                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
+                    TileScheduler.clc_problem_shape(tile_sched_params),
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                    storage.clc_response.data_ptr(),
+                ),
+                pipeline=pipeline.PipelineClcFetchAsync.create(
+                    barrier_storage=storage.clc_mbar_ptr.data_ptr(),
+                    num_stages=self.sched_stages,
+                    producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread,
+                        self.threads_per_warp * num_clc_consumer_warps,
+                    ),
+                    tx_count=16,
+                    cta_layout_vmnk=cluster_layout_vmnk,
+                ),
+                consumer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.sched_stages
+                ),
+                producer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.sched_stages
+                ),
+            )
+            tile_sched = TileScheduler.create(tile_sched_params, clc=clc)
+            work_tile = tile_sched.initial_work_tile_info()
         tmem.allocate(self.tmem_alloc_cols)
         # All-thread CTA NamedBarrier publishes the shared trip stores to every role.
         tmem.wait_for_alloc()
+        if cutlass.const_expr(self.use_clc_scheduler):
+            for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
+                if warp_idx == self.empty_warp_id[_i]:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    if cutlass.const_expr(
+                        self.empty_warp_id[_i] == self.clc_scheduler_warp_id
+                    ):
+                        if is_leader_cta:
+                            while work_tile.is_valid_tile:
+                                tile_sched.prefetch_next_work()
+                                work_tile = tile_sched.advance_to_next_work()
+                            tile_sched.producer_tail()
+                        else:
+                            while work_tile.is_valid_tile:
+                                work_tile = tile_sched.advance_to_next_work()
+                    else:
+                        while work_tile.is_valid_tile:
+                            work_tile = tile_sched.advance_to_next_work()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -2010,68 +2109,139 @@ class BlackwellFusedMultiHeadAttentionForward:
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         (seqlen_q, scale_output) = value_args
         (sum_consumer, sSum) = sum_args
-        (mma_o_consumer, gO_staged, cO_staged, tOtO_staged,
+        (
+            mma_o_consumer,
+            gO_staged,
+            cO_staged,
+            tOtO_staged,
             sO_staged,
             gmem_tiled_copy_o,
         ) = o_args
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
         sum_handle = sum_consumer.wait_and_advance()
-        o_handle = mma_o_consumer.wait_and_advance()
-        for iter in cutlass.range(self.iterations_pv):
-            gO = gO_staged[None, None, iter]
-            cO = cO_staged[None, None, iter]
-            sO = sO_staged[None, None, 0]
+        if cutlass.const_expr(self.use_clc_scheduler):
             row_sum = sSum[thread_idx]
             row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = scale_output / row_sum if not row_sum_is_zero_or_nan else 0.0
-            tOtO = tOtO_staged[(None, None), 0, 0, iter]
-            tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
-            sO_epi = cute.zipped_divide(sO, epi_tile)
-            tmem_copy_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.pv_acc_dtype
-            )
-            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
-            thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
-            tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
-            tTMEM_LOADsO = thr_tmem_load.partition_D(sO_epi)
-            for i in cutlass.range(cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True):
-                tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
-                tTMEM_LOADsO_i = tTMEM_LOADsO[None, i, 0]
-                tTMrO = cute.make_rmem_tensor(tTMEM_LOADsO[None, 0, i].shape, self.pv_acc_dtype)
-                cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
-                # tcgen05.wait::ld: load must complete before the O slot is released
-                # (register use alone does not order the TMEM read)
-                cute.arch.fence_view_async_tmem_load()
-                for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
-                    tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
-                        (tTMrO[j], tTMrO[j + 1]),
-                        (scale, scale),
+            o_handle = mma_o_consumer.wait_and_advance()
+            for iter in cutlass.range_constexpr(self.iterations_pv):
+                gO = gO_staged[None, None, iter]
+                cO = cO_staged[None, None, iter]
+                sO = sO_staged[None, None, 0]
+                tOtO = tOtO_staged[(None, None), 0, 0, iter]
+                tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
+                sO_epi = cute.zipped_divide(sO, epi_tile)
+                tmem_copy_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                    self.pv_acc_dtype,
+                )
+                tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
+                thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+                tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
+                tTMEM_LOADsO = thr_tmem_load.partition_D(sO_epi)
+                for i in cutlass.range(
+                    cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True
+                ):
+                    tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
+                    tTMEM_LOADsO_i = tTMEM_LOADsO[None, i, 0]
+                    tTMrO = cute.make_rmem_tensor(
+                        tTMEM_LOADsO[None, 0, i].shape, self.pv_acc_dtype
                     )
-                tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
-                o_vec = tTMrO.load()
-                tSMrO.store(o_vec.to(self.o_dtype))
-                cute.autovec_copy(tSMrO, tTMEM_LOADsO_i)
-            cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=2,
-                number_of_threads=len(self.correction_warp_ids)
-                * self.threads_per_warp,
-            )
-            self._store_o_from_smem(
-                sO,
-                gO,
-                cO,
-                gmem_tiled_copy_o,
-                thread_idx,
-                seqlen_q,
-            )
-            cute.arch.barrier(
-                barrier_id=2,
-                number_of_threads=len(self.correction_warp_ids)
-                * self.threads_per_warp,
-            )
-        o_handle.release()
+                    cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                    # tcgen05.wait::ld must complete before the O slot is released.
+                    cute.arch.fence_view_async_tmem_load()
+                    for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
+                        tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                            (tTMrO[j], tTMrO[j + 1]),
+                            (scale, scale),
+                        )
+                    tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+                    o_vec = tTMrO.load()
+                    tSMrO.store(o_vec.to(self.o_dtype))
+                    cute.autovec_copy(tSMrO, tTMEM_LOADsO_i)
+                if cutlass.const_expr(iter == self.iterations_pv - 1):
+                    o_handle.release()
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(
+                    barrier_id=2,
+                    number_of_threads=len(self.correction_warp_ids)
+                    * self.threads_per_warp,
+                )
+                self._store_o_from_smem(
+                    sO,
+                    gO,
+                    cO,
+                    gmem_tiled_copy_o,
+                    thread_idx,
+                    seqlen_q,
+                )
+                cute.arch.barrier(
+                    barrier_id=2,
+                    number_of_threads=len(self.correction_warp_ids)
+                    * self.threads_per_warp,
+                )
+        else:
+            o_handle = mma_o_consumer.wait_and_advance()
+            for iter in cutlass.range(self.iterations_pv):
+                gO = gO_staged[None, None, iter]
+                cO = cO_staged[None, None, iter]
+                sO = sO_staged[None, None, 0]
+                row_sum = sSum[thread_idx]
+                row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                scale = scale_output / row_sum if not row_sum_is_zero_or_nan else 0.0
+                tOtO = tOtO_staged[(None, None), 0, 0, iter]
+                tOtO_epi = cute.zipped_divide(tOtO, epi_tile)
+                sO_epi = cute.zipped_divide(sO, epi_tile)
+                tmem_copy_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                    self.pv_acc_dtype,
+                )
+                tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_epi)
+                thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+                tTMEM_LOADtO = thr_tmem_load.partition_S(tOtO_epi)
+                tTMEM_LOADsO = thr_tmem_load.partition_D(sO_epi)
+                for i in cutlass.range(
+                    cute.size(tTMEM_LOADtO, mode=[1]), unroll_full=True
+                ):
+                    tTMEM_LOADtO_i = tTMEM_LOADtO[None, i, 0]
+                    tTMEM_LOADsO_i = tTMEM_LOADsO[None, i, 0]
+                    tTMrO = cute.make_rmem_tensor(
+                        tTMEM_LOADsO[None, 0, i].shape, self.pv_acc_dtype
+                    )
+                    cute.copy(tiled_tmem_load, tTMEM_LOADtO_i, tTMrO)
+                    # tcgen05.wait::ld: load must complete before the O slot is released
+                    # (register use alone does not order the TMEM read)
+                    cute.arch.fence_view_async_tmem_load()
+                    for j in cutlass.range(0, cute.size(tTMrO), 2, unroll_full=True):
+                        tTMrO[j], tTMrO[j + 1] = cute.arch.mul_packed_f32x2(
+                            (tTMrO[j], tTMrO[j + 1]),
+                            (scale, scale),
+                        )
+                    tSMrO = cute.make_rmem_tensor(tTMrO.shape, self.o_dtype)
+                    o_vec = tTMrO.load()
+                    tSMrO.store(o_vec.to(self.o_dtype))
+                    cute.autovec_copy(tSMrO, tTMEM_LOADsO_i)
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(
+                    barrier_id=2,
+                    number_of_threads=len(self.correction_warp_ids)
+                    * self.threads_per_warp,
+                )
+                self._store_o_from_smem(
+                    sO,
+                    gO,
+                    cO,
+                    gmem_tiled_copy_o,
+                    thread_idx,
+                    seqlen_q,
+                )
+                cute.arch.barrier(
+                    barrier_id=2,
+                    number_of_threads=len(self.correction_warp_ids)
+                    * self.threads_per_warp,
+                )
+            o_handle.release()
         sum_handle.release()
         return mma_o_consumer, sum_consumer
 

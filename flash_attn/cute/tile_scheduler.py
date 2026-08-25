@@ -161,6 +161,7 @@ class TileSchedulerArguments(ParamsBase):
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
+    m_block_slowest: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
@@ -799,6 +800,7 @@ class SingleTileVarlenScheduler:
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
+        m_block_slowest: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
@@ -842,6 +844,7 @@ class SingleTileVarlenScheduler:
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
+                m_block_slowest=args.m_block_slowest,
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
@@ -885,7 +888,7 @@ class SingleTileVarlenScheduler:
     def clc_problem_shape(params: Params):
         return ClcDynamicPersistentTileSchedulerParams(
             problem_shape_ntile_mnl=SingleTileVarlenScheduler.get_grid_shape(params),
-            cluster_shape_mnk=(1, 1, 1),
+            cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
         )
 
     @staticmethod
@@ -1037,6 +1040,10 @@ class SingleTileVarlenScheduler:
                 head_idx = section_idx * nheads_in_l2 + head_idx_residual
                 if cutlass.const_expr(params.lpt):
                     block = num_m_blocks - 1 - block
+            elif cutlass.const_expr(params.m_block_slowest):
+                block = mh_block // params.num_head
+                head_idx = mh_block - block * params.num_head
+                block = num_m_blocks - 1 - block
             else:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks

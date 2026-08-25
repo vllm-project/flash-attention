@@ -91,6 +91,8 @@ _TUNING_CONFIG = {
     (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
     (True, False, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
     (True, True, 256, False): {"ex2_emu_freq": 14, "ex2_emu_res": 6, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
+    (True, False, 256, True): {"ex2_emu_freq": 0, "ex2_emu_res": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
+    (True, True, 256, True): {"ex2_emu_freq": 0, "ex2_emu_res": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 256, "num_regs_correction": 160},
 }
 _FP8_TUNING_CONFIG = {
     (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},

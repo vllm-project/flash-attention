@@ -789,6 +789,18 @@ def _flash_attn_fwd(
                 or (causal and max_seqlen_q <= 2048 and max_seqlen_k <= 2048)
             )
         )
+        hd256_clc = (
+            cu_seqlens_q is not None
+            and not hd256_varlen_b1
+            and causal
+            and not local
+            and seqused_q is None
+            and seqused_k is None
+            and page_table is None
+            and hd256_use_2cta
+            and max_seqlen_q <= 4096
+            and max_seqlen_k <= 4096
+        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -967,6 +979,7 @@ def _flash_attn_fwd(
             hd256_l2_swizzle,
             hd256_mask_residual,
             hd256_use_2cta,
+            hd256_clc,
         )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -1151,6 +1164,7 @@ def _flash_attn_fwd(
                         l2_swizzle=hd256_l2_swizzle,
                         mask_residual=hd256_mask_residual,
                         use_2cta=hd256_use_2cta,
+                        use_clc_scheduler=hd256_clc,
                     )
                 else:
                     fa_fwd = FlashAttentionForwardSm100(

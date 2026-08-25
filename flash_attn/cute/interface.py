@@ -50,7 +50,7 @@ from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardS
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA kernel imports
+# SM100 dedicated head_dim=256 kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
@@ -276,6 +276,7 @@ class _CompileOnlyTensorSpec:
         self.device = torch.device("cuda")
         self.requires_grad = False
         self.is_cuda = True
+        self._assumed_align = assumed_align
         self._stride = (
             tuple(
                 cute.sym_int64(divisibility=1) if item is None else item
@@ -754,9 +755,40 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
+    # hd=256 forward uses the dedicated Blackwell-family kernel.
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if use_dedicated_hd256_kernel:
+        hd256_varlen_b1 = cu_seqlens_q is not None and batch_size == 1
+        hd256_l2_swizzle = (
+            causal
+            and not local
+            and seqused_q is None
+            and page_table is None
+            and batch_size == 1
+            and qhead_per_kvhead == 1
+            and max_seqlen_q <= 8192
+            and max_seqlen_k <= 8192
+        )
+        hd256_mask_residual = not (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+            and page_table is None
+            and seqlen_q == seqlen_k
+            and seqlen_q % 256 == 0
+        )
+        hd256_use_2cta = not (
+            seqused_q is not None
+            and cu_seqlens_q is None
+            and page_table is None
+            and not local
+            and (
+                (not causal and max_seqlen_q <= 1024)
+                or (causal and max_seqlen_q <= 2048 and max_seqlen_k <= 2048)
+            )
+        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -929,6 +961,13 @@ def _flash_attn_fwd(
         q.dtype,
         out_torch_dtype,
     )
+    if use_dedicated_hd256_kernel:
+        compile_key += (
+            hd256_varlen_b1,
+            hd256_l2_swizzle,
+            hd256_mask_residual,
+            hd256_use_2cta,
+        )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
             cu_seqlens_q_tensor,
@@ -1071,14 +1110,12 @@ def _flash_attn_fwd(
                 )
             else:
                 if use_dedicated_hd256_kernel:
-                    # hd=256 2CTA forward: check for currently unsupported features
+                    # Dedicated hd=256 forward: check for currently unsupported features
                     assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
                     assert learnable_sink is None, \
                         "SM100 forward with head_dim=256 does not support learnable_sink"
-                    assert seqused_q is None and seqused_k is None, \
-                        "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
                         assert max_seqlen_k % page_size == 0, (
                             f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "
@@ -1105,20 +1142,15 @@ def _flash_attn_fwd(
                         pack_gqa=pack_gqa,
                         m_block_size=tile_m,
                         n_block_size=tile_n,
-                        q_stage=q_stage,
-                        is_persistent=not causal
-                            and not local
-                            and cu_seqlens_q is None
-                            and seqused_q is None
-                            and not is_split_kv,
                         score_mod=score_mod,
                         mask_mod=mask_mod,
                         has_aux_tensors=aux_tensors is not None,
                         paged_kv_non_tma=page_size not in [None, tile_n],
-                        is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                        is_varlen_b1=hd256_varlen_b1,
                         q_subtile_factor=q_subtile_factor,
-                        use_2cta_instrs=use_2cta_instrs,
-                        use_clc_scheduler=use_clc_scheduler,
+                        l2_swizzle=hd256_l2_swizzle,
+                        mask_residual=hd256_mask_residual,
+                        use_2cta=hd256_use_2cta,
                     )
                 else:
                     fa_fwd = FlashAttentionForwardSm100(

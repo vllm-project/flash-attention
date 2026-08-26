@@ -1389,19 +1389,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     tile_fastdiv_mods = fastdiv_mods
                     if cutlass.const_expr(tile_fastdiv_mods is not None):
-                        seqlen_q_divmod, seqlen_k_divmod = tile_fastdiv_mods
-                        tile_fastdiv_mods = (
-                            FastDivmodDivisor(seqlen_info.seqlen_q)
-                            if cutlass.const_expr(
-                                seqlen_info.has_cu_seqlens_q or seqlen_info.has_seqused_q
-                            )
-                            else seqlen_q_divmod,
-                            FastDivmodDivisor(seqlen_info.seqlen_k)
-                            if cutlass.const_expr(
-                                seqlen_info.has_cu_seqlens_k or seqlen_info.has_seqused_k
-                            )
-                            else seqlen_k_divmod,
-                        )
+                        q_divmod, k_divmod = tile_fastdiv_mods
+                        if cutlass.const_expr(
+                            seqlen_info.has_cu_seqlens_q or seqlen_info.has_seqused_q
+                        ):
+                            q_divmod = FastDivmodDivisor(seqlen_q)
+                        if cutlass.const_expr(
+                            seqlen_info.has_cu_seqlens_k or seqlen_info.has_seqused_k
+                        ):
+                            k_divmod = FastDivmodDivisor(seqlen_k)
+                        tile_fastdiv_mods = q_divmod, k_divmod
                     if cutlass.const_expr(has_seqused):
                         start_count = sTripSoftmax[0]
                         trip_count = sTripSoftmax[1]

@@ -13,6 +13,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 
+from cutlass.cute import FastDivmodDivisor
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileVarlenScheduler,
@@ -22,12 +23,19 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
 )
 from flash_attn.cute.mask import (
+    AttentionMask,
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData, domain_offset_aligned
+from flash_attn.cute.utils import (
+    AuxData,
+    as_bshkrd_tensor,
+    compute_fastdiv_mods,
+    domain_offset_aligned,
+    ex2_emulation_2,
+)
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -57,8 +65,6 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
         assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
-        assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
-        assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
         assert not paged_kv_non_tma, (
             "SM100 hd256 2CTA supports TMA paged KV only (page_size must equal tile_n=128)"
         )
@@ -106,6 +112,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
+        self.mask_mod = mask_mod
+        self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
 
@@ -188,12 +196,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
-        )
-        assert aux_data.tensors is None, (
-            "SM100 forward with head_dim=256 does not support aux_tensors"
-        )
-        assert aux_data.scalars is None, (
-            "SM100 forward with head_dim=256 does not support aux_scalars"
         )
         if cutlass.const_expr(mSeqUsedQ is None and mSeqUsedK is None):
             assert not self.is_local, (
@@ -356,6 +358,15 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             page_table = None
             max_seqlen_k_paged = None
+
+        fastdiv_mods = compute_fastdiv_mods(
+            q,
+            k,
+            self.qhead_per_kvhead,
+            False,
+            aux_data.tensors,
+            page_table,
+        )
         # (s, d, ((h_r, h_k), b))
         o = cute.make_tensor(
             o_norm.iterator,
@@ -629,6 +640,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             v_smem_layout_staged,
             self.tile_sched_params,
             TileScheduler,
+            aux_data,
+            fastdiv_mods,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -671,6 +684,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         v_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | SingleTileVarlenScheduler.Params,
         TileScheduler: cutlass.Constexpr,
+        aux_data: AuxData = AuxData(),
+        fastdiv_mods=(None, None),
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1358,10 +1373,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                 while work_tile.is_valid_tile:
                     curr_block_coord = work_tile.tile_idx
                     mma_block_coord = (
-                    curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
-                    curr_block_coord[1],
-                    curr_block_coord[2],
-                )
+                        curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
+                        curr_block_coord[1],
+                        curr_block_coord[2],
+                    )
                     batch_coord = curr_block_coord[2][1]
                     seqlen_info = SeqlenInfoQK.create(batch_coord, *seqlen_info_args)
                     seqlen_q = seqlen_info.seqlen_q
@@ -1372,17 +1387,29 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                    tile_fastdiv_mods = fastdiv_mods
+                    if cutlass.const_expr(tile_fastdiv_mods is not None):
+                        q_divmod, k_divmod = tile_fastdiv_mods
+                        if cutlass.const_expr(
+                            seqlen_info.has_cu_seqlens_q or seqlen_info.has_seqused_q
+                        ):
+                            q_divmod = FastDivmodDivisor(seqlen_q)
+                        if cutlass.const_expr(
+                            seqlen_info.has_cu_seqlens_k or seqlen_info.has_seqused_k
+                        ):
+                            k_divmod = FastDivmodDivisor(seqlen_k)
+                        tile_fastdiv_mods = q_divmod, k_divmod
                     if cutlass.const_expr(has_seqused):
                         start_count = sTripSoftmax[0]
                         trip_count = sTripSoftmax[1]
                     else:
                         start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        *trip_mask_args,
-                    )
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            *trip_mask_args,
+                        )
                         trip_count = cutlass.max(trip_count, 0)
                     q_tile_valid = not continue_cond
                     if q_tile_valid and trip_count == 0:
@@ -1412,54 +1439,69 @@ class BlackwellFusedMultiHeadAttentionForward:
                             )
                         )
                         cS_base = cute.make_identity_tensor(
-                        (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-                    )
-                        cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
+                            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+                        )
+                        cS = cute.domain_offset(
+                            (mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base
+                        )
                         tScS = qk_thr_mma.partition_C(cS)
 
                         for step in cutlass.range(start_count, end_count, 1, unroll=1):
                             cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                             tScS_iter = qk_thr_mma.partition_C(cS_iter)
+                            mask_seqlen = step == end_count - 1
                             if cutlass.const_expr(self.use_semantic_trip_range):
                                 need_apply_mask = (
-                                step >= n_block_min_causal_local_mask
-                                or step < n_block_min_before_local_mask
-                                or step == end_count - 1
-                            )
+                                    step >= n_block_min_causal_local_mask
+                                    or step < n_block_min_before_local_mask
+                                    or mask_seqlen
+                                )
                             else:
-                            # Residual path only needs seqlen masking on the last K tile.
-                                need_apply_mask = step == end_count - 1
+                                # Residual path only needs seqlen masking on the last K tile.
+                                need_apply_mask = mask_seqlen
                             (
-                            row_max,
-                            row_sum,
-                            mma_s_consumer,
-                            p_mma_producer,
-                            s_corr_producer,
-                        ) = self.softmax_step(
-                            (need_apply_mask, q_tile_full, step, window_size_left, window_size_right),
-                            (
-                                row_max_prev,
+                                row_max,
                                 row_sum,
-                                seqlen_q,
-                                seqlen_k,
-                                scale_softmax_log2,
-                            ),
-                            (tStS, tScS_iter),
-                            (mma_s_consumer, p_mma_producer, s_corr_producer),
-                        )
+                                mma_s_consumer,
+                                p_mma_producer,
+                                s_corr_producer,
+                            ) = self.softmax_step(
+                                (
+                                    need_apply_mask,
+                                    q_tile_full,
+                                    step,
+                                    window_size_left,
+                                    window_size_right,
+                                    mma_block_coord[0],
+                                    batch_coord,
+                                    curr_block_coord[2][0],
+                                ),
+                                (
+                                    row_max_prev,
+                                    row_sum,
+                                    seqlen_q,
+                                    seqlen_k,
+                                    scale_softmax_log2,
+                                ),
+                                (tStS, tScS_iter, qk_thr_mma),
+                                (mma_s_consumer, p_mma_producer, s_corr_producer),
+                                seqlen_info,
+                                aux_data,
+                                tile_fastdiv_mods,
+                            )
                             row_max_prev = row_max
                         sum_producer = self.store_sum_max(
-                        row_max,
-                        mLSE,
-                        row_sum,
-                        sSum,
-                        sum_producer,
-                        curr_block_coord,
-                        seqlen_q,
-                        cum_seqlen_q,
-                        offset_q,
-                        scale_softmax,
-                    )
+                            row_max,
+                            mLSE,
+                            row_sum,
+                            sSum,
+                            sum_producer,
+                            curr_block_coord,
+                            seqlen_q,
+                            cum_seqlen_q,
+                            offset_q,
+                            scale_softmax,
+                        )
                     work_tile = tile_sched.advance_to_next_work()
                 p_mma_producer.tail()
                 s_corr_producer.tail()
@@ -1630,10 +1672,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         value_args: Tuple,
         tensor_args: Tuple,
         pipeline_args: Tuple,
+        seqlen_info: SeqlenInfoQK,
+        aux_data: AuxData = AuxData(),
+        fastdiv_mods=(None, None),
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        need_apply_mask, q_tile_full, step, window_size_left, window_size_right = mask_args
+        (
+            need_apply_mask,
+            q_tile_full,
+            step,
+            window_size_left,
+            window_size_right,
+            m_block,
+            batch_idx,
+            head_idx,
+        ) = mask_args
+        n_block = step
         row_max, row_sum, seqlen_q, seqlen_k, scale_softmax_log2 = value_args
-        tStS, tScS = tensor_args
+        tStS, tScS, qk_thr_mma = tensor_args
         mma_s_consumer, p_mma_producer, s_corr_producer = pipeline_args
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
@@ -1652,6 +1707,28 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
+        if cutlass.const_expr(self.mask_mod is not None):
+            mask = AttentionMask(
+                self.qk_mma_tiler[0],
+                self.qk_mma_tiler[1],
+                seqlen_info,
+            )
+            mask.apply_mask_sm100(
+                tTMEM_LOADrS,
+                m_block,
+                n_block,
+                qk_thr_mma,
+                thr_load,
+                True,
+                False,
+                mask_mod=self.mask_mod,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                aux_data=aux_data,
+                fastdiv_mods=fastdiv_mods,
+                vec_size=self.mask_vec_size,
+                check_q_boundary=True,
+            )
         if need_apply_mask:
             if cutlass.const_expr(self.mask_residual):
                 k_tile_full = (step + 1) * self.qk_mma_tiler[1] <= seqlen_k

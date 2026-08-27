@@ -96,6 +96,25 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime value-dimension shared-memory test",
+)
+def test_flash_attn_value_dim_larger_than_query_dim():
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 769, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 769, 8, 128, device="cuda", dtype=torch.bfloat16)
+
+    out = _flash_attn_fwd(q, k, v)[0]
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])

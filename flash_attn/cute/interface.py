@@ -3493,7 +3493,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 12)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):

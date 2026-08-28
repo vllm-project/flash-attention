@@ -67,6 +67,49 @@ def test_splitkv_forwards_explicit_arch(monkeypatch):
         _flash_attn_fwd(q, k, v, num_splits=2, _arch=100)
 
 
+def test_flash_attn_combine_batch_idx_keyword_compatibility(monkeypatch):
+    captured_batch_indices = []
+
+    def record_combine(*args, **kwargs):
+        captured_batch_indices.append(kwargs["virtual_batch_idx"])
+
+    monkeypatch.setattr(interface, "_flash_attn_fwd_combine", record_combine)
+    out_partial = torch.empty(2, 1, 1, 1, 1, dtype=torch.float32)
+    lse_partial = torch.empty(2, 1, 1, 1, dtype=torch.float32)
+    batch_idx = torch.tensor([0], dtype=torch.int32)
+
+    flash_attn_combine(
+        out_partial,
+        lse_partial,
+        virtual_batch_idx=batch_idx,
+    )
+    flash_attn_combine(
+        out_partial,
+        lse_partial,
+        varlen_batch_idx=batch_idx,
+    )
+    flash_attn_combine(
+        out_partial,
+        lse_partial,
+        None,
+        None,
+        None,
+        None,
+        batch_idx,
+        False,
+    )
+
+    assert len(captured_batch_indices) == 3
+    assert all(value is batch_idx for value in captured_batch_indices)
+    with pytest.raises(ValueError, match="cannot both be provided"):
+        flash_attn_combine(
+            out_partial,
+            lse_partial,
+            virtual_batch_idx=batch_idx,
+            varlen_batch_idx=batch_idx,
+        )
+
+
 @pytest.mark.skipif(USE_FAKE_TENSOR, reason="Runtime combine optional-input test")
 def test_flash_attn_combine_dynamic_splits_and_semaphore(monkeypatch):
     torch.manual_seed(0)

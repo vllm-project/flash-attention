@@ -4089,6 +4089,8 @@ def flash_attn_combine(
     seqused: Optional[torch.Tensor] = None,
     virtual_batch_idx: Optional[torch.Tensor] = None,
     return_lse: bool = True,
+    *,
+    varlen_batch_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Flash Attention combine function for split attention computation.
 
@@ -4111,6 +4113,7 @@ def flash_attn_combine(
             (int32 tensor of shape (batch_size,)). Used by persistent tile schedulers
             that reorder batch processing for load balancing.
         return_lse: Whether to return the combined LSE tensor. Default is True.
+        varlen_batch_idx: Compatibility alias for virtual_batch_idx.
 
     Returns:
         Tuple of (out, lse) where:
@@ -4124,6 +4127,13 @@ def flash_attn_combine(
         split attention computation, where the first dimension is num_splits.
         The permuting from user format to kernel format is now done inside the kernel.
     """
+    if varlen_batch_idx is not None:
+        if virtual_batch_idx is not None:
+            raise ValueError(
+                "virtual_batch_idx and varlen_batch_idx cannot both be provided"
+            )
+        virtual_batch_idx = varlen_batch_idx
+
     # Input validation
     assert out_partial.dim() in [4, 5], "out_partial must have 4 or 5 dimensions"
     # Determine if this is variable length based on dimensions

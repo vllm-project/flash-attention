@@ -37,6 +37,7 @@ class FlashAttentionForwardCombine:
         log_max_splits: int = 4,
         num_threads: int = 256,
         stages: int = 4,
+        output_quant_key: Optional[cutlass.Constexpr[str]] = None,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -51,6 +52,8 @@ class FlashAttentionForwardCombine:
         :param num_threads: number of threads
         :param varlen: whether using variable length sequences
         :param stages: number of pipeline stages
+        :param output_quant_key: compile-time tag for fused quant output,
+            see FlashAttentionForwardBase for more details.
         """
         self.dtype = dtype
         self.dtype_partial = dtype_partial
@@ -62,6 +65,7 @@ class FlashAttentionForwardCombine:
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
+        self.output_quant_key = output_quant_key
 
     @staticmethod
     def can_implement(
@@ -74,7 +78,12 @@ class FlashAttentionForwardCombine:
         num_threads,
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters."""
-        if dtype not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]:
+        if dtype not in [
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float32,
+            cutlass.Float8E4M3FN,
+        ]:
             return False
         if dtype_partial not in [cutlass.Float16, cutlass.BFloat16, Float32]:
             return False
@@ -209,6 +218,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         virtual_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
+        output_scale: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -341,6 +351,7 @@ class FlashAttentionForwardCombine:
             seqlen_divmod,
             head_divmod,
             varlen,
+            output_scale,
             tile_sched_params,
             TileScheduler,
         ).launch(
@@ -372,6 +383,7 @@ class FlashAttentionForwardCombine:
         seqlen_divmod: FastDivmodDivisor,
         head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
+        output_scale: Optional[cute.Tensor],
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
     ):
@@ -380,6 +392,10 @@ class FlashAttentionForwardCombine:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, k_block, maybe_virtual_batch, _ = work_tile.tile_idx
+
+        # Load FP8 output scale and invert in-kernel.
+        if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+            output_scale_inv = Float32(1.0) / Float32(output_scale[0])
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
         batch_idx = (
@@ -684,7 +700,11 @@ class FlashAttentionForwardCombine:
                 # ===============================
 
                 rO = cute.make_rmem_tensor_like(tOrO, self.dtype)
-                rO.store(tOrO.load().to(self.dtype))
+                # Fold per-tensor output scale into the cast (fused FP8 out).
+                if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+                    rO.store((tOrO.load() * output_scale_inv).to(self.dtype))
+                else:
+                    rO.store(tOrO.load().to(self.dtype))
                 if const_expr(cu_seqlens is None):
                     mO_cur = mO[None, None, None, batch_idx]
                 else:

@@ -16,6 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
+from quack.compile_utils import make_fake_tensor as fake_tensor
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -67,7 +68,18 @@ def get_num_sms_for_selection(device_index: int, arch: int) -> int:
     )
 
 
+def _is_compile_only_tensor_spec(tensor) -> bool:
+    return (
+        not isinstance(tensor, torch.Tensor)
+        and hasattr(tensor, "_cute_tensor")
+        and hasattr(tensor, "_assumed_align")
+    )
+
+
 def _has_aligned_pointer(tensor: torch.Tensor, align_bytes: int) -> bool:
+    if _is_compile_only_tensor_spec(tensor):
+        assumed_align = tensor._assumed_align
+        return assumed_align is not None and assumed_align % align_bytes == 0
     address = (
         tensor.storage_offset() * tensor.element_size()
         if isinstance(tensor, FakeTensor)
@@ -81,13 +93,26 @@ def _is_aligned_layout(tensor: torch.Tensor, align_bytes: int) -> bool:
     if tensor.stride(-1) != 1 or not _has_aligned_pointer(tensor, align_bytes):
         return False
     stride_alignment = max(1, align_bytes // tensor.element_size())
-    return all(stride == 0 or stride % stride_alignment == 0 for stride in tensor.stride()[:-1])
+    strides = tensor.stride()[:-1]
+    if _is_compile_only_tensor_spec(tensor):
+        return all(
+            not isinstance(stride, int) or stride == 0 or stride % stride_alignment == 0
+            for stride in strides
+        )
+    return all(stride == 0 or stride % stride_alignment == 0 for stride in strides)
 
 
 def maybe_contiguous(tensor: torch.Tensor | None, align_bytes: int = 16):
     """Canonicalize inputs to the pointer and stride alignment kernels assume."""
     if tensor is None:
         return None
+    if _is_compile_only_tensor_spec(tensor):
+        if not _is_aligned_layout(tensor, align_bytes):
+            raise ValueError(
+                "Compile-only tensor specs must describe an aligned layout with a "
+                "contiguous last dimension"
+            )
+        return tensor
     if tensor.is_contiguous():
         return (
             tensor
@@ -101,6 +126,14 @@ def maybe_contiguous(tensor: torch.Tensor | None, align_bytes: int = 16):
 
 def validate_output_layout(tensor: torch.Tensor, name: str, align_bytes: int) -> None:
     """Validate a caller-provided output or SplitKV workspace."""
+    if _is_compile_only_tensor_spec(tensor):
+        assert not any(isinstance(stride, int) and stride == 0 for stride in tensor.stride()), (
+            f"{name} must not have broadcast dimensions"
+        )
+        assert _is_aligned_layout(tensor, align_bytes), (
+            f"{name} must have aligned strides and a contiguous last dimension"
+        )
+        return
     assert 0 not in tensor.stride(), f"{name} must not have broadcast dimensions"
     if tensor.is_contiguous():
         assert _has_aligned_pointer(tensor, align_bytes), (
@@ -134,6 +167,24 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     if t is None:
         return None
+    if hasattr(t, "_cute_tensor"):
+        # Compile-only fake tensor. cutlass-dsl 4.6.0 removed mark_layout_dynamic()
+        # on fake tensors, so express the dynamic layout at construction instead
+        # (equivalent to from_dlpack(...).mark_layout_dynamic(leading_dim=...)).
+        cute_dtype = t._cute_tensor.element_type
+        ndim = t.ndim
+        if fully_dynamic:
+            leading_dim = None
+        elif leading_dim == -1:
+            leading_dim = ndim - 1
+        divisibility = max(1, assumed_align * 8 // cute_dtype.width) if assumed_align else 1
+        return fake_tensor(
+            cute_dtype,
+            tuple(cute.sym_int() for _ in range(ndim)),
+            divisibility=divisibility,
+            leading_dim=leading_dim,
+        )
+
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
@@ -155,13 +206,14 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def to_cute_aux_tensor(t, enable_tvm_ffi=True):
+def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
     This allows the user to specify alignment and leading dimension for aux tensors used in
     custom score_mod callables.
     """
     assumed_align: int = getattr(t, "__assumed_align__", None)
-    leading_dim: int = getattr(t, "__leading_dim__", None)
+    if leading_dim is None:
+        leading_dim = getattr(t, "__leading_dim__", None)
     fully_dynamic: bool = leading_dim is None
 
     return to_cute_tensor(
@@ -173,9 +225,10 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
     )
 
 
-def _resolve_aux_leading_dim(tensor: torch.Tensor) -> int | None:
+def _resolve_aux_leading_dim(tensor: torch.Tensor, leading_dim: int | None = None) -> int | None:
     """Pick the mode CuTe keeps as a static stride-1 leading dimension."""
-    leading_dim = getattr(tensor, "__leading_dim__", None)
+    if leading_dim is None:
+        leading_dim = getattr(tensor, "__leading_dim__", None)
     if leading_dim is not None:
         if tensor.ndim == 0:
             raise ValueError("Scalar aux tensors cannot declare __leading_dim__")
@@ -193,11 +246,16 @@ def _resolve_aux_leading_dim(tensor: torch.Tensor) -> int | None:
     return nontrivial_dims[0]
 
 
-def get_aux_tensor_metadata(aux_tensors):
+def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
     """Return the static aux-tensor ABI facts that must key the compile cache."""
+    if aux_tensor_leading_dims is not None:
+        assert len(aux_tensor_leading_dims) == len(aux_tensors)
+    else:
+        aux_tensor_leading_dims = [None] * len(aux_tensors)
+
     metadata = []
-    for tensor in aux_tensors:
-        leading_dim = _resolve_aux_leading_dim(tensor)
+    for tensor, leading_dim in zip(aux_tensors, aux_tensor_leading_dims):
+        leading_dim = _resolve_aux_leading_dim(tensor, leading_dim)
         static_strides = tuple(
             0 if stride == 0 else 1 if dim == leading_dim else None
             for dim, stride in enumerate(tensor.stride())

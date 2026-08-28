@@ -208,6 +208,7 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    nested_mbh_coord: cutlass.Constexpr[bool] = False
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     virtual_batch_idx_ptr: Optional[cute.Tensor] = None
@@ -886,6 +887,7 @@ class VarlenDecoder(ParamsBase):
     head_swizzle: cutlass.Constexpr[bool] = False
     cluster_shape_m: cutlass.Constexpr[int] = 1
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    nested_mbh_coord: cutlass.Constexpr[bool] = False
     fold_splits_into_scan: cutlass.Constexpr[bool] = False
     scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
     mCuSeqlensQ: Optional[cute.Tensor] = None
@@ -906,6 +908,8 @@ class VarlenDecoder(ParamsBase):
         fold_splits_into_scan: bool,
         head_swizzle: bool = False,
         cluster_shape_m: int = 1,
+        use_cluster_idx: bool = False,
+        nested_mbh_coord: bool = False,
         scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
         loc=None,
         ip=None,
@@ -928,7 +932,8 @@ class VarlenDecoder(ParamsBase):
             lpt=args.lpt,
             head_swizzle=head_swizzle,
             cluster_shape_m=cluster_shape_m,
-            use_cluster_idx=args.use_cluster_idx,
+            use_cluster_idx=use_cluster_idx,
+            nested_mbh_coord=nested_mbh_coord,
             fold_splits_into_scan=fold_splits_into_scan,
             scheduling_mode=scheduling_mode,
             mCuSeqlensQ=args.mCuSeqlensQ,
@@ -1214,6 +1219,8 @@ class SingleTileVarlenScheduler:
                 fold_splits_into_scan=False,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
+                use_cluster_idx=args.use_cluster_idx,
+                nested_mbh_coord=args.nested_mbh_coord,
                 scheduling_mode=scheduling_mode,
                 loc=loc,
                 ip=ip,
@@ -1315,10 +1322,10 @@ class SingleTileVarlenScheduler:
             if is_valid:
                 num_splits = Int32(d.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
-        return WorkTileInfo(
-            (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)),
-            is_valid,
-        )
+        tile_idx = (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx))
+        if const_expr(d.nested_mbh_coord):
+            tile_idx = (Int32(block), Int32(0), (Int32(head_idx), Int32(batch_idx)))
+        return WorkTileInfo(tile_idx, is_valid)
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
@@ -1606,6 +1613,8 @@ class Sm100FmhaStaticTileSchedulerParams:
         is_persistent: bool,
         problem_shape_mbh: cute.Shape,
         *,
+        lpt: cutlass.Constexpr[bool] = False,
+        l2_swizzle: cutlass.Constexpr[bool] = False,
         loc=None,
         ip=None,
     ):
@@ -1619,6 +1628,8 @@ class Sm100FmhaStaticTileSchedulerParams:
         """
         self.is_persistent = is_persistent
         self.problem_shape_mbh = problem_shape_mbh
+        self.lpt = lpt
+        self.l2_swizzle = l2_swizzle
         self._loc = loc
         self._ip = ip
 
@@ -1636,7 +1647,11 @@ class Sm100FmhaStaticTileSchedulerParams:
             obj_list.append(new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return Sm100FmhaStaticTileSchedulerParams(
-            self.is_persistent, *(tuple(obj_list)), loc=self._loc
+            self.is_persistent,
+            *(tuple(obj_list)),
+            lpt=self.lpt,
+            l2_swizzle=self.l2_swizzle,
+            loc=self._loc,
         )
 
 
@@ -1780,6 +1795,20 @@ class Sm100FmhaStaticTileScheduler:
             )
         else:
             blk_coord = self._blk_coord
+        if const_expr(self._params.lpt):
+            num_query_clusters = cute.ceil_div(self._params.problem_shape_mbh[0], 2)
+            query_cluster = blk_coord[0] // 2
+            cta_rank = blk_coord[0] % 2
+            head = blk_coord[1]
+            if const_expr(not self._params.is_persistent and self._params.l2_swizzle):
+                linear_cluster = head * num_query_clusters + query_cluster
+                query_cluster = linear_cluster // self._params.problem_shape_mbh[1]
+                head = linear_cluster % self._params.problem_shape_mbh[1]
+            blk_coord = (
+                (num_query_clusters - 1 - query_cluster) * 2 + cta_rank,
+                head,
+                blk_coord[2],
+            )
 
         # cur_tile_coord is (mid, 0, (bid, hid))
         cur_tile_coord = (
@@ -1846,6 +1875,9 @@ def compute_sm100_fmha_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
+    *,
+    lpt: cutlass.Constexpr[bool] = False,
+    l2_swizzle: cutlass.Constexpr[bool] = False,
 ) -> Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
     """Compute grid parameters for FMHA (static scheduler).
 
@@ -1858,6 +1890,8 @@ def compute_sm100_fmha_grid(
             cute.size(o_shape[2][0]),
             cute.size(o_shape[2][1]),
         ),
+        lpt=lpt,
+        l2_swizzle=l2_swizzle,
     )
     grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
     return tile_sched_params, grid

@@ -158,6 +158,8 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        # Derived tag for fused quant output, also see FlashAttentionForwardBase
+        output_quant_key: cutlass.Constexpr[str] | None = None,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
     ):
@@ -222,6 +224,7 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.output_quant_key = output_quant_key
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
@@ -435,6 +438,7 @@ class FlashAttentionForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mDynamicCausal: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
@@ -442,6 +446,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        output_scale: Optional[cute.Tensor] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -852,6 +857,7 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            output_scale,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -915,6 +921,7 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        output_scale: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1443,7 +1450,8 @@ class FlashAttentionForwardSm100:
                 num_splits,
                 SeqlenInfoCls,
                 blocksparse_tensors,
-                tile_scheduler=tile_scheduler,
+                tile_scheduler,
+                output_scale,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2574,6 +2582,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        output_scale: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2593,6 +2602,10 @@ class FlashAttentionForwardSm100:
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
+
+        # Load FP8 output scale and invert in-kernel.
+        if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+            output_scale_inv = Float32(1.0) / Float32(output_scale[0])
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
@@ -2744,6 +2757,9 @@ class FlashAttentionForwardSm100:
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * v_descale
+                    # Fold per-tensor output scale into the existing per-row scale.
+                    if const_expr(self.output_quant_key == "kFp8StaticTensorSym"):
+                        scale = scale * output_scale_inv
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):

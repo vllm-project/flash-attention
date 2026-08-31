@@ -497,14 +497,22 @@ struct CollectiveMainloopFwdSm90 {
             args.stride_Q,
             make_stride(make_stride(get<2>(args.stride_Q), get<0>(args.stride_Q)), get<1>(args.stride_Q), get<2>(args.stride_Q) * qhead_per_khead, get<3>(args.stride_Q))
         );
-        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_packed_tma, stride_Q_packed);
+        // OnlyQv (NoPE MLA): Q and K have zero-width head dims and their TMA
+        // copies are never issued, but cuTensorMapEncodeTiled rejects a zero
+        // extent, so describe them with the static tile dim instead.
+        int const headdim_qk_tma = OnlyQv ? int(get<2>(TileShape_MNK{})) : int(get<1>(shape_Q_packed_tma));
+        auto const shape_Q_tma = make_shape(get<0>(shape_Q_packed_tma), headdim_qk_tma,
+                                            get<2>(shape_Q_packed_tma), get<3>(shape_Q_packed_tma));
+        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_tma, stride_Q_packed);
         TMA_Q tma_load_Q = make_tma_copy_A_sm90(
             GmemTiledCopyQ{},
             mQ,
             SmemLayoutQ{},
             TileShape_MNK{},
             ClusterShape{}); // no mcast for Q
-        Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
+        auto const shape_K_tma = make_shape(get<0>(args.shape_K), headdim_qk_tma,
+                                            get<2>(args.shape_K), get<3>(args.shape_K));
+        Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), shape_K_tma, args.stride_K);
         TMA_K tma_load_K = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             mK,
@@ -520,7 +528,9 @@ struct CollectiveMainloopFwdSm90 {
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
-        Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
+        auto const shape_K_new_tma = make_shape(get<0>(args.shape_K_new), headdim_qk_tma,
+                                                get<2>(args.shape_K_new), get<3>(args.shape_K_new));
+        Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), shape_K_new_tma, args.stride_K_new);
         TMA_K tma_load_K_new = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             cute::conditional_return<AppendKV>(mKnew, mK),

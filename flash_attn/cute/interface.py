@@ -241,7 +241,19 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is None:
+        return x
+    if x.stride(-1) != 1:
+        return x.contiguous()
+    # .contiguous() above only fixes stride pattern, not storage_offset(): a tensor
+    # sliced from a larger buffer can be fully "contiguous" by PyTorch's definition
+    # (packed strides for its own shape) while still starting at a nonzero offset
+    # into the underlying allocation. to_cute_tensor()/from_dlpack() exports that
+    # real offset via DLPack's byte_offset field, and the compiled cute-dsl kernel's
+    # tvm_ffi wrapper rejects any nonzero byte_offset. Force a real copy in that case.
+    if x.storage_offset() != 0:
+        return x.clone()
+    return x
 
 
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
@@ -995,6 +1007,7 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
+        q, k, v = maybe_contiguous(q), maybe_contiguous(k), maybe_contiguous(v)
         q_tensor, k_tensor, v_tensor, o_tensor = [
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]

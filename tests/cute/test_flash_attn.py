@@ -109,6 +109,20 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 hd256 forward only")
+def test_flash_attn_hd256_sm100_sm110_clamps_splitkv():
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 8192, 1, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out_ref, _ = flash_attn_func(q, k, v, num_splits=1)
+    # This shape has one M block and 64 N blocks, so auto requests SplitKV.
+    for num_splits in (0, 4):
+        out, _ = flash_attn_func(q, k, v, num_splits=num_splits)
+        assert torch.equal(out, out_ref)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime layout-cache test",

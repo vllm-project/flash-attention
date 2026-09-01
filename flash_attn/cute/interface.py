@@ -433,8 +433,13 @@ def _get_fwd_config(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
+    # hd=256 forward uses the dedicated Blackwell-family kernel, which has no
+    # SplitKV variant.
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     if arch // 10 == 12:
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
+    elif use_dedicated_hd256_kernel:
+        num_splits = 1
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)

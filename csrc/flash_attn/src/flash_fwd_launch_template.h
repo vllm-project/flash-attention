@@ -13,16 +13,20 @@
 
 namespace FLASH_NAMESPACE {
 
-// Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// Determine if the architecture supports FLASH and define a macro to handle parameter modifiers.
+// Turing (sm75) runs the fp16 path via the SM75 MMA/LDSM atoms in kernel_traits.h;
+// __grid_constant__ stays Ampere+ as upstream ships it.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
 #define ARCH_SUPPORTS_FLASH
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif
 
 // Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
+#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm75-sm90, but was built for < 7.5!");
 
 // Use a macro to clean up kernel definitions
 #define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
@@ -111,7 +115,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !Is_causal, Is_local, [&] {
                 BOOL_SWITCH(params.num_splits > 1, Split, [&] {
-                    BOOL_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
+                    APPENDKV_SWITCH(params.knew_ptr != nullptr, Append_KV, [&] {
                         ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                             SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
                                 // If Append_KV, then we must have seqlen_offsets, which means cu_seqlens_k != nullptr.
@@ -173,7 +177,23 @@ template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_align(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int kBlockM = 64;
     constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
+    // Turing (sm75): 64 KB smem per block. Matches the sm75 kBlockN of the
+    // standard kernels (hdim192/256 run 64 x 32 there) to keep numerics aligned.
+    constexpr static int kBlockN_standard_sm75 = Headdim <= 64 ? 128 : (Headdim <= 128 ? 64 : 32);
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    if (cc_major == 7) {
+        if constexpr (Headdim == 128) {
+            // Measured 2026-08-30 (RTX 8000): prefill chunks are 37 % faster
+            // with the standard-kernel tile (128 x 64, 64 KB smem) than with
+            // 64 x 64 — and it IS the standard kernel's tile, so the
+            // bitwise-numerics argument of this align path stays intact.
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_causal>(params, stream);
+            return;
+        }
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard_sm75, 4, false, false, T>, Is_causal>(params, stream);
+    } else {
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, int Headdim, bool Is_causal>
@@ -182,13 +202,25 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+    // Turing (sm75): 64 KB smem per block, so K/V tiles must shrink
+    // (tile set from farnghwai/flash-attention-2080ti). Must stay in sync with
+    // set_params_splitkv in flash_api.cpp.
+    // hdim 128 measured 2026-08-30 (RTX 8000, 31k paged KV): N=32 gives
+    // 32 KB smem = 2 CTAs/SM and is 18 % faster than N=64 for q=1..8.
+    constexpr static int kBlockN_sm75 = Headdim == 128 ? 32
+        : (Headdim <= 64 ? 128 : (Headdim <= 160 ? 64 : 32));
     if (params.num_splits == 1) {
         // Defined in flash_fwd_split_align_*.cu; declared extern in the main
         // flash_fwd_split_*.cu so this call does not re-instantiate the tree here.
         run_mha_fwd_splitkv_align<T, Headdim, Is_causal>(params, stream);
         return;
     }
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    if (cc_major == 7) {
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_sm75, 4, false, false, T>, Is_causal>(params, stream);
+    } else {
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, bool Is_causal>
@@ -281,9 +313,15 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            if (cc_major == 7) {
+                // Turing: 128 x 64 x 8 needs 96 KB smem; 64 x 32 fits in 48 KB.
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
         }
@@ -314,8 +352,11 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
         // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
         if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
-        } else {
+        } else if (max_smem_per_block >= 2 * Headdim * (64 + 2 * 64)) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            // Turing: 64 KB smem cap; 64 x 32 uses exactly 64 KB.
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
         }
         // 64 KB
         // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);

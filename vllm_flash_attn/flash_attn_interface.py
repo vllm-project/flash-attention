@@ -40,9 +40,11 @@ DEFAULT_FA_VERSION = 2
 def _is_fa2_supported(device = None) -> Tuple[bool, Optional[str]]:
     if not FA2_AVAILABLE:
         return False, f"FA2 is unavaible due to: {FA2_UNAVAILABLE_REASON}"
-    if torch.cuda.get_device_capability(device)[0] < 8:
+    # SM75 enablement: Turing (7.5) runs the fp16-only FA2 path; the C++ entry
+    # points reject bf16 inputs on sm75.
+    if torch.cuda.get_device_capability(device) < (7, 5):
         return False, \
-            "FA2 is only supported on devices with compute capability >= 8"
+            "FA2 is only supported on devices with compute capability >= 7.5"
     return True, None
     
 def _is_fa3_supported(device = None) -> Tuple[bool, Optional[str]]:

@@ -346,7 +346,11 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
     const int num_splits, const int num_sm, const Tensor &ref) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    const int block_n = cc_major == 7
+        ? (head_size == 128 ? 32
+           : (head_size <= 64 ? 128 : (head_size <= 160 ? 64 : 32)))
+        : (head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64));
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -423,11 +427,19 @@ mha_fwd(Tensor q,         // batch_size x seqlen_q x num_heads x round_multiple(
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
-    STD_TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    STD_TORCH_CHECK(is_sm8x_min || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     auto q_dtype = q.scalar_type();
     STD_TORCH_CHECK(q_dtype == ScalarType::Half || q_dtype == ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    // Turing has no bf16 tensor-core MMA; the sm75 kernels are fp16-only.
+    STD_TORCH_CHECK(!(is_sm75 && q_dtype == ScalarType::BFloat16),
+                "FlashAttention on Turing (sm75) only supports fp16 data type");
+    #ifdef FLASHATTENTION_DISABLE_BF16
+        STD_TORCH_CHECK(q_dtype != ScalarType::BFloat16,
+                "This flash attention build does not support bf16.");
+    #endif
     STD_TORCH_CHECK(k.scalar_type() == q_dtype, "query and key must have the same dtype");
     STD_TORCH_CHECK(v.scalar_type() == q_dtype, "query and value must have the same dtype");
 
@@ -600,11 +612,19 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
-    STD_TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    STD_TORCH_CHECK(is_sm8x_min || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     auto q_dtype = q.scalar_type();
     STD_TORCH_CHECK(q_dtype == ScalarType::Half || q_dtype == ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    // Turing has no bf16 tensor-core MMA; the sm75 kernels are fp16-only.
+    STD_TORCH_CHECK(!(is_sm75 && q_dtype == ScalarType::BFloat16),
+                "FlashAttention on Turing (sm75) only supports fp16 data type");
+    #ifdef FLASHATTENTION_DISABLE_BF16
+        STD_TORCH_CHECK(q_dtype != ScalarType::BFloat16,
+                "This flash attention build does not support bf16.");
+    #endif
     STD_TORCH_CHECK(k.scalar_type() == q_dtype, "query and key must have the same dtype");
     STD_TORCH_CHECK(v.scalar_type() == q_dtype, "query and value must have the same dtype");
     STD_TORCH_CHECK(cu_seqlens_q.scalar_type() == ScalarType::Int, "cu_seqlens_q must have dtype int32");
@@ -762,8 +782,9 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped || (paged_KV && max_seqlen_q <= 64)) {
         // Split-k for decoding AND for short multi-token queries (spec-decode
-        // verify): without it a paged varlen call with 1 < q_len <= 64 walks
-        // the whole KV serially in one CTA per (batch, head).
+        // verify): without splits the kernel walks the whole paged KV
+        // serially per (batch, head) — measured 20x slower than the q=1
+        // path at 31k context on sm75 (0.13 ms vs 2.6 ms per layer call).
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
@@ -896,7 +917,8 @@ mha_bwd(const Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
-    STD_TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    STD_TORCH_CHECK(is_sm8x_min || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     [[maybe_unused]] bool is_dropout = p_dropout > 0.0;
     auto stream = get_current_cuda_stream(q);
@@ -904,6 +926,13 @@ mha_bwd(const Tensor &dout,  // batch_size x seqlen_q x num_heads, x multiple_of
     auto q_dtype = q.scalar_type();
     STD_TORCH_CHECK(q_dtype == ScalarType::Half || q_dtype == ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    // Turing has no bf16 tensor-core MMA; the sm75 kernels are fp16-only.
+    STD_TORCH_CHECK(!(is_sm75 && q_dtype == ScalarType::BFloat16),
+                "FlashAttention on Turing (sm75) only supports fp16 data type");
+    #ifdef FLASHATTENTION_DISABLE_BF16
+        STD_TORCH_CHECK(q_dtype != ScalarType::BFloat16,
+                "This flash attention build does not support bf16.");
+    #endif
     STD_TORCH_CHECK(k.scalar_type() == q_dtype, "query and key must have the same dtype");
     STD_TORCH_CHECK(v.scalar_type() == q_dtype, "query and value must have the same dtype");
     STD_TORCH_CHECK(out.scalar_type() == q_dtype, "query and out must have the same dtype");
@@ -1117,7 +1146,8 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
-    STD_TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    STD_TORCH_CHECK(is_sm8x_min || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     [[maybe_unused]] bool is_dropout = p_dropout > 0.0;
     auto stream = get_current_cuda_stream(q);
@@ -1125,6 +1155,13 @@ mha_varlen_bwd(const Tensor &dout,  // total_q x num_heads, x head_size
     auto q_dtype = q.scalar_type();
     STD_TORCH_CHECK(q_dtype == ScalarType::Half || q_dtype == ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    // Turing has no bf16 tensor-core MMA; the sm75 kernels are fp16-only.
+    STD_TORCH_CHECK(!(is_sm75 && q_dtype == ScalarType::BFloat16),
+                "FlashAttention on Turing (sm75) only supports fp16 data type");
+    #ifdef FLASHATTENTION_DISABLE_BF16
+        STD_TORCH_CHECK(q_dtype != ScalarType::BFloat16,
+                "This flash attention build does not support bf16.");
+    #endif
     STD_TORCH_CHECK(k.scalar_type() == q_dtype, "query and key must have the same dtype");
     STD_TORCH_CHECK(v.scalar_type() == q_dtype, "query and value must have the same dtype");
     STD_TORCH_CHECK(out.scalar_type() == q_dtype, "query and out must have the same dtype");
@@ -1342,11 +1379,23 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
-    STD_TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm75 = cc_major == 7 && cc_minor == 5;
+    STD_TORCH_CHECK(is_sm8x_min || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
     auto q_dtype = q.scalar_type();
     STD_TORCH_CHECK(q_dtype == ScalarType::Half || q_dtype == ScalarType::BFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
+    // Turing has no bf16 tensor-core MMA; the sm75 kernels are fp16-only.
+    STD_TORCH_CHECK(!(is_sm75 && q_dtype == ScalarType::BFloat16),
+                "FlashAttention on Turing (sm75) only supports fp16 data type");
+    #ifdef FLASHATTENTION_DISABLE_BF16
+        STD_TORCH_CHECK(q_dtype != ScalarType::BFloat16,
+                "This flash attention build does not support bf16.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_APPENDKV
+        STD_TORCH_CHECK(!k_.has_value() && !rotary_cos_.has_value(),
+                "This flash attention build does not support appending KV or in-kernel rotary embedding.");
+    #endif
     STD_TORCH_CHECK(kcache.scalar_type() == q_dtype, "query and key must have the same dtype");
     STD_TORCH_CHECK(vcache.scalar_type() == q_dtype, "query and value must have the same dtype");
 

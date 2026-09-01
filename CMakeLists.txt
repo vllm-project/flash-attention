@@ -22,7 +22,9 @@ set(ignoreMe "${VLLM_PYTHON_PATH}")
 set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 
 # Supported NVIDIA architectures.
-set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
+# SM75 enablement: 7.5 must survive this global filter or the FA2 arch
+# intersection below silently comes up empty for Turing-only builds.
+set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.9;9.0")
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     list(APPEND CUDA_SUPPORTED_ARCHS "10.0" "11.0" "12.0")
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
@@ -137,12 +139,36 @@ if (FA2_ENABLED)
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        # SM75 enablement: Turing builds real SASS (7.5); 8.0+PTX keeps the
+        # original behavior for Ampere and newer targets.
+        cuda_archs_loose_intersection(FA2_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
-        set_gencode_flags_for_srcs(
-            SRCS "${FA2_GEN_SRCS}"
-            CUDA_ARCHS "${FA2_ARCHS}")
+        # bf16 kernels only exist for Ampere+: the sm75 kernel traits force
+        # half_t and cannot instantiate them.
+        set(FA2_BF16_ARCHS ${FA2_ARCHS})
+        list(REMOVE_ITEM FA2_BF16_ARCHS "7.5")
+        file(GLOB FA2_BF16_GEN_SRCS "csrc/flash_attn/src/flash_fwd_*_bf16_*.cu")
+        set(FA2_FP16_GEN_SRCS ${FA2_GEN_SRCS})
+        list(REMOVE_ITEM FA2_FP16_GEN_SRCS ${FA2_BF16_GEN_SRCS})
+
+        if (FA2_BF16_ARCHS)
+            set_gencode_flags_for_srcs(
+                SRCS "${FA2_FP16_GEN_SRCS}"
+                CUDA_ARCHS "${FA2_ARCHS}")
+            set_gencode_flags_for_srcs(
+                SRCS "${FA2_BF16_GEN_SRCS}"
+                CUDA_ARCHS "${FA2_BF16_ARCHS}")
+        else()
+            # Turing-only build: drop the bf16 sources entirely and disable
+            # the bf16 dispatch path (FLASHATTENTION_DISABLE_BF16 below).
+            set(FA2_GEN_SRCS ${FA2_FP16_GEN_SRCS})
+            set(FA2_DISABLE_BF16 ON)
+            message(STATUS "FA2: Turing-only build, bf16 kernels disabled")
+            set_gencode_flags_for_srcs(
+                SRCS "${FA2_GEN_SRCS}"
+                CUDA_ARCHS "${FA2_ARCHS}")
+        endif()
     endif()
 
     define_gpu_extension_target(
@@ -178,6 +204,15 @@ if (FA2_ENABLED)
         # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage
         TORCH_TARGET_VERSION=0x020A000000000000ULL
     )
+
+    if (FA2_DISABLE_BF16)
+        # Turing-only build: no bf16 kernels, and no in-kernel KV-append
+        # (its rotary copies break against the sm75 non-cp.async copy atoms;
+        # vLLM never uses either path).
+        target_compile_definitions(_vllm_fa2_C PRIVATE
+            FLASHATTENTION_DISABLE_BF16
+            FLASHATTENTION_DISABLE_APPENDKV)
+    endif()
 
     # Pin the C++ standard on the target itself. When flash-attn is built as a
     # vLLM subproject (FetchContent), the directory-level CMAKE_CXX_STANDARD set
@@ -316,8 +351,6 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         FLASHATTENTION_DISABLE_APPENDKV
         CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED
         CUTLASS_ENABLE_GDC_FOR_SM90
-        TORCH_TARGET_VERSION=0x020A000000000000ULL
-        USE_CUDA
     )
 
     # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.

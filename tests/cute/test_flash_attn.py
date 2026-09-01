@@ -82,6 +82,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM110 = torch.cuda.get_device_capability()[0] == 11
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
@@ -94,6 +95,20 @@ def test_flash_attn_sm120_rejects_splitkv():
     v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
+
+
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 hd256 forward only")
+def test_flash_attn_hd256_sm100_sm110_clamps_splitkv():
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 1, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 8192, 1, 256, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out_ref, _ = flash_attn_func(q, k, v, num_splits=1)
+    # This shape has one M block and 64 N blocks, so auto requests SplitKV.
+    for num_splits in (0, 4):
+        out, _ = flash_attn_func(q, k, v, num_splits=num_splits)
+        assert torch.equal(out, out_ref)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

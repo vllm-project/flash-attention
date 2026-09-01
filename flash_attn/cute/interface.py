@@ -708,8 +708,13 @@ def _flash_attn_fwd(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
+
+    # hd=256 forward uses the dedicated Blackwell-family kernel.
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     if arch // 10 == 12:
         assert num_splits == 1, "SM120 forward only supports num_splits=1"
+    elif use_dedicated_hd256_kernel:
+        num_splits = 1  # the dedicated hd=256 kernel has no SplitKV variant
     elif num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
@@ -755,8 +760,6 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 forward uses the dedicated Blackwell-family kernel.
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
     if use_dedicated_hd256_kernel:
         hd256_varlen_b1 = cu_seqlens_q is not None and batch_size == 1

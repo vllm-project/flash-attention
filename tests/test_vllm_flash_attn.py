@@ -522,3 +522,145 @@ def test_sparse_attention_varlen(
         f"{torch.max(torch.abs(out - ref_out))}"
     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(lse - ref_lse))}"
+
+
+# ---------------------------------------------------------------------------
+# Split-k over varlen paged KV with uniform query lengths.
+#
+# The existing test_varlen_with_paged_kv cases all use RAGGED query lengths
+# ([1, 5, 129]), so none of them reach the uniform-q branch. These do: every
+# sequence submits the same number of query tokens, which is what speculative
+# decoding produces (num_speculative_tokens + 1 per sequence per verify step).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("num_seqs,query_len", [(3, 8), (4, 2), (8, 1), (2, 100)])
+@pytest.mark.parametrize("kv_lens", [[4096, 1500, 33, 20000, 8, 12000, 700, 65]])
+@pytest.mark.parametrize("num_heads", [(4, 4), (16, 2)])
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("sliding_window", [None])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("soft_cap", [None, 30.0])
+@torch.inference_mode()
+def test_varlen_paged_uniform_query_len(
+        num_seqs: int,
+        query_len: int,
+        kv_lens: List[int],
+        num_heads: Tuple[int, int],
+        head_size: int,
+        block_size: int,
+        sliding_window: Optional[int],
+        dtype: torch.dtype,
+        soft_cap: Optional[float],
+) -> None:
+    """Uniform query lengths make the packed q layout dense-equivalent, which is
+    the precondition for split-k on this path. Checks output AND softmax_lse: the
+    combine kernel writes the LSE through a dense (b, h, seqlen_q) mapping, so an
+    output-only check would miss a stride error there."""
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    kv_lens = kv_lens[:num_seqs]
+    num_query_heads, num_kv_heads = num_heads
+    assert num_query_heads % num_kv_heads == 0
+    query_lens = [query_len] * num_seqs
+    max_kv_len = max(kv_lens)
+    window_size = ((sliding_window, sliding_window)
+                   if sliding_window is not None else (-1, -1))
+    scale = head_size**-0.5
+    num_blocks = 2048
+
+    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size,
+                            dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0, num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output, lse = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=seqused_k,
+        max_seqlen_q=query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        fa_version=2,
+        return_softmax_lse=True,
+    )
+
+    ref = ref_paged_attn(query=query,
+                         key_cache=key_cache,
+                         value_cache=value_cache,
+                         query_lens=query_lens,
+                         kv_lens=kv_lens,
+                         block_tables=block_tables,
+                         scale=scale,
+                         sliding_window=sliding_window,
+                         soft_cap=soft_cap)
+    torch.testing.assert_close(output, ref, atol=2e-2, rtol=1e-2), \
+        f"{torch.max(torch.abs(output - ref))}"
+    assert lse.shape == (num_query_heads, sum(query_lens)), \
+        f"unpadded LSE shape wrong: {lse.shape}"
+    assert torch.isfinite(lse).all(), "LSE contains non-finite values"
+
+
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@torch.inference_mode()
+def test_varlen_paged_split_k_engages_only_when_uniform(head_size: int) -> None:
+    """Positive and negative control for the uniform-q split-k branch.
+
+    Without this, a green suite shows only that nothing crashed -- not that the new
+    branch ran. The splitkv combine kernel is launched if and only if num_splits > 1,
+    so its presence in a profiler trace is direct evidence that split-k engaged, and
+    its absence on ragged input is direct evidence the guard still holds.
+    """
+    from torch.profiler import profile, ProfilerActivity
+    torch.set_default_device("cuda")
+    torch.cuda.manual_seed_all(0)
+    block_size, num_blocks, nq, nk = 16, 2048, 8, 2
+    kv_len, q_len, num_seqs = 32768, 8, 3
+    scale = head_size**-0.5
+
+    def run(query_lens):
+        query = torch.randn(sum(query_lens), nq, head_size, dtype=torch.bfloat16)
+        kc = torch.randn(num_blocks, block_size, nk, head_size, dtype=torch.bfloat16)
+        vc = torch.randn_like(kc)
+        cu = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+            dim=0, dtype=torch.int32)
+        su = torch.tensor([kv_len] * len(query_lens), dtype=torch.int32)
+        bt = torch.randint(0, num_blocks,
+                           (len(query_lens),
+                            (kv_len + block_size - 1) // block_size),
+                           dtype=torch.int32)
+        call = lambda: flash_attn_varlen_func(
+            q=query, k=kc, v=vc, cu_seqlens_q=cu, seqused_k=su,
+            max_seqlen_q=max(query_lens), max_seqlen_k=kv_len,
+            softmax_scale=scale, causal=True, block_table=bt, fa_version=2)
+        for _ in range(2):
+            call()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            out = call()
+            torch.cuda.synchronize()
+        engaged = any("combine" in e.key.lower() for e in prof.key_averages())
+        return out, engaged
+
+    out, engaged = run([q_len] * num_seqs)
+    assert engaged, "split-k did not engage on uniform query lengths"
+    assert torch.isfinite(out).all()
+
+    out, engaged = run([q_len, q_len, q_len - 1])
+    assert not engaged, "split-k engaged on RAGGED query lengths -- the dense combine " \
+                        "indexing is invalid there"
+    assert torch.isfinite(out).all()

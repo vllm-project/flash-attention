@@ -760,8 +760,52 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
                                p_dropout, num_splits, get_num_sm(get_current_device()), q);
     } else if (paged_KV) {
-        STD_TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
-        params.num_splits = num_splits;
+        // Split-k over varlen paged KV is safe exactly when the packed query layout is
+        // dense-equivalent, i.e. every sequence contributes the same number of query
+        // tokens. The splitkv accumulators are sized {num_splits, b, h, max_seqlen_q}
+        // (set_params_splitkv) and the combine kernel indexes them -- and the output --
+        // densely as b * h * seqlen_q, where params.seqlen_q == max_seqlen_q on this path.
+        // It never reads cu_seqlens_q. So when total_q == batch_size * max_seqlen_q the
+        // packed and dense layouts coincide and that indexing is exact; when query
+        // lengths are ragged it is not, which is what the original blanket check guarded.
+        //
+        // The uniform case is the norm for speculative decoding: every sequence submits
+        // exactly num_speculative_tokens + 1 query tokens per verify step. Forcing
+        // num_splits = 1 there launches only batch_size * num_heads CTAs, which serialises
+        // over the KV length; with split-k restored the verify step parallelises like the
+        // decode path it already uses. (Measurements in the PR description.)
+        //
+        // Precondition, same one the seqlenq_ngroups_swapped branch above already relies
+        // on: max_seqlen_q must be exact and total_q == cu_seqlens_q[b]. vLLM satisfies
+        // both. If a caller under-reports max_seqlen_q the dense combine indexing is
+        // wrong -- hence the equality test rather than a per-sequence scan.
+        const bool uniform_q = (total_q == batch_size * max_seqlen_q);
+        if (uniform_q) {
+            // The combine kernel addresses the output as
+            //   o_ptr + batch_idx * o_batch_stride + head_idx * o_head_stride + row * o_row_stride
+            // (flash_fwd_kernel.h). On the varlen path o_batch_stride is never assigned --
+            // set_params_fprop only fills it when cu_seqlens_q == nullptr -- so it is still 0
+            // here and every sequence would be written into batch 0. Under the uniform-q
+            // precondition the packed output is exactly dense, so the batch stride is simply
+            // max_seqlen_q rows. (Q reads remain correct via sum_s_q in BlockInfo.)
+            params.o_batch_stride = max_seqlen_q * params.o_row_stride;
+            std::tie(softmax_lse_accum, out_accum) =
+                set_params_splitkv(params, batch_size, num_heads, head_size,
+                                   max_seqlen_k, max_seqlen_q, head_size_rounded,
+                                   p_dropout, num_splits, get_num_sm(get_current_device()), q);
+            // set_params_splitkv normalises "no split" to num_splits == 1, but the
+            // dispatcher reads == 1 as a request for the batch-invariant *align* kernel
+            // (run_mha_fwd_splitkv_align), which has different tile traits. The
+            // pre-existing paged path passes the caller's value (0) straight through, so
+            // restore it when the heuristic declined to split -- otherwise this change
+            // would silently alter kernel selection for shapes it does not split, which
+            // is outside its scope.
+            if (params.num_splits <= 1) { params.num_splits = num_splits; }
+        } else {
+            STD_TORCH_CHECK(num_splits <= 1,
+                            "num_splits > 1 is not supported for varlen paged KV with ragged query lengths");
+            params.num_splits = num_splits;
+        }
     }
 
     if (leftpad_k_.has_value()) {

@@ -1721,6 +1721,7 @@ class Sm100FusedMask:
         is_local: cutlass.Constexpr[bool] = False,
         window_size_left: Optional[int] = None,
         window_size_right: Optional[int] = None,
+        apply_residual: cutlass.Constexpr[bool] = True,
         index_transform: cutlass.Constexpr = lambda index_q, index_k: (
             index_q,
             index_k,
@@ -1759,6 +1760,7 @@ class Sm100FusedMask:
                         min_K_index = max(0, index_q + offset - window_size_left)
                         if index_k > max_K_index or index_k < min_K_index:
                             acc_qk[i] = -Float32.inf
-            # Residual mask is always needed for boundary protection.
-            if index_k >= seqlen_k or index_q >= seqlen_q:
-                acc_qk[i] = -Float32.inf
+            if cutlass.const_expr(apply_residual):
+                # Residual mask is needed only when a boundary tile can be partial.
+                if index_k >= seqlen_k or index_q >= seqlen_q:
+                    acc_qk[i] = -Float32.inf

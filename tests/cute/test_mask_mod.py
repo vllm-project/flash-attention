@@ -848,6 +848,32 @@ def test_parameterized_masks(
     )
 
 
+@pytest.mark.parametrize(
+    "mask_name,kv_mode",
+    [("mini_causal", "mha"), ("document", "gqa")],
+)
+def test_hd256_mask_mod_forward(mask_name, kv_mode):
+    """The dedicated path must apply masks with token, aux-tensor, and GQA-head indices."""
+    if COMPUTE_CAPABILITY not in (10, 11):
+        pytest.skip("head-dim-256 dedicated kernel is SM100/SM110-only")
+
+    _run_mask_test(
+        seqlen_q=257,
+        seqlen_k=257,
+        nheads=4,
+        kv_mode=kv_mode,
+        headdim=256,
+        dtype=torch.bfloat16,
+        mask_name=mask_name,
+        window_size=None,
+        window_left=None,
+        window_right=None,
+        tile_m=128,
+        tile_n=128,
+        use_block_sparsity=False,
+    )
+
+
 # =============================================================================
 # Vectorized mask_mod equality tests
 # Pattern: scalar mask is reference; vec mask at multiple __vec_size__ values

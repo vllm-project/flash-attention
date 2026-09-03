@@ -215,7 +215,6 @@ public:
         int const* cu_seqlens_q;
         int const* seqused_q;
         int const* prepare_seqlen_q_ptr;
-        int const* varlen_batch_idx_ptr;
     };
 
     struct StaticTileScheduler {
@@ -253,17 +252,10 @@ public:
         //     are mixed since in that case the STANDARD scheduling algo will
         //     have a lot of empty (no work) blocks in the grid.
         //
-        // The coordinate mapping for LINEARIZE_M_AND_BATCH scans the batches in
-        // groups of 32 (one warp) to locate the batch owning a linear tile id,
-        // so its per-block overhead scales as O(B / 32) warp iterations. This
-        // scan cost grows with the batch size B, so for very large B the scan
-        // can outweigh the savings from eliminating empty tiles (see
-        // choose_scheduling_algo).
-        //
 
         enum SchedulingAlgo {
-            STANDARD,
-            LINEARIZE_M_AND_BATCH,
+            STANDARD,           // Same as StaticTileScheduler
+            LINEARIZE_M_AND_BATCH,  // Linearize the M and batch dimensions into a single tile index
         };
 
         struct Params {
@@ -274,7 +266,6 @@ public:
             int const* const cu_seqlens_q;
             int const* const seqused_q;
             int const* const prepare_seqlen_q_ptr;
-            int const* const varlen_batch_idx_ptr;
             SchedulingAlgo algo;
         };
 
@@ -283,19 +274,16 @@ public:
 
         static SchedulingAlgo choose_scheduling_algo(SchedulerArguments const& args) {
             // Choose the scheduling algorithm based on how dense the grid of tiles that
-            // do actual work is. If the grid is more than 50% sparse, we linearize the M
+            // do actual work is. If the grid is more then 50% sparse, we linearize the M
             // and batch. If the grid is more than 50% dense, we use the standard scheduling
             // algorithm since its more efficient at calculating the block coordinates.
-            //
-            // The 50% density threshold is a heuristic copied from vLLM:
-            // https://github.com/vllm-project/flash-attention/blob/main/hopper/flash_fwd_combine_kernel.h#L275-L287
             // NOTE: in varlen case args.seqlen_q is the max seqlen_q across all batches
             // use lower bound to estimate when the density is more than 50%
             int lower_bound_on_non_empty_tiles = cute::ceil_div(args.total_q, kBlockM);
             int grid_size = args.b * cute::ceil_div(args.seqlen_q, kBlockM);
-            return 2 * lower_bound_on_non_empty_tiles >= grid_size
-                ? SchedulingAlgo::STANDARD
-                : SchedulingAlgo::LINEARIZE_M_AND_BATCH;
+            return 2 * lower_bound_on_non_empty_tiles >= grid_size ? 
+                SchedulingAlgo::STANDARD : 
+                SchedulingAlgo::LINEARIZE_M_AND_BATCH;
         }
 
         static Params to_underlying_arguments(SchedulerArguments const& args) { 
@@ -307,9 +295,8 @@ public:
                 args.cu_seqlens_q,
                 args.seqused_q,
                 args.prepare_seqlen_q_ptr,
-                args.varlen_batch_idx_ptr,
                 choose_scheduling_algo(args)
-            };
+            }; 
         }
 
         static dim3 get_grid_shape(SchedulerArguments const& args) {
@@ -321,12 +308,14 @@ public:
                 return {num_blocks_m, num_blocks_k, static_cast<unsigned int>(args.b)};
             }
             case SchedulingAlgo::LINEARIZE_M_AND_BATCH: {
-                // rough worst case upper bound on the number of blocks required
-                // (assuming each batch has an additional partial block)
+                // rough worst case upper bound on the number of blocks required 
+                //  (assuming each batch has an additional partial block)
                 unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
                 return {num_blocks_m, num_blocks_k, 1};
             }}
 
+            // rough worst case upper bound on the number of blocks required 
+            //  (assuming each batch has an additional partial block)
             unsigned int num_blocks_m = cute::ceil_div(args.total_q * args.num_heads, kBlockM) + args.b;
             return {num_blocks_m, num_blocks_k, 1};
         }
@@ -334,10 +323,11 @@ public:
         CUTE_DEVICE BlockCoord get_block_coord_linearized_m_and_batch(Params const& params) {
             int curr_tile_id = blockIdx.x;
 
-            // Scan through the batches in groups of 32 (one warp) to find the
-            // batch that contains the current tile_id. Compute using only the
-            // first warp of the block.
+            // Scan through the batches find the batch that contains the current
+            // tile_id. Compute using only the first warp of the block.
             if (threadIdx.x < 32) {
+                // We compute linearized tile index start and ends for each batch
+                // in groups of 32 in parallel
                 int group_start_bidb = -(cutlass::NumThreadsPerWarp);
                 int group_end_bidb = 0;
                 int group_end_tile_id = 0;
@@ -357,13 +347,7 @@ public:
                             int length = params.prepare_seqlen_q_ptr[bidb] * (!params.pack_gqa ? params.num_heads : params.num_heads_kv);
                             return cute::ceil_div(length, Int<kBlockM>{});
                         } else {
-                            // bidb is the virtual (scheduling) batch. When batches are
-                            // sorted, remap to the actual batch so the per-virtual-batch
-                            // tile count matches the data the operator reads (which uses
-                            // varlen_batch_idx_ptr[bidb]). Equivalent to prepare_seqlen_q_ptr.
-                            int const actual_bidb = params.varlen_batch_idx_ptr
-                                ? params.varlen_batch_idx_ptr[bidb] : bidb;
-                            flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{actual_bidb, 0, params.cu_seqlens_q, params.seqused_q};
+                            flash::SeqlenInfo<Varlen, kBlockM> seqlen_info{bidb, 0, params.cu_seqlens_q, params.seqused_q};
                             return cute::ceil_div(seqlen_info.seqlen * params.num_heads, Int<kBlockM>{});
                         }
                     };
@@ -388,6 +372,10 @@ public:
                 
                 int bidb = group_start_bidb + batch_idx_in_group;
                 int block_m = curr_tile_id - batch_m_start_tile_id;
+                // NOTE(lucas): not sure why this causes a block_k unused warning
+                //  just inlined `blockIdx.y` to suppress the warning
+                // int block_k = blockIdx.y;
+                // shared_storage.block_coord = {block_m, block_k, bidb};
                 BlockCoord block_coord{block_m, static_cast<int>(blockIdx.y), bidb};
                 if (threadIdx.x == 0) { shared_storage.block_coord = block_coord; }
             }

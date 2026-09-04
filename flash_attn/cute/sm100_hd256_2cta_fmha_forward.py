@@ -49,6 +49,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int = 1,
+        kv_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         score_mod=None,
@@ -72,6 +73,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert q_subtile_factor == 1, (
             "SM100 forward with head_dim=256 does not support q_subtile_factor"
+        )
+        assert kv_subtile_factor == 1, (
+            "SM100 forward with head_dim=256 does not support kv_subtile_factor"
         )
         assert m_block_size == 128 and n_block_size == 128, (
             "SM100 dedicated kernel only supports tile_m=128 and tile_n=128"
@@ -531,9 +535,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             order=(1, 0),
         )
         vO_layout = cute.make_layout((1, async_copy_elems))
-        gmem_tiled_copy_o = cute.make_tiled_copy_tv(
-            atom_universal_copy, tO_layout, vO_layout
-        )
+        gmem_tiled_copy_o = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
         # TMA load for Q
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
 
@@ -846,8 +848,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         if cutlass.const_expr(TileScheduler is SingleTileVarlenScheduler):
-            tile_sched = TileScheduler.create(
-                tile_sched_params)
+            tile_sched = TileScheduler.create(tile_sched_params)
         else:
             blk_idx = cute.arch.block_idx()
             if cutlass.const_expr(not self.use_2cta):
@@ -862,10 +863,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         seqlen_info_args = (
             mQ_qdl.shape[0],
             mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k,
-            cum_seqlen_q, cum_seqlen_k, mSeqUsedQ, mSeqUsedK,
+            cum_seqlen_q,
+            cum_seqlen_k,
+            mSeqUsedQ,
+            mSeqUsedK,
             None,  # mCuTotalMBlocks
             None,  # mCuBlockIdxOffsets
-            self.qk_mma_tiler[0], self.qk_mma_tiler[1],
+            self.qk_mma_tiler[0],
+            self.qk_mma_tiler[1],
         )
         trip_mask_args = (self.is_causal, self.is_local, window_size_left, window_size_right)
 
@@ -876,8 +881,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cute.arch.lane_idx() == 0:
                         writer_block_coord = work_tile.tile_idx
                         writer_mma_block_coord = (
-                            writer_block_coord[0]
-                            // cute.size(qk_tiled_mma.thr_id.shape),
+                            writer_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                             writer_block_coord[1],
                             writer_block_coord[2],
                         )
@@ -934,12 +938,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                     seqlen_kv_loop_start = sTripLoad[0]
                     seqlen_kv_loop_steps = sTripLoad[1]
                 else:
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        *trip_mask_args,
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            *trip_mask_args,
+                        )
                     )
                     seqlen_kv_loop_steps = cutlass.max(seqlen_kv_loop_steps, 0)
                 if not continue_cond and seqlen_kv_loop_steps > 0:
@@ -1148,12 +1154,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                     seqlen_kv_loop_start = sTripMma[0]
                     seqlen_kv_loop_steps = sTripMma[1]
                 else:
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        *trip_mask_args,
+                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                        FusedMask.get_trip_start_count_via_block_info(
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            *trip_mask_args,
+                        )
                     )
                     seqlen_kv_loop_steps = cutlass.max(seqlen_kv_loop_steps, 0)
                 if not continue_cond and seqlen_kv_loop_steps > 0:
@@ -1430,14 +1438,14 @@ class BlackwellFusedMultiHeadAttentionForward:
                         end_count = start_count + trip_count
                         if cutlass.const_expr(self.use_semantic_trip_range):
                             n_block_min_causal_local_mask, n_block_min_before_local_mask = (
-                            FusedMask.get_trip_mask_bounds_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                *trip_mask_args,
+                                FusedMask.get_trip_mask_bounds_via_block_info(
+                                    mma_block_coord,
+                                    self.qk_mma_tiler,
+                                    seqlen_q,
+                                    seqlen_k,
+                                    *trip_mask_args,
+                                )
                             )
-                        )
                         cS_base = cute.make_identity_tensor(
                             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
                         )
@@ -1585,7 +1593,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                     mma_corr_consumer, sum_consumer = self.correction_epilog(
                         (seqlen_q, scale_output),
                         (sum_consumer, sSum),
-                        (mma_corr_consumer, gO_staged, cO_staged, tOtO_staged,
+                        (
+                            mma_corr_consumer,
+                            gO_staged,
+                            cO_staged,
+                            tOtO_staged,
                             sO,
                             gmem_tiled_copy_o,
                         ),
@@ -1627,7 +1639,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         #  Empty warps reg dealloc
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx > self.load_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Cooperative TMEM Deallocation
@@ -2010,7 +2022,11 @@ class BlackwellFusedMultiHeadAttentionForward:
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         (seqlen_q, scale_output) = value_args
         (sum_consumer, sSum) = sum_args
-        (mma_o_consumer, gO_staged, cO_staged, tOtO_staged,
+        (
+            mma_o_consumer,
+            gO_staged,
+            cO_staged,
+            tOtO_staged,
             sO_staged,
             gmem_tiled_copy_o,
         ) = o_args
@@ -2055,8 +2071,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=2,
-                number_of_threads=len(self.correction_warp_ids)
-                * self.threads_per_warp,
+                number_of_threads=len(self.correction_warp_ids) * self.threads_per_warp,
             )
             self._store_o_from_smem(
                 sO,
@@ -2068,8 +2083,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             )
             cute.arch.barrier(
                 barrier_id=2,
-                number_of_threads=len(self.correction_warp_ids)
-                * self.threads_per_warp,
+                number_of_threads=len(self.correction_warp_ids) * self.threads_per_warp,
             )
         o_handle.release()
         sum_handle.release()

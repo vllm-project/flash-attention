@@ -472,7 +472,7 @@ class AttentionMask:
         batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
         ncol = const_expr(cute.size(tScS_t2r.shape))
 
-        for i in cutlass.range_constexpr(ncol):
+        for i in cutlass.range(ncol, unroll_full=True):
             row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
             col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
             global_row = row_coord + m_block * self.tile_m
@@ -1166,6 +1166,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         return n_block_min, n_block_max - n_block_min
@@ -1209,6 +1210,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, _ = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(

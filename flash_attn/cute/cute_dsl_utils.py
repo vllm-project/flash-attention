@@ -1,9 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
+import os
 from typing import Tuple
 from functools import lru_cache
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 try:
     from triton.tools.disasm import extract
@@ -40,6 +42,107 @@ def get_max_active_clusters(cluster_size):
 @lru_cache
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
+
+
+@lru_cache
+def _get_device_arch_and_num_sms(device_index: int) -> tuple[int, int]:
+    properties = torch.cuda.get_device_properties(device_index)
+    return properties.major * 10 + properties.minor, properties.multi_processor_count
+
+
+def get_num_sms_for_selection(device_index: int, arch: int) -> int:
+    """Return the SM count of the matching local GPU or cross-compilation target."""
+    override = os.getenv("FLASH_ATTENTION_NUM_SMS")
+    if override is not None:
+        num_sms = int(override)
+        if num_sms <= 0:
+            raise ValueError("FLASH_ATTENTION_NUM_SMS must be positive")
+        return num_sms
+    if torch.cuda.is_available():
+        device_arch, num_sms = _get_device_arch_and_num_sms(device_index)
+        if device_arch == arch:
+            return num_sms
+    raise RuntimeError(
+        "Cannot determine the target GPU's SM count; set FLASH_ATTENTION_NUM_SMS "
+        "when cross-compiling without a matching local GPU"
+    )
+
+
+def _is_compile_only_tensor_spec(tensor) -> bool:
+    return (
+        not isinstance(tensor, torch.Tensor)
+        and hasattr(tensor, "_cute_tensor")
+        and hasattr(tensor, "_assumed_align")
+    )
+
+
+def _has_aligned_pointer(tensor: torch.Tensor, align_bytes: int) -> bool:
+    if _is_compile_only_tensor_spec(tensor):
+        assumed_align = tensor._assumed_align
+        return assumed_align is not None and assumed_align % align_bytes == 0
+    address = (
+        tensor.storage_offset() * tensor.element_size()
+        if isinstance(tensor, FakeTensor)
+        else tensor.data_ptr()
+    )
+    return address % align_bytes == 0
+
+
+def _is_aligned_layout(tensor: torch.Tensor, align_bytes: int) -> bool:
+    """Return whether a tensor satisfies the pointer and stride ABI kernels assume."""
+    if tensor.stride(-1) != 1 or not _has_aligned_pointer(tensor, align_bytes):
+        return False
+    stride_alignment = max(1, align_bytes // tensor.element_size())
+    strides = tensor.stride()[:-1]
+    if _is_compile_only_tensor_spec(tensor):
+        return all(
+            not isinstance(stride, int) or stride == 0 or stride % stride_alignment == 0
+            for stride in strides
+        )
+    return all(stride == 0 or stride % stride_alignment == 0 for stride in strides)
+
+
+def maybe_contiguous(tensor: torch.Tensor | None, align_bytes: int = 16):
+    """Canonicalize inputs to the pointer and stride alignment kernels assume."""
+    if tensor is None:
+        return None
+    if _is_compile_only_tensor_spec(tensor):
+        if not _is_aligned_layout(tensor, align_bytes):
+            raise ValueError(
+                "Compile-only tensor specs must describe an aligned layout with a "
+                "contiguous last dimension"
+            )
+        return tensor
+    if tensor.is_contiguous():
+        return (
+            tensor
+            if _has_aligned_pointer(tensor, align_bytes)
+            else tensor.clone(memory_format=torch.contiguous_format)
+        )
+    if not _has_aligned_pointer(tensor, align_bytes):
+        return tensor.clone(memory_format=torch.contiguous_format)
+    return tensor if _is_aligned_layout(tensor, align_bytes) else tensor.contiguous()
+
+
+def validate_output_layout(tensor: torch.Tensor, name: str, align_bytes: int) -> None:
+    """Validate a caller-provided output or SplitKV workspace."""
+    if _is_compile_only_tensor_spec(tensor):
+        assert not any(isinstance(stride, int) and stride == 0 for stride in tensor.stride()), (
+            f"{name} must not have broadcast dimensions"
+        )
+        assert _is_aligned_layout(tensor, align_bytes), (
+            f"{name} must have aligned strides and a contiguous last dimension"
+        )
+        return
+    assert 0 not in tensor.stride(), f"{name} must not have broadcast dimensions"
+    if tensor.is_contiguous():
+        assert _has_aligned_pointer(tensor, align_bytes), (
+            f"{name} must have aligned strides and a contiguous last dimension"
+        )
+        return
+    assert _is_aligned_layout(tensor, align_bytes), (
+        f"{name} must have aligned strides and a contiguous last dimension"
+    )
 
 
 def assume_strides_aligned(t):
@@ -122,25 +225,43 @@ def to_cute_aux_tensor(t, leading_dim=None, enable_tvm_ffi=True):
     )
 
 
+def _resolve_aux_leading_dim(tensor: torch.Tensor, leading_dim: int | None = None) -> int | None:
+    """Pick the mode CuTe keeps as a static stride-1 leading dimension."""
+    if leading_dim is None:
+        leading_dim = getattr(tensor, "__leading_dim__", None)
+    if leading_dim is not None:
+        if tensor.ndim == 0:
+            raise ValueError("Scalar aux tensors cannot declare __leading_dim__")
+        leading_dim %= tensor.ndim
+        if tensor.stride(leading_dim) != 1:
+            raise ValueError("Aux tensor __leading_dim__ must identify a stride-1 dimension")
+        return leading_dim
+
+    unit_stride_dims = [dim for dim, stride in enumerate(tensor.stride()) if stride == 1]
+    if len(unit_stride_dims) <= 1:
+        return unit_stride_dims[0] if unit_stride_dims else None
+    nontrivial_dims = [dim for dim in unit_stride_dims if tensor.shape[dim] > 1]
+    if len(nontrivial_dims) != 1:
+        raise ValueError("Aux tensor layout has no unique stride-1 leading dimension")
+    return nontrivial_dims[0]
+
+
 def get_aux_tensor_metadata(aux_tensors, aux_tensor_leading_dims=None):
+    """Return the static aux-tensor ABI facts that must key the compile cache."""
     if aux_tensor_leading_dims is not None:
         assert len(aux_tensor_leading_dims) == len(aux_tensors)
+    else:
+        aux_tensor_leading_dims = [None] * len(aux_tensors)
 
-    return tuple(
-        (
-            getattr(t, "__assumed_align__", 0),
-            (leading_dim if leading_dim is not None else getattr(t, "__leading_dim__", -1)),
-            leading_dim is not None or hasattr(t, "__leading_dim__"),
+    metadata = []
+    for tensor, leading_dim in zip(aux_tensors, aux_tensor_leading_dims):
+        leading_dim = _resolve_aux_leading_dim(tensor, leading_dim)
+        static_strides = tuple(
+            0 if stride == 0 else 1 if dim == leading_dim else None
+            for dim, stride in enumerate(tensor.stride())
         )
-        for t, leading_dim in zip(
-            aux_tensors,
-            (
-                aux_tensor_leading_dims
-                if aux_tensor_leading_dims is not None
-                else [None] * len(aux_tensors)
-            ),
-        )
-    )
+        metadata.append((tensor.dtype, getattr(tensor, "__assumed_align__", None), static_strides))
+    return tuple(metadata)
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
@@ -150,7 +271,11 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     stride=0 as static, meaning kernels compiled with different broadcast
     patterns are not interchangeable.
     """
-    return tuple(s == 0 for s in tensor.stride())
+    strides = tensor.stride()
+    # Written this way for speed.
+    if 0 not in strides:
+        return (False,) * len(strides)
+    return tuple(stride == 0 for stride in strides)
 
 
 # credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)

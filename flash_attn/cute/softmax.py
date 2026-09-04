@@ -205,18 +205,13 @@ class Softmax(ParamsBase):
         row_scale = cute.make_fragment_like(row_max, Float32)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            row_max_scaled = row_max[r] * scale_log2
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                # if all scores are masked (row_max=-inf), exp2(sink - (-inf)) overflows
-                # set row_max/row_sum so the sink is the sole softmax contributor (matching SM100 logic)
                 if row_max[r] == -Float32.inf:
-                    row_max[r] = sink_val_cur * (LOG2_E / scale_log2)
-                    row_sum[r] = Float32(1.0)
-                else:
-                    row_sum[r] += cute.math.exp2(
-                        sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                    )
+                    row_max_scaled = sink_val_cur * LOG2_E
+                row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max_scaled, fastmath=True)
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -226,7 +221,7 @@ class Softmax(ParamsBase):
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
-                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
@@ -303,6 +298,18 @@ class SoftmaxSm100(Softmax):
                     acc_scale = 1.0
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
+
+    @cute.jit
+    def update_row_max_precomputed(
+        self, hw_row_max: Float32, is_first: int
+    ) -> Tuple[Float32, Float32]:
+        """Row max already reduced in hardware (SM103 tcgen05.ld.red): skip the
+        software fmax tree — the TMEM controller computed the max during the S load."""
+        if cutlass.const_expr(is_first):
+            row_max_new = hw_row_max
+        else:
+            row_max_new = cute.arch.fmax(hw_row_max, self.row_max[0])
+        return self.update_row_max_from_local(row_max_new, is_first)
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:

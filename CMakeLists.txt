@@ -179,6 +179,11 @@ if (FA2_ENABLED)
         TORCH_TARGET_VERSION=0x020A000000000000ULL
     )
 
+    # MSVC exposes M_* constants from <cmath> only with this definition.
+    if(MSVC)
+        target_compile_definitions(_vllm_fa2_C PRIVATE _USE_MATH_DEFINES)
+    endif()
+
     # Pin the C++ standard on the target itself. When flash-attn is built as a
     # vLLM subproject (FetchContent), the directory-level CMAKE_CXX_STANDARD set
     # above does not propagate to targets created via define_gpu_extension_target,
@@ -319,6 +324,11 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
         TORCH_TARGET_VERSION=0x020A000000000000ULL
         USE_CUDA
     )
+
+    # MSVC exposes M_* constants from <cmath> only with this definition.
+    if(MSVC)
+        target_compile_definitions(_vllm_fa3_C PRIVATE _USE_MATH_DEFINES)
+    endif()
 
     # See _vllm_fa2_C above: enforce C++20 on the target for the vLLM subproject build.
     set_target_properties(_vllm_fa3_C PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)

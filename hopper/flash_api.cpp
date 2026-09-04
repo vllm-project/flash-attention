@@ -1136,6 +1136,15 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
             params.qv_batch_stride = q_v.stride(0);
         }
     }
+    // NoPE MLA (qk_rope_head_dim == 0, e.g. GLM-5.3-Flash): the QK^T part of
+    // the query is empty, all of the query content rides in q_v, and the
+    // kernel skips the Q/K loads and the QK GEMM.
+    params.only_qv = head_size == 0;
+    TORCH_CHECK(!params.only_qv || q_v_.has_value(),
+                "head_size == 0 (NoPE) requires q_v to be provided");
+    TORCH_CHECK(!params.only_qv || !k_new_.has_value(),
+                "head_size == 0 (NoPE) does not support appending k_new/v_new; "
+                "write the new KV to the cache before the call instead");
 
     if (rotary_cos_.has_value()) {
         STD_TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");

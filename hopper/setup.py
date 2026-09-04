@@ -88,7 +88,7 @@ DISABLE_CLUSTER = True
 # DISABLE_HDIM256 = True
 DISABLE_SM8x = True
 
-DISABLE_HDIMDIFF64 = True
+DISABLE_HDIMDIFF64 = os.getenv("FLASH_ATTENTION_DISABLE_HDIMDIFF64", "TRUE") == "TRUE"  # default off for binary size; the NoPE/MLA (64_256, 64_512) kernels need FLASH_ATTENTION_DISABLE_HDIMDIFF64=FALSE
 # DISABLE_HDIMDIFF192 = True
 
 PACKGQA_ONLY = True
@@ -428,7 +428,7 @@ if not SKIP_CUDA_BUILD:
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
-    if bare_metal_version != Version("12.8"):
+    if os.getenv("FA_SKIP_TOOLCHAIN_PIN") != "1" and bare_metal_version != Version("12.8"):
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",

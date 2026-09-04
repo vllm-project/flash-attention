@@ -259,19 +259,23 @@ struct CollectiveMainloopFwdSm90 {
     using StrideRotary = cute::Stride<int64_t, _1>;
     using StrideDescale = cute::Stride<int64_t, int64_t>;
 
-    using TMA_Q = decltype(make_tma_copy_A_sm90(
+    using TMA_Q_ = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQPackedTMA{}, StrideQPacked{}),
         SmemLayoutQ{},
         TileShape_MNK{},
         ClusterShape{}));
+    // OnlyQv (NoPE MLA): Q and K have zero-width head dims and are never
+    // loaded, so their TMA descriptors are never created.
+    using TMA_Q = std::conditional_t<!OnlyQv, TMA_Q_, std::nullptr_t>;
 
-    using TMA_K = decltype(make_tma_copy_B_sm90(
+    using TMA_K_ = decltype(make_tma_copy_B_sm90(
         GmemTiledCopyKV{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
         take<0, 2>(SmemLayoutK{}),
         TileShape_MNK{},
         ClusterShape{})); // mcast along M mode for this N load, if any
+    using TMA_K = std::conditional_t<!OnlyQv, TMA_K_, std::nullptr_t>;
 
     using TMA_V = decltype(make_tma_copy(
         GmemTiledCopyKV{},
@@ -497,28 +501,36 @@ struct CollectiveMainloopFwdSm90 {
             args.stride_Q,
             make_stride(make_stride(get<2>(args.stride_Q), get<0>(args.stride_Q)), get<1>(args.stride_Q), get<2>(args.stride_Q) * qhead_per_khead, get<3>(args.stride_Q))
         );
-        // OnlyQv (NoPE MLA): Q and K have zero-width head dims and their TMA
-        // copies are never issued, but cuTensorMapEncodeTiled rejects a zero
-        // extent, so describe them with the static tile dim instead.
-        int const headdim_qk_tma = OnlyQv ? int(get<2>(TileShape_MNK{})) : int(get<1>(shape_Q_packed_tma));
-        auto const shape_Q_tma = make_shape(get<0>(shape_Q_packed_tma), headdim_qk_tma,
-                                            get<2>(shape_Q_packed_tma), get<3>(shape_Q_packed_tma));
-        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_tma, stride_Q_packed);
-        TMA_Q tma_load_Q = make_tma_copy_A_sm90(
-            GmemTiledCopyQ{},
-            mQ,
-            SmemLayoutQ{},
-            TileShape_MNK{},
-            ClusterShape{}); // no mcast for Q
-        auto const shape_K_tma = make_shape(get<0>(args.shape_K), headdim_qk_tma,
-                                            get<2>(args.shape_K), get<3>(args.shape_K));
-        Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), shape_K_tma, args.stride_K);
-        TMA_K tma_load_K = make_tma_copy_B_sm90(
-            GmemTiledCopyKV{},
-            mK,
-            take<0, 2>(SmemLayoutK{}),
-            TileShape_MNK{},
-            ClusterShape{}); // mcast along M mode for this N load, if any
+        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_packed_tma, stride_Q_packed);
+        // OnlyQv (NoPE MLA): Q/K/K_new have zero-width head dims and are never
+        // loaded, so their TMA descriptors are never created -- this also
+        // sidesteps cuTensorMapEncodeTiled rejecting zero extents (and any
+        // 16B-alignment requirement on the caller's pointer).
+        TMA_Q tma_load_Q = [&] {
+            if constexpr (!OnlyQv) {
+                return make_tma_copy_A_sm90(
+                    GmemTiledCopyQ{},
+                    mQ,
+                    SmemLayoutQ{},
+                    TileShape_MNK{},
+                    ClusterShape{}); // no mcast for Q
+            } else {
+                return nullptr;
+            }
+        }();
+        Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
+        TMA_K tma_load_K = [&] {
+            if constexpr (!OnlyQv) {
+                return make_tma_copy_B_sm90(
+                    GmemTiledCopyKV{},
+                    mK,
+                    take<0, 2>(SmemLayoutK{}),
+                    TileShape_MNK{},
+                    ClusterShape{}); // mcast along M mode for this N load, if any
+            } else {
+                return nullptr;
+            }
+        }();
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
                                 make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
                                 select<1, 0, 2, 3>(args.stride_V));
@@ -528,15 +540,19 @@ struct CollectiveMainloopFwdSm90 {
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
-        auto const shape_K_new_tma = make_shape(get<0>(args.shape_K_new), headdim_qk_tma,
-                                                get<2>(args.shape_K_new), get<3>(args.shape_K_new));
-        Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), shape_K_new_tma, args.stride_K_new);
-        TMA_K tma_load_K_new = make_tma_copy_B_sm90(
-            GmemTiledCopyKV{},
-            cute::conditional_return<AppendKV>(mKnew, mK),
-            take<0, 2>(SmemLayoutK{}),
-            TileShape_MNK{},
-            ClusterShape{}); // mcast along M mode for this N load, if any
+        Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
+        TMA_K tma_load_K_new = [&] {
+            if constexpr (!OnlyQv) {
+                return make_tma_copy_B_sm90(
+                    GmemTiledCopyKV{},
+                    cute::conditional_return<AppendKV>(mKnew, mK),
+                    take<0, 2>(SmemLayoutK{}),
+                    TileShape_MNK{},
+                    ClusterShape{}); // mcast along M mode for this N load, if any
+            } else {
+                return nullptr;
+            }
+        }();
         Tensor mVnew = make_tensor(make_gmem_ptr(args.ptr_V_new),
                                    make_shape(args.headdim_v, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
                                    select<1, 0, 2, 3>(args.stride_V_new));
@@ -612,17 +628,23 @@ struct CollectiveMainloopFwdSm90 {
     CUTLASS_DEVICE
     static void prefetch_tma_descriptors(Params const& params) {
         if constexpr (Use_TMA_Q) {
-            cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
+            if constexpr (!OnlyQv) {
+                cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
+            }
             if constexpr (HasQv) {
                 cute::prefetch_tma_descriptor(params.tma_load_Qv.get_tma_descriptor());
             }
         }
         if constexpr (Use_TMA_KV) {
-            cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
+            if constexpr (!OnlyQv) {
+                cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
+            }
             cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
         }
         if constexpr (AppendKV) {
-            cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
+            if constexpr (!OnlyQv) {
+                cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
+            }
             cute::prefetch_tma_descriptor(params.tma_load_V_new.get_tma_descriptor());
         }
     }
@@ -696,31 +718,45 @@ struct CollectiveMainloopFwdSm90 {
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
 
-        Tensor gQ = local_tile(
-            domain_offset(
-                cute::conditional_return<!PackGQA>(
-                    make_coord(seqlen_info.offset_q, _0{}),
-                    make_coord(make_coord(_0{}, seqlen_info.offset_q), _0{})),
-                mQ),
-            select<0, 2>(TileShape_MNK{}),
-            make_coord(m_block, _0{}));  // (M, K)
-        // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
-        // Now add n_offset to update KV gmem pointers
-        Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
         Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k + n_offset, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
-        auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
-        Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
-        Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
+        auto [tQgQ, tQsQ] = [&] {
+            if constexpr (!OnlyQv) {
+                Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q_packed)(_, _, bidh, !is_varlen_q ? bidb : 0);
+                // if (cute::thread0()) { printf("Varlen = %d, params.leftpad_k = %p, leftpad_k = %d\n", Varlen, params.leftpad_k, leftpad_k); }
+                Tensor gQ = local_tile(
+                    domain_offset(
+                        cute::conditional_return<!PackGQA>(
+                            make_coord(seqlen_info.offset_q, _0{}),
+                            make_coord(make_coord(_0{}, seqlen_info.offset_q), _0{})),
+                        mQ),
+                    select<0, 2>(TileShape_MNK{}),
+                    make_coord(m_block, _0{}));  // (M, K)
+                auto block_tma_Q = params.tma_load_Q.get_slice(_0{});
+                Tensor tQgQ = group_modes<0, 3>(block_tma_Q.partition_S(gQ));  // (TMA)
+                Tensor tQsQ = group_modes<0, 3>(block_tma_Q.partition_D(sQ));  // (TMA)
+                return cute::make_tuple(tQgQ, tQsQ);
+            } else {
+                return cute::make_tuple(nullptr, nullptr);
+            }
+        }();
         // tma_partition doesn't handle position_independent_swizzle_tensor correctly, so we need to do it manually
-        auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
-        Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
-        Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
+        auto [tKgK_TMA, tKsK_TMA] = [&] {
+            if constexpr (!OnlyQv) {
+                Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
+                // Now add n_offset to update KV gmem pointers
+                Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k + n_offset, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
+                auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
+                Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
+                Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
+                return cute::make_tuple(tKgK_TMA, tKsK_TMA);
+            } else {
+                return cute::make_tuple(nullptr, nullptr);
+            }
+        }();
         auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
@@ -798,15 +834,17 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            pipeline_k.producer_acquire(smem_pipe_write);
-            if constexpr (!PagedKVNonTMA) {
-                auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
-                copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
-                    tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
-            } else {
-                constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
-                paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
-                pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+            if constexpr (!OnlyQv) {
+                pipeline_k.producer_acquire(smem_pipe_write);
+                if constexpr (!PagedKVNonTMA) {
+                    auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_K_TMA();
+                    copy(params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_LAST),
+                        tKgK_TMA(_, n_block_idx, bidb_kv_idx), tKsK_TMA(_, smem_pipe_write.index()));
+                } else {
+                    constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK_pi(_, _, smem_pipe_write.index()));
+                    pipeline_k.producer_commit(smem_pipe_write, cutlass::arch::cpasync_barrier_arrive);
+                }
             }
         };
 
@@ -1603,16 +1641,23 @@ struct CollectiveMainloopFwdSm90 {
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
 
         bool const is_varlen_k_new = Varlen && params.cu_seqlens_k_new;
-        Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
         auto shape_Vnew = make_shape(params.headdim_v, get<0>(params.shape_K_new), get<2>(params.shape_K_new), get<3>(params.shape_K_new));
         Tensor mVnewt_TMA = params.tma_load_V_new.get_tma_tensor(shape_Vnew)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
 
-        Tensor gKnew_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor gVnewt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k_new), mVnewt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _));  // (K, N, _)
 
-        auto block_tma_K_new = params.tma_load_K_new.get_slice(cluster_local_block_id.x);
-        Tensor tKgKnew_TMA = group_modes<0, 3>(block_tma_K_new.partition_S(gKnew_TMA));  // (TMA, k)
-        Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K_new.partition_D(sK));  // (TMA, PIPE)
+        auto [tKgKnew_TMA, tKsK_TMA] = [&] {
+            if constexpr (!OnlyQv) {
+                Tensor mKnew_TMA = params.tma_load_K_new.get_tma_tensor(params.shape_K_new)(_, _, bidh_kv, !is_varlen_k_new ? bidb : 0);
+                Tensor gKnew_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k_new, _0{}), mKnew_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
+                auto block_tma_K_new = params.tma_load_K_new.get_slice(cluster_local_block_id.x);
+                Tensor tKgKnew_TMA = group_modes<0, 3>(block_tma_K_new.partition_S(gKnew_TMA));  // (TMA, k)
+                Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K_new.partition_D(sK));  // (TMA, PIPE)
+                return cute::make_tuple(tKgKnew_TMA, tKsK_TMA);
+            } else {
+                return cute::make_tuple(nullptr, nullptr);
+            }
+        }();
         auto block_tma_V_new = params.tma_load_V_new.get_slice(cluster_local_block_id.x);
         Tensor tVgVnewt_TMA = group_modes<0, 3>(block_tma_V_new.partition_S(gVnewt_TMA));  // (TMA, k)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V_new.partition_D(sVt));  // (TMA, PIPE)
@@ -1626,9 +1671,11 @@ struct CollectiveMainloopFwdSm90 {
         }
 
         auto load_K_new = [&] (int const n_block, auto const& smem_pipe_write) {
-            pipeline_k_new.producer_acquire(smem_pipe_write);
-            copy(params.tma_load_K_new.with(*pipeline_k_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_FIRST),
-                tKgKnew_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
+            if constexpr (!OnlyQv) {
+                pipeline_k_new.producer_acquire(smem_pipe_write);
+                copy(params.tma_load_K_new.with(*pipeline_k_new.producer_get_barrier(smem_pipe_write), mcast_mask_kv, TMA::CacheHintSm90::EVICT_FIRST),
+                    tKgKnew_TMA(_, n_block), tKsK_TMA(_, smem_pipe_write.index()));
+            }
         };
 
         auto load_V_new = [&] (int const n_block, auto const& smem_pipe_write) {
@@ -1647,7 +1694,9 @@ struct CollectiveMainloopFwdSm90 {
         // and the main attention are not the same. We want to make sure the consumers
         // have finished reading all smem_k and smem_v for the previous iteration.
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
-        if (should_load_KV) { load_K_new(n_block, smem_pipe_write); }
+        if constexpr (!OnlyQv) {
+            if (should_load_KV) { load_K_new(n_block, smem_pipe_write); }
+        }
         // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
         if (should_load_KV) { load_V_new(n_block, smem_pipe_write); }
         // if (thread_idx == 0) { printf("Producer: Done loading V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
@@ -1657,7 +1706,7 @@ struct CollectiveMainloopFwdSm90 {
         #pragma unroll 1
         for (; n_block >= n_block_new_min; --n_block) {
             if (should_load_KV) {
-                load_K_new(n_block, smem_pipe_write);
+                if constexpr (!OnlyQv) { load_K_new(n_block, smem_pipe_write); }
                 // if (thread_idx == 0) { printf("Producer: Done loading K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
                 load_V_new(n_block, smem_pipe_write);
                 // if (thread_idx == 0) { printf("Producer: Done loading V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
@@ -1815,7 +1864,7 @@ struct CollectiveMainloopFwdSm90 {
         #pragma unroll 1
         for (int n_block = n_block_new_max - 1; n_block >= n_block_new_min; --n_block) {
             if constexpr (PagedKVNonTMA) { paged_kv_manager.template load_page_table<true /*Seqlenk_mask*/>(n_block); }
-            store_K(n_block, smem_pipe_read);
+            if constexpr (!OnlyQv) { store_K(n_block, smem_pipe_read); }
             // if (thread_idx == 0) { printf("Done storing K, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }
             store_V(n_block, smem_pipe_read);
             // if (thread_idx == 0) { printf("Done storing V, n_block = %d, n_block_new_min = %d\n", n_block, n_block_new_min); }

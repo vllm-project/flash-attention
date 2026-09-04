@@ -1117,6 +1117,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     params.only_qv = head_size == 0;
     TORCH_CHECK(!params.only_qv || q_v_.has_value(),
                 "head_size == 0 (NoPE) requires q_v to be provided");
+    TORCH_CHECK(!params.only_qv || !k_new_.has_value(),
+                "head_size == 0 (NoPE) does not support appending k_new/v_new; "
+                "write the new KV to the cache before the call instead");
 
     if (rotary_cos_.has_value()) {
         TORCH_CHECK(k_new_.has_value(), "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");

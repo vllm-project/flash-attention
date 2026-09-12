@@ -87,6 +87,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     bool const is_varlen_k = params.cu_seqlens_k;
     bool const is_varlen_k_new = params.cu_seqlens_knew;
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
+    int seqlen_k = !is_varlen_k ? params.seqlen_k : params.total_k;
+    int seqlen_k_new = !is_varlen_k_new ? params.seqlen_knew : params.total_knew;
+    if (seqlen_q == 0 || (seqlen_k == 0 && seqlen_k_new == 0 && !params.page_table)) {
+        return;
+    }
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
     typename CollectiveMainloop::StrideV v_strides =

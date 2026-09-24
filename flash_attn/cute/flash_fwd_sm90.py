@@ -66,13 +66,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.intra_wg_overlap = intra_wg_overlap
+        # Match the FA3 FP8 path: keep softmax probabilities in registers for PV.
+        # SM90 FP8 needs a different accumulator-to-A-fragment mapping than FP16.
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
-        # FP8-KV scale-fold path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
+        # SM90 compensated FP8-MMA path: native fp16/bf16 Q, E4M3 paged K/V,
+        # FP8 WGMMA QK/PV, FP32 accumulation, and native fp16/bf16 O.
         self.fp8_kv_dequant = fp8_kv_dequant
         self.kv_dtype = kv_dtype if kv_dtype is not None else self.dtype
+        # Hopper FP8 WGMMA needs FP8 on both inputs. Q is quantized once per output
+        # tile. P is scaled before its FP8 cast to preserve long-context softmax
+        # values; the reciprocal is folded into final output normalization.
+        self.fp8_q_scale = 1.0
+        self.fp8_p_scale = 256.0
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
@@ -105,9 +113,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     def _get_tiled_mma(self):
         atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
+        mma_dtype = self.kv_dtype if self.fp8_kv_dequant else self.dtype
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
-            self.dtype,
-            self.dtype,
+            mma_dtype,
+            mma_dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
@@ -115,10 +124,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
-            self.dtype,
-            self.dtype,
+            mma_dtype,
+            mma_dtype,
             warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.K
+            if self.fp8_kv_dequant
+            else warpgroup.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
@@ -149,7 +160,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
         if const_expr(self.fp8_kv_dequant):
-            # sStage: the fp8 staging buffer; its num_stages=1 TMA pipeline gates GMEM->sStage.
+            sQ_input_struct = cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(self.sQ_layout)],
+                self.buffer_align_bytes,
+            ]
+            sQ_mma_struct = cute.struct.Align[
+                cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sQ_mma_layout)],
+                self.buffer_align_bytes,
+            ]
+            sK_mma_struct = cute.struct.Align[
+                cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            sV_mma_struct = cute.struct.Align[
+                cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sV_mma_layout)],
+                self.buffer_align_bytes,
+            ]
             sStage_struct = cute.struct.Align[
                 cute.struct.MemRange[self.kv_dtype, cute.cosize(self.sStage_layout)],
                 self.buffer_align_bytes,
@@ -157,17 +183,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_Stage_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
 
             @cute.struct
-            class SharedStorageQKVDequant:
+            class SharedStorageQKVFp8Mma:
                 mbar_ptr_Q: mbar_ptr_Q_struct
-                mbar_ptr_K: mbar_ptr_K_struct
-                mbar_ptr_V: mbar_ptr_V_struct
                 mbar_ptr_Stage: mbar_ptr_Stage_struct
-                sV: sV_struct
-                sQ: sQ_struct
-                sK: sK_struct
+                sQ: sQ_input_struct
+                sQ_mma: sQ_mma_struct
+                sK: sK_mma_struct
+                sV_mma: sV_mma_struct
                 sStage: sStage_struct
 
-            return SharedStorageQKVDequant
+            return SharedStorageQKVFp8Mma
 
         @cute.struct
         class SharedStorageQKV:
@@ -221,7 +246,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         """Configures and launches the flash attention kernel.
 
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout
-        (except the fp8-KV scale-fold path: fp16 Q + fp8 e4m3 K/V -> fp16 O):
+        (except FP8 MMA: native fp16/bf16 Q, E4M3 K/V, native fp16/bf16 O):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
         if const_expr(not self.fp8_kv_dequant):
@@ -234,10 +259,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         else:
             # FP8-KV: K/V are fp8 (rejected by the symmetric _check_type). Q/O may each be
-            # fp16 OR bf16 -- compute is always fp16 (the single-instruction fp8->fp16 fast
-            # path). Q is narrowed bf16->fp16 in-kernel and the fp32 accumulator is cast to
-            # mO's dtype in the epilogue, so the Q/O tensor dtypes are independent of compute.
-            assert self.dtype == Float16, "fp8_kv_dequant computes in fp16"
+            # fp16 or bf16. Q and softmax P use compensated pairs of E4M3 values;
+            # QK and PV both execute as FP8 WGMMA with fp32 accumulation.
+            assert self.dtype == Float16, (
+                "fp8_kv_dequant requires fp16 auxiliary conversion layouts"
+            )
             assert mQ.element_type in (Float16, BFloat16), "fp8_kv_dequant expects fp16 or bf16 Q"
             if const_expr(self.is_split_kv):
                 assert mO.element_type == Float32, (
@@ -248,8 +274,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     "fp8_kv_dequant expects fp16 or bf16 O"
                 )
 
-        # Q input / O output dtypes (may differ from the fp16 compute dtype on the fp8-KV
-        # path). q_dtype gates the in-kernel bf16->fp16 Q narrow; o_dtype drives the
+        # Q input / O output dtypes. q_dtype drives Q quantization and o_dtype drives the
         # epilogue cast. SplitKV writes fp32 partials via acc_O directly, so o_dtype stays
         # the compute dtype there (the combine kernel produces the final bf16/fp16 O).
         self.q_dtype = mQ.element_type
@@ -284,6 +309,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_mma_threads = tiled_mma_qk.size
         self.num_threads_per_warp_group = 128
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
+        if const_expr(self.fp8_kv_dequant):
+            assert self.num_wg_mma == 2, (
+                "SM90 d512 FP8 MMA requires exactly two MMA warp groups"
+            )
         assert self.num_wg_mma in [1, 2, 3]
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
@@ -309,10 +338,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
-        # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
-        # dequant target (self.dtype), not mK/mV's fp8 source.
-        sK_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
-        sV_dtype = self.dtype if const_expr(self.fp8_kv_dequant) else mV.element_type
+        sK_dtype = self.kv_dtype if const_expr(self.fp8_kv_dequant) else mK.element_type
+        sV_dtype = self.kv_dtype if const_expr(self.fp8_kv_dequant) else mV.element_type
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(dtype, LayoutEnum.ROW_MAJOR, shape, stage)
             for dtype, shape, stage in [
@@ -326,9 +353,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.o_dtype, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
-        # fp8 staging tile: ONE shared buffer (tile_hdim == tile_hdimv so it serves K and V).
+        self.sQ_mma_layout = None
+        self.sV_mma_layout = None
         self.sStage_layout = None
         if const_expr(self.fp8_kv_dequant):
+            self.sQ_mma_layout = sm90_utils.make_smem_layout(
+                self.kv_dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), None
+            )
+            # Construct WGMMA-B directly as (output_dim, reduction_dim), K-major.
+            self.sV_mma_layout = sm90_utils.make_smem_layout(
+                self.kv_dtype,
+                LayoutEnum.ROW_MAJOR,
+                (self.tile_hdimv, self.tile_n),
+                self.num_stages,
+            )
+            # One row-major staging tile is shared by K and V TMA loads.
             self.sStage_layout = sm90_utils.make_smem_layout(
                 self.kv_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdim), 1
             )
@@ -376,7 +415,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_K, tma_tensor_K = None, None
         tma_atom_V, tma_tensor_V = None, None
         if const_expr(self.use_tma_KV):
-            # FP8-KV: K and V from GMEM land in sStage for the consumer to dequant(instead of sK/sV)
+            # FP8 K/V land in sStage for the consumer's WGMMA-layout
+            # rearrangement instead of being widened into sK/sV.
             sK_tma_box = cute.select(
                 self.sStage_layout if const_expr(self.fp8_kv_dequant) else self.sK_layout,
                 mode=[0, 1],
@@ -485,6 +525,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.sV_layout,
             self.sO_layout,
             self.sP_layout,
+            self.sQ_mma_layout,
+            self.sV_mma_layout,
             self.sStage_layout,
             self.gmem_tiled_copy_Q,
             self.gmem_tiled_copy_K,
@@ -536,6 +578,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         sP_layout: cute.ComposedLayout | None,
+        sQ_mma_layout: cute.ComposedLayout | None,
+        sV_mma_layout: cute.ComposedLayout | None,
         sStage_layout: cute.ComposedLayout | None,
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_K: cute.TiledCopy,
@@ -649,28 +693,37 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # typed with the compute dtype, so the TMA'd bf16 Q must be read back as q_dtype
         # (passing dtype here, like sO below) -- otherwise bf16 bytes get read as fp16.
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
-        # FP8-KV bf16 Q: fp16 compute view aliasing sQ's smem (both 2 bytes, so the
-        # element layout/swizzle is identical -- reinterpret the same storage as fp16, the
-        # same way sO reuses sQ's storage below). _narrow_q_to_compute() casts sQ bf16->fp16
-        # in place per Q tile; the QK WGMMA reads sQ_mma. When Q is already fp16, sQ_mma is sQ.
         sQ_mma = sQ
-        if const_expr(self.fp8_kv_dequant and self.q_dtype != self.dtype):
-            sQ_mma = storage.sQ.get_tensor(
-                sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.dtype
+        sQ_res = sQ
+        if const_expr(self.fp8_kv_dequant):
+            sQ_mma = storage.sQ_mma.get_tensor(
+                sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner
+            )
+            # Reuse the now-dead FP16 Q input bytes for the FP8 residual term.
+            sQ_res = storage.sQ.get_tensor(
+                sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner, dtype=self.kv_dtype
             )
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        if const_expr(not self.Q_in_regs):
+        if const_expr(self.fp8_kv_dequant):
+            sVt = storage.sV_mma.get_tensor(
+                sV_mma_layout.outer, swizzle=sV_mma_layout.inner
+            )
+            sV = layout_utils.transpose_view(sVt)
+        elif const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            sVt = layout_utils.transpose_view(sV)
         else:
             sV = storage.sQ.get_tensor(
                 sV_layout.outer, swizzle=sV_layout.inner, dtype=mV.element_type
             )
-        # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
-        sVt = layout_utils.transpose_view(sV)
+            sVt = layout_utils.transpose_view(sV)
         sP = None
+        sP_res = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-        # fp8 staging buffer (TMA dst, dequant src).
+            if const_expr(self.fp8_kv_dequant):
+                sP_res = storage.sP_res.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+        # FP8 staging buffer: TMA destination and WGMMA-layout rearrangement source.
         sStage = None
         if const_expr(self.fp8_kv_dequant):
             sStage = storage.sStage.get_tensor(sStage_layout.outer, swizzle=sStage_layout.inner)
@@ -764,8 +817,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sK,
                 sVt,
                 sP,
+                sP_res,
                 sO,
                 sQ_mma,
+                sQ_res,
                 learnable_sink,
                 pipeline_k,
                 pipeline_v,
@@ -828,7 +883,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
 
-            # Q stays fp16 (no dequant)
+            # Q remains in its native fp16/bf16 source dtype until compensated
+            # E4M3 preparation in the MMA warp group.
             load_Q = None
             pack_gqa = None
             if const_expr(self.use_tma_Q):
@@ -1256,10 +1312,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sK: cute.Tensor,
         sVt: cute.Tensor,
         sP: Optional[cute.Tensor],
+        sP_res: Optional[cute.Tensor],
         sO: cute.Tensor,
-        # FP8-KV bf16 Q: fp16 compute view aliasing sQ (built in kernel() from the
-        # region-local sQ_layout). Equals sQ when Q is already fp16.
+        # FP8 high and residual Q terms used by the compensated QK WGMMA.
         sQ_mma: cute.Tensor,
+        sQ_res: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
@@ -1277,8 +1334,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         num_splits: Int32 = Int32(1),
-        # FP8-KV cast inputs (None on the non-fp8 path): sV (fp16 V write target),
-        # sStage, pipeline_stage.
+        # FP8-KV staging inputs (None on the non-fp8 path).
         sV: Optional[cute.Tensor] = None,
         sStage: Optional[cute.Tensor] = None,
         pipeline_stage: Optional[pipeline.PipelineAsync] = None,
@@ -1292,20 +1348,46 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx))
-        # FP8-KV bf16 Q: the QK WGMMA needs fp16 operands. sQ holds the bf16 Q as TMA'd;
-        # sQ_mma is the fp16 compute view (same smem) built in kernel(). _narrow_q_to_compute()
-        # casts sQ bf16->fp16 in place per tile before the QK reads sQ_mma.
-        narrow_q = const_expr(self.fp8_kv_dequant and self.q_dtype != self.dtype)
+        quantize_q = const_expr(self.fp8_kv_dequant)
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
             wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ_mma, sK
         )
-        mma_qk_fn = partial(
-            sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
-        )
+        if const_expr(self.fp8_kv_dequant):
+            _, tSrQ_res, _ = sm90_utils.partition_fragment_ABC(
+                wg_mma_qk, (self.tile_m, self.tile_n, self.tile_hdim), sQ_res, sK
+            )
+            mma_qk_fn = partial(
+                self._gemm_qk_fp8_compensated,
+                tiled_mma_qk,
+                (self.tile_m, self.tile_n),
+                tSrQ,
+                tSrQ_res,
+                tSrK,
+            )
+        else:
+            mma_qk_fn = partial(
+                sm90_utils.gemm_zero_init,
+                tiled_mma_qk,
+                (self.tile_m, self.tile_n),
+                tSrQ,
+                tSrK,
+            )
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
-        mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
+        tOrP_res = None
+        if const_expr(self.fp8_kv_dequant):
+            tOrP_res = cute.make_rmem_tensor_like(tOrP)
+            mma_pv_fn = partial(
+                self._gemm_pv_fp8_compensated,
+                tiled_mma_pv,
+                acc_O,
+                tOrP,
+                tOrP_res,
+                tOrVt,
+            )
+        else:
+            mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Smem copy atom tiling
@@ -1315,7 +1397,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
-        smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
+        smem_copy_params = SimpleNamespace(
+            smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP, tOrP_res=tOrP_res
+        )
 
         self.mma_init()
 
@@ -1324,48 +1408,91 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
 
-        # FP8-KV MMA WGs side dequant setup:
-        # K: cooperative 256-thread(2 WGs) copy of the full tile;
-        # V: each WG copies only its own hdimv-half.
+        # FP8 staging -> FP8 WGMMA buffers. K keeps its orientation; V is explicitly
+        # transposed so the PV B operand is K-major as required by Hopper FP8 WGMMA.
         dequant_params = None
         if const_expr(self.fp8_kv_dequant):
             sStage2 = sStage[None, None, 0]
             sK2 = sK[None, None, 0]
-            sV2 = sV[None, None, 0]
+            sStageVt2 = layout_utils.transpose_view(sStage2)
+            sVt2 = sVt[None, None, 0]
             half = const_expr(min(256, self.tile_hdimv))
-            VEC = const_expr(8)  # 8 fp16 == 128-bit store; 8 fp8 == 64-bit load
+            VEC = const_expr(8)
             tiled_copy_K = copy_utils.tiled_copy_2d(
-                self.dtype, self.tile_hdim // VEC, self.num_mma_threads, num_copy_elems=VEC
-            )
-            tiled_copy_V = copy_utils.tiled_copy_2d(
-                self.dtype, half // VEC, self.num_threads_per_warp_group, num_copy_elems=VEC
+                self.kv_dtype,
+                self.tile_hdim // VEC,
+                self.num_mma_threads,
+                num_copy_elems=VEC,
             )
             thr_copy_K = tiled_copy_K.get_slice(tidx)
-            thr_copy_V = tiled_copy_V.get_slice(tidx % self.num_threads_per_warp_group)
-            # WG-local hdimv-half sub-views (tile coord (0, warp_group_idx)).
-            gStage_V = cute.local_tile(sStage2, (self.tile_n, half), (0, warp_group_idx))
-            gV = cute.local_tile(sV2, (self.tile_n, half), (0, warp_group_idx))
+            # Build both WG-local output-dimension halves with static coordinates.
+            # A dynamic local_tile coordinate loses the 128-bit alignment proof
+            # required by STSM even though both 256-column offsets are aligned.
+            gStage_V0 = cute.local_tile(sStageVt2, (half, self.tile_n), (0, 0))
+            gStage_V1 = cute.local_tile(sStageVt2, (half, self.tile_n), (1, 0))
+            gV0 = cute.local_tile(sVt2, (half, self.tile_n), (0, 0))
+            gV1 = cute.local_tile(sVt2, (half, self.tile_n), (1, 0))
+
+            # Port of FA3's FP8 V transpose. LDSM.T reads 64x8 byte tiles as
+            # 16-bit matrices, PRMT interleaves their bytes, and STSM writes the
+            # K-major WGMMA layout without scalar shared-memory traffic.
+            ldsm_atom = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix8x8x16bOp(True, 4), self.kv_dtype
+            )
+            stsm_atom = cute.make_copy_atom(
+                cute.nvgpu.warp.StMatrix8x8x16bOp(False, 4), self.kv_dtype
+            )
+            ldsm_copy = cute.make_tiled_copy_tv(
+                ldsm_atom,
+                cute.make_layout((32, 4, 1, 1), stride=(4, 1, 0, 0)),
+                cute.make_layout((2, 2, 1, 4), stride=(1, 2, 16, 4)),
+            )
+            stsm_copy = cute.make_tiled_copy_tv(
+                stsm_atom,
+                cute.make_layout((8, 4, 4, 1), stride=(4, 1, 32, 0)),
+                # FA3's faster STSM layout avoids shared-memory bank conflicts.
+                # It permutes V's output columns, so each completed PV must apply
+                # the inverse permutation to its accumulator registers.
+                cute.make_layout((1, 4, 2, 2), stride=(0, 1, 4, 8)),
+            )
+            transpose_tid = tidx % self.num_threads_per_warp_group
+            ldsm_thr = ldsm_copy.get_slice(transpose_tid)
+            stsm_thr = stsm_copy.get_slice(transpose_tid)
+            tStage_V0 = ldsm_thr.partition_S(cute.flat_divide(gStage_V0, (64, 8)))
+            tStage_V1 = ldsm_thr.partition_S(cute.flat_divide(gStage_V1, (64, 8)))
+            tsV0 = stsm_thr.partition_D(cute.flat_divide(gV0, (8, 16)))
+            tsV1 = stsm_thr.partition_D(cute.flat_divide(gV1, (8, 16)))
+            tStage_V0 = cute.group_modes(tStage_V0, 1, cute.rank(tStage_V0))
+            tStage_V1 = cute.group_modes(tStage_V1, 1, cute.rank(tStage_V1))
+            tsV0 = cute.group_modes(tsV0, 1, cute.rank(tsV0))
+            tsV1 = cute.group_modes(tsV1, 1, cute.rank(tsV1))
             dequant_params = SimpleNamespace(
                 pipeline_stage=pipeline_stage,
                 warp_group_idx=warp_group_idx,
                 tStage_K=thr_copy_K.partition_S(sStage2),
                 tsK=thr_copy_K.partition_D(sK2),
-                tStage_V=thr_copy_V.partition_S(gStage_V),
-                tsV=thr_copy_V.partition_D(gV),
+                tStage_V0=tStage_V0,
+                tStage_V1=tStage_V1,
+                tsV0=tsV0,
+                tsV1=tsV1,
+                ldsm_copy=ldsm_copy,
+                stsm_copy=stsm_copy,
             )
 
-        # FP8-KV bf16 Q in-place narrow partitions (256-thread cooperative copy of the
-        # full Q tile; src is the bf16 sQ, dst the fp16 compute view over the same smem).
         q_narrow_params = None
-        if const_expr(narrow_q):
+        if const_expr(quantize_q):
             VEC_Q = const_expr(8)
             tiled_copy_Q = copy_utils.tiled_copy_2d(
-                self.dtype, self.tile_hdim // VEC_Q, self.num_mma_threads, num_copy_elems=VEC_Q
+                self.kv_dtype,
+                self.tile_hdim // VEC_Q,
+                self.num_mma_threads,
+                num_copy_elems=VEC_Q,
             )
             thr_copy_Q = tiled_copy_Q.get_slice(tidx)
             q_narrow_params = SimpleNamespace(
                 tQsrc=thr_copy_Q.partition_S(sQ),
                 tQdst=thr_copy_Q.partition_D(sQ_mma),
+                tQres=thr_copy_Q.partition_D(sQ_res),
             )
 
         tile_scheduler = TileSchedulerCls()
@@ -1444,6 +1571,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 qk_descale, v_descale_tile = self._load_effective_descales(
                     descale_tensors, batch_idx, head_idx_kv
                 )
+                qk_descale = qk_descale / Float32(self.fp8_q_scale)
+                v_descale_tile = v_descale_tile / Float32(self.fp8_p_scale)
                 if const_expr(self.score_mod is None):
                     softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                     softmax_scale_eff = None
@@ -1540,10 +1669,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         n_block_max = n_block_max_full
             n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
-            # FP8-KV bf16 Q: cast the just-arrived bf16 Q tile -> fp16 in place (with a
-            # 256-thread barrier) before any QK WGMMA reads it. No-op when Q is already fp16.
-            if const_expr(narrow_q):
-                self._narrow_q_to_compute(q_narrow_params)
+            if const_expr(quantize_q):
+                self._quantize_q_to_fp8(q_narrow_params)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
             # We need masking on S for the very last block when K and V has length not multiple of tile_n.
@@ -1800,39 +1927,197 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return qk_descale, v_descale
 
     @cute.jit
-    def _narrow_q_to_compute(self, q_narrow_params):
-        """In-place narrow the bf16 Q tile -> fp16 compute dtype. src/dst alias the same
-        smem (both 2 bytes), so each thread reads bf16 into registers, converts, and writes
-        fp16 back. A 256-thread NarrowQ barrier publishes the fp16 Q to both MMA warpgroups
-        before the QK WGMMA. Called once per Q tile (Q is reused across all KV blocks)."""
-        # The in-place aliasing (sQ_mma reinterprets sQ's storage) is only valid when the
-        # Q-input and compute dtypes have the same width -- bf16<->fp16 are both 16-bit. A
-        # different width would make sQ_mma's elements overlap sQ's incorrectly.
-        assert self.q_dtype.width == self.dtype.width, (
-            "in-place Q narrow requires q_dtype and compute dtype of equal width"
-        )
+    def _gemm_two_fp8_a(
+        self,
+        tiled_mma,
+        acc,
+        tA_hi,
+        tA_res,
+        tB,
+        zero_init: cutlass.Constexpr[bool],
+        wg_wait: cutlass.Constexpr[int],
+    ):
+        """Issue high and residual FP8 A terms in one WGMMA commit group."""
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
+        for k in cutlass.range_constexpr(cute.size(tA_hi.shape[2])):
+            cute.gemm(mma_atom, acc, tA_hi[None, None, k], tB[None, None, k], acc)
+            mma_atom.set(warpgroup.Field.ACCUMULATE, True)
+        for k in cutlass.range_constexpr(cute.size(tA_res.shape[2])):
+            cute.gemm(mma_atom, acc, tA_res[None, None, k], tB[None, None, k], acc)
+        warpgroup.commit_group()
+        if const_expr(wg_wait >= 0):
+            warpgroup.wait_group(wg_wait)
+
+    @cute.jit
+    def _gemm_qk_fp8_compensated(
+        self, tiled_mma, shape, tQ_hi, tQ_res, tK, B_idx=None, wg_wait: int = -1
+    ):
+        acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
+        rK = tK if const_expr(B_idx is None) else tK[None, None, None, B_idx]
+        self._gemm_two_fp8_a(tiled_mma, acc, tQ_hi, tQ_res, rK, True, wg_wait)
+        return acc
+
+    @cute.jit
+    def _gemm_pv_fp8_compensated(
+        self,
+        tiled_mma,
+        acc,
+        tP_hi,
+        tP_res,
+        tV,
+        zero_init,
+        B_idx=None,
+        wg_wait: int = -1,
+    ):
+        rV = tV if const_expr(B_idx is None) else tV[None, None, None, B_idx]
+        self._gemm_two_fp8_a(tiled_mma, acc, tP_hi, tP_res, rV, zero_init, wg_wait)
+
+    @cute.jit
+    def _quantize_q_to_fp8(self, q_narrow_params):
+        """Quantize the TMA-loaded FP16/BF16 Q tile into FP8 shared memory once."""
         qp = q_narrow_params
         rS = cute.make_rmem_tensor_like(qp.tQsrc)
         rD = cute.make_rmem_tensor_like(qp.tQdst)
+        rR = cute.make_rmem_tensor_like(qp.tQres)
         cute.autovec_copy(qp.tQsrc, rS)
-        rD.store(rS.load().to(self.dtype))
+        q_scaled = rS.load().to(Float32) * Float32(self.fp8_q_scale)
+        q_hi = q_scaled.to(self.kv_dtype)
+        rD.store(q_hi)
+        rR.store((q_scaled - q_hi.to(Float32)).to(self.kv_dtype))
         cute.autovec_copy(rD, qp.tQdst)
+        cute.arch.fence_view_async_shared()
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.NarrowQ), number_of_threads=self.num_mma_threads
+        )
+        # All input FP16/BF16 values have been captured in registers, so the Q input
+        # allocation can now safely hold the compact residual FP8 tile.
+        cute.autovec_copy(rR, qp.tQres)
         cute.arch.fence_view_async_shared()
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.NarrowQ), number_of_threads=self.num_mma_threads
         )
 
     @cute.jit
-    def _cast_tile_fp8_to_f16(self, pipeline_stage, tStage, tsDst, phase):
-        """Cast one staged fp8 tile -> fp16 smem without applying a descale."""
+    def _copy_staged_fp8_tile(self, pipeline_stage, tStage, tsDst, phase):
+        """Copy/reorder one staged FP8 tile into its FP8 WGMMA shared-memory layout."""
         rS = cute.make_rmem_tensor_like(tStage)
         rD = cute.make_rmem_tensor_like(tsDst)
         pipeline_stage.consumer_wait_w_index_phase(0, phase)
         cute.autovec_copy(tStage, rS)
-        rD.store(utils.cvt_fp8_to_f16_packed(rS.load(), self.dtype))
+        rD.store(rS.load())
         cute.autovec_copy(rD, tsDst)
         pipeline_stage.consumer_release_w_index(0)
         cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _transpose_fp8_v_tile(self, dp, tStage_V, tsV):
+        for i in cutlass.range_constexpr(cute.size(tStage_V.shape[1])):
+            dst = tsV[None, i]
+            # The STSM TV layout guarantees every lane's address is 16-byte
+            # aligned; retain that fact after partition/slicing in the DSL IR.
+            dst = cute.make_tensor(dst.iterator.align(16), dst.layout)
+            rV = cute.make_rmem_tensor_like(dst)
+            cute.copy(dp.ldsm_copy, tStage_V[None, i], rV)
+            rV_u32 = cute.recast_tensor(rV, Int32)
+            for j in cutlass.range_constexpr(cute.size(rV_u32) // 2):
+                upper = rV_u32[2 * j]
+                lower = rV_u32[2 * j + 1]
+                rV_u32[2 * j] = cute.arch.prmt(upper, lower, Int32(0x6420))
+                rV_u32[2 * j + 1] = cute.arch.prmt(upper, lower, Int32(0x7531))
+            cute.copy(dp.stsm_copy, rV, dst)
+
+    @cute.jit
+    def _transpose_staged_fp8_v(self, dp, phase):
+        """FA3-style LDSM.T -> PRMT -> STSM transpose for one WG's V half."""
+        dp.pipeline_stage.consumer_wait_w_index_phase(0, phase)
+        if dp.warp_group_idx == 0:
+            self._transpose_fp8_v_tile(dp, dp.tStage_V0, dp.tsV0)
+        else:
+            self._transpose_fp8_v_tile(dp, dp.tStage_V1, dp.tsV1)
+        dp.pipeline_stage.consumer_release_w_index(0)
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _permute_Cregs_fp8(self, acc):
+        """Match FA3's QK-C to FP8 PV-A register permutation."""
+        acc_u64 = cute.recast_tensor(acc, cutlass.Int64)
+        flat = cute.make_tensor(acc_u64.iterator, cute.make_layout(cute.size(acc_u64)))
+        for i in cutlass.range_constexpr(cute.size(flat) // 4):
+            tmp = flat[4 * i + 1]
+            flat[4 * i + 1] = flat[4 * i + 2]
+            flat[4 * i + 2] = tmp
+
+    @cute.jit
+    def _permute_output_fp8(self, acc):
+        """Undo the output-column permutation from FA3's conflict-free V STSM."""
+        # The hdim-512 Python kernel's PV accumulator carries the local FP8
+        # output permutation as well. Undo that first, then apply FA3's
+        # cross-lane V-column permutation below. The order is significant.
+        frag32 = cute.group_modes(acc, 1, cute.rank(acc))
+        for mi in cutlass.range_constexpr(cute.size(frag32.shape[1])):
+            for j in cutlass.range_constexpr(cute.size(frag32.shape[0][1])):
+                for i in cutlass.range_constexpr(frag32.shape[0][2] // 2):
+                    tmp = frag32[((1, j, 2 * i), mi)]
+                    frag32[((1, j, 2 * i), mi)] = frag32[((0, j, 2 * i + 1), mi)]
+                    frag32[((0, j, 2 * i + 1), mi)] = tmp
+
+        frag = cute.group_modes(cute.recast_tensor(acc, cutlass.Int64), 1, cute.rank(acc))
+        n8 = frag.shape[0][2]
+        assert n8 % 2 == 0
+        quad_idx = cute.arch.lane_idx() % 4
+        lane_03 = quad_idx == 0 or quad_idx == 3
+        upper_src = Int32(0)
+        if quad_idx == 1:
+            upper_src = Int32(2)
+        elif quad_idx == 2:
+            upper_src = Int32(3)
+        elif quad_idx == 3:
+            upper_src = Int32(1)
+        lower_src = upper_src ^ Int32(2)
+        for mi in cutlass.range_constexpr(cute.size(frag.shape[1])):
+            for j in cutlass.range_constexpr(cute.size(frag.shape[0][1])):
+                for i in cutlass.range_constexpr(n8 // 2):
+                    upper = frag[((0, j, 2 * i), mi)]
+                    lower = frag[((0, j, 2 * i + 1), mi)]
+                    upper0, lower0 = upper, lower
+                    if not lane_03:
+                        upper0, lower0 = lower, upper
+                    upper0 = utils.shuffle_sync(upper0, upper_src, width=4)
+                    lower0 = utils.shuffle_sync(lower0, lower_src, width=4)
+                    if lane_03:
+                        frag[((0, j, 2 * i), mi)] = upper0
+                        frag[((0, j, 2 * i + 1), mi)] = lower0
+                    else:
+                        frag[((0, j, 2 * i), mi)] = lower0
+                        frag[((0, j, 2 * i + 1), mi)] = upper0
+
+    @cute.jit
+    def _reshape_acc_to_fp8_frgA(self, acc):
+        """SM90 FP8 form of FA3 convert_layout_acc_Aregs."""
+        layout = acc.layout
+        n8 = layout.shape[0][2]
+        assert n8 % 4 == 0
+        frg_layout = cute.make_layout(
+            ((4, 2, 2), layout.shape[1], (n8 // 4, layout.shape[2])),
+            stride=(
+                (1, 4, 8),
+                layout.stride[1],
+                (16, layout.stride[2]),
+            ),
+        )
+        return cute.make_tensor(acc.iterator, frg_layout)
+
+    @cute.jit
+    def _prepare_fp8_probabilities(self, acc_S, tOrP, tOrP_res):
+        """Convert softmax probabilities into compensated FP8 PV A fragments."""
+        self._permute_Cregs_fp8(acc_S)
+        tP_acc = self._reshape_acc_to_fp8_frgA(acc_S)
+        p_scaled = tP_acc.load() * Float32(self.fp8_p_scale)
+        p_hi = p_scaled.to(self.kv_dtype)
+        tOrP.store(p_hi)
+        tOrP_res.store((p_scaled - p_hi.to(Float32)).to(self.kv_dtype))
 
     @cute.jit
     def first_half_block_overlap_fp8(
@@ -1852,11 +2137,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         is_first_block: bool = False,
         dequant_params: Optional[SimpleNamespace] = None,
     ):
-        """FP8-KV first-half block: cooperative 256-thread cast of the first K tile
-        + DequantK barrier, then the synchronous QK."""
+        """FP8-KV first half: rearrange K, synchronize, then issue QK."""
         dp = dequant_params
         nthr = const_expr(self.num_mma_threads)
-        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(0))
+        self._copy_staged_fp8_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(0))
         cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
 
@@ -1864,9 +2148,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
-        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
-        tOrP_cur = tOrP
-        tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+        self._prepare_fp8_probabilities(acc_S, tOrP, smem_copy_params.tOrP_res)
         if const_expr(self.rescale_O_before_gemm):
             acc_O.fill(0.0)
             scores_scale.store(row_scale.load())
@@ -1907,18 +2189,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: Optional[cute.Tensor] = None,
         dequant_params: Optional[SimpleNamespace] = None,
     ):
-        """FP8-KV final PV: each WG casts its own hdimv-half of the last V tile
-        + WG-local DequantV barrier, then the synchronous PV."""
+        """FP8-KV final PV: each WG rearranges its V half before the synchronous PV."""
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         dp = dequant_params
         nthr_wg = const_expr(self.num_threads_per_warp_group)
-        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_V, dp.tsV, Int32(1))
+        self._transpose_staged_fp8_v(dp, Int32(1))
         if dp.warp_group_idx == 0:
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
         else:
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV1), number_of_threads=nthr_wg)
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
+        self._permute_output_fp8(acc_O)
         kv_consumer_state.advance()
         return kv_consumer_state
 
@@ -2082,7 +2364,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         nthr = const_expr(self.num_mma_threads)
         nthr_wg = const_expr(self.num_threads_per_warp_group)
         # ---- 1. cast K[n] -> sK (cooperative 256-thread, staging phase 1) ----
-        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(1))
+        self._copy_staged_fp8_tile(dp.pipeline_stage, dp.tStage_K, dp.tsK, Int32(1))
         cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantK), number_of_threads=nthr)
         # ---- 2. S = Q @ K.T (async) ----
         self.warp_scheduler_barrier_sync()
@@ -2090,7 +2372,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         # ---- 3. cast V[n_prev] -> sV (WG-split, phase 0) WHILE QK[n] runs ----
-        self._cast_tile_fp8_to_f16(dp.pipeline_stage, dp.tStage_V, dp.tsV, Int32(0))
+        self._transpose_staged_fp8_v(dp, Int32(0))
         if dp.warp_group_idx == 0:
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
         else:
@@ -2105,9 +2387,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mask_fn(acc_S=acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
-        tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
-        tOrP_cur = tOrP
-        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        self._prepare_fp8_probabilities(acc_S, tOrP, smem_copy_params.tOrP_res)
         if const_expr(not self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, row_scale)
         if const_expr(self.rescale_O_before_gemm):

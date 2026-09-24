@@ -777,10 +777,12 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     if fp8_kv_dequant:
-        # FP8-KV in-kernel dequant: fp16/bf16 Q + fp8 e4m3 K/V (dequantized in-kernel to
-        # fp16), fp16/bf16 O. Compute is always fp16 (the single-instruction fp8->fp16 fast
-        # path); a bf16 Q is narrowed to fp16 in-kernel and the fp32 accumulator is cast to
-        # O's dtype in the epilogue, so Q/O dtypes are independent of compute. SM90 only.
+        # SM90 FP8 MMA: fp16/bf16 Q is represented as compensated E4M3 pairs;
+        # paged E4M3 K/V remain FP8 WGMMA operands, and accumulation is FP32.
+        # The epilogue casts FP32 accumulators to the native fp16/bf16 output dtype.
+        assert q is not None and qv is None, (
+            "fp8_kv_dequant requires Q and does not support QV-only input"
+        )
         assert q.dtype in (torch.float16, torch.bfloat16), (
             "fp8_kv_dequant requires fp16 or bf16 Q"
         )
@@ -788,6 +790,18 @@ def _flash_attn_fwd(
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
         assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
+        if dynamic_causal is not None:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 MMA does not support dynamic_causal"
+            )
+        if block_sparse_tensors is not None:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 MMA does not support block sparsity"
+            )
+        assert head_dim == head_dim_v == 512, (
+            "FA4 SM90 FP8 MMA currently requires head_dim == head_dim_v == 512; "
+            f"got head_dim={head_dim}, head_dim_v={head_dim_v}."
+        )
     else:
         input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
         present = {name: t for name, t in input_tensors.items() if t is not None}
@@ -852,7 +866,7 @@ def _flash_attn_fwd(
         pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
-    if is_fp8 and requires_grad:
+    if (is_fp8 or fp8_kv_dequant) and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     if output_scale is not None:
         assert output_scale.dtype == torch.float32, "output_scale must be float32"
@@ -931,23 +945,44 @@ def _flash_attn_fwd(
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
-    if fp8_kv_dequant and q_descale is None:
-        # fp16 Q has no q-scale; materialize an identity (1.0) q_descale so the
-        # DescaleTensors struct has all three fields present (identity q is a no-op).
-        _ref_descale = k_descale if k_descale is not None else v_descale
-        q_descale = (
-            torch.ones_like(_ref_descale)
-            if _ref_descale is not None
-            else torch.ones((batch_size, num_head_kv), dtype=torch.float32, device=q.device)
+    if fp8_kv_dequant and any(
+        t is None for t in (q_descale, k_descale, v_descale)
+    ):
+        # DescaleTensors' MLIR reconstruction packs present values positionally.
+        # Materialize every missing slot so configurations such as V-only scaling
+        # cannot shift V into the K field and silently corrupt QK/PV scaling.
+        _ref_descale = next(
+            (t for t in (q_descale, k_descale, v_descale) if t is not None),
+            None,
         )
+        if _ref_descale is None:
+            identity_descale = torch.ones(
+                (batch_size, num_head_kv), dtype=torch.float32, device=q.device
+            )
+        else:
+            identity_descale = torch.ones_like(
+                _ref_descale, memory_format=torch.contiguous_format
+            )
+        q_descale, k_descale, v_descale = [
+            t if t is not None else identity_descale
+            for t in (q_descale, k_descale, v_descale)
+        ]
+    # Expanded scalar scales can have a zero stride even when every size is
+    # one; Tensor.contiguous() may preserve that layout. Copy only those
+    # tensors whose CuTe dynamic leading dimension is not actually unit-stride.
+    q_descale, k_descale, v_descale = [
+        t.clone(memory_format=torch.contiguous_format)
+        if t is not None and t.stride(-1) != 1
+        else t
+        for t in (q_descale, k_descale, v_descale)
+    ]
     dtype = torch2cute_dtype_map[q_dtype]
     kv_dtype = torch2cute_dtype_map[k.dtype] if fp8_kv_dequant else dtype
     if fp8_kv_dequant:
         assert arch // 10 == 9, "fp8_kv_dequant is an SM90-only forward (compute capability 9.x)"
-        # Compute is fp16 regardless of the (fp16/bf16) Q dtype: the fp8->fp16 cvt is the
-        # only single-instruction widening on SM90. The kernel derives the Q/O tensor
-        # dtypes from mQ/mO (which keep q.dtype / out_torch_dtype), narrowing bf16 Q to
-        # fp16 in-kernel and casting the fp32 accumulator to O's dtype in the epilogue.
+        # This dtype selects fp16 auxiliary layouts/conversions. QK and PV use
+        # compensated E4M3 operands with FP8 WGMMA and FP32 accumulation; mQ/mO
+        # retain the caller's fp16/bf16 input and output dtypes.
         dtype = torch2cute_dtype_map[torch.float16]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
@@ -1000,6 +1035,10 @@ def _flash_attn_fwd(
     intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     if fp8_kv_dequant:
+        assert intra_wg_overlap, (
+            "FA4 SM90 FP8 MMA requires intra_wg_overlap=True until a compatible "
+            "non-overlap control flow is implemented."
+        )
         # Force RS-mode PV: frees sP for the fp8 staging buffer, keeping smem within
         # budget at d=512 while preserving intra-WG overlap.
         mma_pv_is_rs = True
@@ -1483,10 +1522,10 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         output_quant_key,
         fp8_kv_dequant,
-        # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
-        # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
-        # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
-        q.dtype,
+        # FP8 MMA uses a fixed fp16 auxiliary dtype, so `dtype` no longer captures
+        # native Q/O tensor dtypes. Key on them explicitly for quantization and
+        # epilogue selection. This is redundant for the other paths.
+        q_dtype,
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
@@ -1532,7 +1571,7 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
         q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
+            to_cute_tensor(t, assumed_align=4, leading_dim=1) if t is not None else None
             for t in (q_descale, k_descale, v_descale)
         )
         descale_tensors_tensor = (
@@ -1879,8 +1918,8 @@ def _flash_attn_fwd(
                 for t in (q_call, k_call, v_call, qv_call)
             ]
         elif fp8_kv_dequant:
-            # FP8-KV dequant: Q is fp16/bf16 but K/V are fp8 e4m3 -- apply the same uint8
-            # FFI workaround to K/V only (the compiled kernel takes them as uint8).
+            # FP8 MMA has native fp16/bf16 Q and E4M3 K/V. Apply the uint8 FFI
+            # workaround to K/V only (the compiled kernel takes them as uint8).
             k_call = k_call.view(torch.uint8)
             v_call = v_call.view(torch.uint8)
         out_call = out.detach()

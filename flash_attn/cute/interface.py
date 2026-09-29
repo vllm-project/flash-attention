@@ -1006,7 +1006,7 @@ def _flash_attn_fwd(
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
     # under 128 query heads per KV head only the decode kernel runs DSA gather natively
-    use_decode = (
+    use_sparse_decode = (
         qv is not None
         and q is not None
         and gather_kv_indices is not None
@@ -1025,7 +1025,7 @@ def _flash_attn_fwd(
         and output_quant_key is None
     )
     decode_splits = None
-    if use_decode:
+    if use_sparse_decode:
         decode_splits = mla_decode_splits(
             total_q, num_head_kv, qhead_per_kvhead,
             get_num_sms_for_selection(device.index, arch),
@@ -1037,7 +1037,7 @@ def _flash_attn_fwd(
     if is_split_kv:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
-            (num_splits, lse_shape[1], lse_shape[0]) if use_decode
+            (num_splits, lse_shape[1], lse_shape[0]) if use_sparse_decode
             else (num_splits, *lse_shape)
         )
         if isinstance(q, _CompileOnlyTensorSpec):
@@ -1189,7 +1189,7 @@ def _flash_attn_fwd(
         )
         assert tile_n == 128
 
-        assert not is_split_kv or use_decode, (
+        assert not is_split_kv or use_sparse_decode, (
             "split kv with qv is only supported on the varlen top-k gather path"
         )
         assert learnable_sink is None
@@ -1249,7 +1249,7 @@ def _flash_attn_fwd(
 
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
-    if use_dedicated_hd256_kernel or use_decode:
+    if use_dedicated_hd256_kernel or use_sparse_decode:
         # These kernels use their own fixed scheduling and ignore dynamic metadata.
         scheduler_metadata = None
     elif (
@@ -1274,7 +1274,7 @@ def _flash_attn_fwd(
         and not disable_scheduler_metadata
         and arch // 10 in [10, 11]
         and not use_dedicated_hd256_kernel
-        and not use_decode
+        and not use_sparse_decode
     ):
         scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
@@ -1341,7 +1341,7 @@ def _flash_attn_fwd(
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and not use_dedicated_hd256_kernel
-        and not use_decode
+        and not use_sparse_decode
     )
     if (
         use_cu_hint
@@ -1631,7 +1631,7 @@ def _flash_attn_fwd(
                 assert not use_dedicated_hd256_kernel, (
                     "fused FP8 output + head_dim=256 kernel not supported yet"
                 )
-            if qv is not None and use_decode:
+            if qv is not None and use_sparse_decode:
                 fa_fwd = FlashAttentionMLADecodeSm100(
                     topk_length=gather_kv_length,
                     qhead_per_kvhead=qhead_per_kvhead,
@@ -1754,7 +1754,7 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        if qv is not None and use_decode:
+        if qv is not None and use_sparse_decode:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
                 q_tensor,
@@ -1877,7 +1877,7 @@ def _flash_attn_fwd(
             if q_descale is not None or k_descale is not None or v_descale is not None
             else None
         )
-        if qv is not None and use_decode:
+        if qv is not None and use_sparse_decode:
             _flash_attn_fwd.compile_cache[compile_key](
                 q_call,
                 qv_call,
@@ -1974,7 +1974,7 @@ def _flash_attn_fwd(
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
-        if use_decode:
+        if use_sparse_decode:
             # decode partials are per token row: one batch of length total_q, no cu_seqlens
             _flash_attn_fwd_combine(
                 out_partial.unsqueeze(1),                    # (S, 1, total_q, h, dv)

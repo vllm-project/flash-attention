@@ -5,9 +5,22 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.cutlass_dsl import dsl_user_op
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
+
+
+@dsl_user_op
+def fence_tcgen05_before_thread_sync(*, loc=None, ip=None) -> None:
+    """Order prior tcgen05 operations before a cross-thread barrier arrival."""
+    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_tcgen05_after_thread_sync(*, loc=None, ip=None) -> None:
+    """Order a following tcgen05 op after the cross-thread barrier wait that precedes it."""
+    nvvm.tcgen05_fence(nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC, loc=loc, ip=ip)
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:

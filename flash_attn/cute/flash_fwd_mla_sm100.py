@@ -364,6 +364,7 @@ class FlashAttentionMLAForwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mDynamicCausal: Optional[cute.Tensor] = None,
         mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
+        mTopkValidLen: Optional[cute.Tensor] = None,  # (b, s_q)      or (total_q,)      if there is cu_seqlens_q
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
@@ -447,7 +448,11 @@ class FlashAttentionMLAForwardSm100:
                 mRowMax.iterator, cute.select(mRowMax.layout, mode=rowmax_layout_transpose)
             )
 
-        topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
+        # (b, s_q) -> (s_q, b); varlen (total_q,) needs no transpose
+        if const_expr(mTopkValidLen is not None and mCuSeqlensQ is None):
+            mTopkValidLen = cute.make_tensor(
+                mTopkValidLen.iterator, cute.select(mTopkValidLen.layout, mode=[1, 0])
+            )
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
         self.p_layout = cutlass.utils.LayoutEnum.ROW_MAJOR
@@ -717,6 +722,7 @@ class FlashAttentionMLAForwardSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mIndexTopk,
+            mTopkValidLen,
             mPageTable,
             tma_atom_Q,
             tma_atom_Qv,
@@ -742,7 +748,6 @@ class FlashAttentionMLAForwardSm100:
             tiled_mma_PVt,
             softmax_scale,
             softmax_scale_log2,
-            topk_length_dynamic,
             tile_sched_params,
             SharedStorage,
         ).launch(
@@ -774,6 +779,7 @@ class FlashAttentionMLAForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mIndexTopk: Optional[cute.Tensor],
+        mTopkValidLen: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_Qv: cute.CopyAtom,
@@ -799,7 +805,6 @@ class FlashAttentionMLAForwardSm100:
         tiled_mma_PVt: cute.TiledMma,
         softmax_scale: Float32,
         softmax_scale_log2: Float32,
-        topk_length_dynamic: Optional[Int32],
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
@@ -1053,7 +1058,7 @@ class FlashAttentionMLAForwardSm100:
                     pipeline_K_cpasync,
                     pipeline_V_cpasync,
                     sO_empty_mbar_ptr,
-                    topk_length_dynamic,
+                    mTopkValidLen,
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
@@ -1078,7 +1083,7 @@ class FlashAttentionMLAForwardSm100:
                     pipeline_V_cpasync,
                     pipeline_bitmask,
                     sO_empty_mbar_ptr,
-                    topk_length_dynamic,
+                    mTopkValidLen,
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
@@ -1113,7 +1118,7 @@ class FlashAttentionMLAForwardSm100:
                 thr_mma_QK,
                 thr_mma_QvV,
                 thr_mma_PVt,
-                topk_length_dynamic,
+                mTopkValidLen,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1154,7 +1159,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_O1,
                 sO_empty_mbar_ptr,
                 is_leader_cta,
-                topk_length_dynamic,
+                mTopkValidLen,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1188,7 +1193,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_bitmask,
                 sO_empty_mbar_ptr,
                 AttentionMaskCls,
-                topk_length_dynamic,
+                mTopkValidLen,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1225,7 +1230,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_sm_stats,
                 sO_empty_mbar_ptr,
                 tiled_copy_O_r2g,
-                topk_length_dynamic,
+                mTopkValidLen,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1267,6 +1272,24 @@ class FlashAttentionMLAForwardSm100:
             work_tile = tile_scheduler.advance_to_next_work()
 
     @cute.jit
+    def topk_n_block_max(
+        self,
+        mTopkValidLen: Optional[cute.Tensor],
+        m_idx: Int32,
+        batch_idx: Int32,
+        has_cu_seqlens_q: cutlass.Constexpr[bool],
+    ) -> Int32:
+        """n-block count for a query row; all warp roles must pass the m_idx slicing mIndexTopk."""
+        n_block_max_full = self.topk_length // self.tile_n
+        if const_expr(mTopkValidLen is None):
+            return Int32(n_block_max_full)
+        valid_len = (
+            mTopkValidLen[m_idx] if const_expr(has_cu_seqlens_q) else mTopkValidLen[m_idx, batch_idx]
+        )
+        # the mainloop always walks one block; a zero-length row is fully masked (out=0, lse=-inf)
+        return max(Int32(1), min(cute.ceil_div(valid_len, self.tile_n), Int32(n_block_max_full)))
+
+    @cute.jit
     def relay(
         self,
         pipeline_K: Optional[pipeline.PipelineAsyncUmma],
@@ -1274,7 +1297,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_K_cpasync: Optional[pipeline.PipelineAsync],
         pipeline_V_cpasync: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: Optional[cute.Pointer],
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1305,8 +1328,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
+                m_idx_topk = cluster_m_block + (
+                    0 if const_expr(self.use_packed_varlen_sched) else seqlen.offset_q
+                )
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen, m_idx_topk, batch_idx, seqlen.has_cu_seqlens_q
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -1377,7 +1404,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_V_cpasync: pipeline.PipelineAsync,
         pipeline_bitmask: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: Optional[cute.Pointer],
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1424,8 +1451,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
+                m_idx_topk = cluster_m_block + (
+                    0 if const_expr(self.use_packed_varlen_sched) else seqlen.offset_q
+                )
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen, m_idx_topk, batch_idx, seqlen.has_cu_seqlens_q
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -1435,18 +1466,14 @@ class FlashAttentionMLAForwardSm100:
 
             if const_expr(self.is_topk_gather):
                 # ==== Topk gather path ====
-                # cluster_m_block == m_idx under MQA 128 assumption
-                m_idx = cluster_m_block
+                # same row the n-block count came from, or the K/V and bitmask pipelines desync
                 if const_expr(not seqlen.has_cu_seqlens_q):
-                    mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                    mIndexTopk_cur = mIndexTopk[None, m_idx_topk, batch_idx]
                 else:
-                    offset_q = seqlen.offset_q if const_expr(not self.use_packed_varlen_sched) else 0
-                    mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
+                    mIndexTopk_cur = mIndexTopk[None, m_idx_topk]
 
                 if const_expr(self.is_causal):
-                    m_local_idx = (
-                        m_idx - seqlen.offset_q if const_expr(self.use_packed_varlen_sched) else m_idx
-                    )
+                    m_local_idx = m_idx_topk - seqlen.offset_q
                     seqlen_k_limit = m_local_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
                 else:
                     seqlen_k_limit = seqlen.seqlen_k
@@ -1857,7 +1884,7 @@ class FlashAttentionMLAForwardSm100:
         thr_mma_QK: cute.ThrMma,
         thr_mma_QvV: cute.ThrMma,
         thr_mma_PVt: cute.ThrMma,
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1894,8 +1921,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen,
+                    cluster_m_block + seqlen.offset_q,
+                    batch_idx,
+                    seqlen.has_cu_seqlens_q,
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2175,7 +2206,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_O1: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: Optional[cute.Pointer],
         is_leader_cta: Boolean,
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -2303,8 +2334,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen,
+                    cluster_m_block + seqlen.offset_q,
+                    batch_idx,
+                    seqlen.has_cu_seqlens_q,
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2496,7 +2531,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_bitmask: Optional[pipeline.PipelineAsync],
         sO_empty_mbar_ptr: Optional[cute.Pointer],
         AttentionMaskCls: Callable,
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -2573,8 +2608,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen,
+                    cluster_m_block + seqlen.offset_q,
+                    batch_idx,
+                    seqlen.has_cu_seqlens_q,
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,
@@ -2890,7 +2929,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: Optional[cute.Pointer],
         tiled_copy_O_r2g: cute.TiledCopy,
-        topk_length_dynamic: Optional[Int32],
+        mTopkValidLen: Optional[cute.Tensor],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -2967,8 +3006,12 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
-                # n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_n_block_max(
+                    mTopkValidLen,
+                    cluster_m_block + seqlen.offset_q,
+                    batch_idx,
+                    seqlen.has_cu_seqlens_q,
+                )
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen,

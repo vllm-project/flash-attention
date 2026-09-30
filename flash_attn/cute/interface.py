@@ -344,29 +344,43 @@ def _make_compile_only_tensor_spec(
 
 
 def mla_decode_splits(total_q, nheads_kv, qhead_per_kvhead, num_SMs, num_n_blocks):
-    """Choose head groups and KV splits for the sparse decode grid."""
+    """Choose head groups and KV splits for the sparse decode grid.
+
+    More than 16 query heads per KV head only reach this kernel when DCP gathers 16 heads per
+    rank, so each rank holds about 16 / qhead_per_kvhead of the top-k, packed at the front of the
+    gather width. Such grids split at least qhead_per_kvhead // 8 ways, so that two splits see
+    valid blocks, and never spend an extra wave on splitting.
+    """
     supported = FlashAttentionMLADecodeSm100.SUPPORTED_HEADS
-    waves = lambda ctas: -(-ctas // num_SMs)
+    waves = lambda groups, splits: -(-total_q * nheads_kv * groups * splits // num_SMs)
     head_groups = next(g for g in (1, 2, 4, 8) if qhead_per_kvhead // g in supported)
-    ctas = total_q * nheads_kv * head_groups
-    # minimize waves per split, with at least two blocks per split and at most one extra wave
-    splits, best_cost, candidate = 1, waves(ctas), 2
-    while (
-        num_n_blocks % candidate == 0
-        and num_n_blocks // candidate >= 2
-        and waves(ctas * candidate) <= waves(ctas) + 1
+    min_splits, extra_waves = (qhead_per_kvhead // 8, 0) if qhead_per_kvhead > 16 else (2, 1)
+    # Fewest waves per split, with at least two blocks per split.
+    candidates = [1] + [
+        s
+        for s in (min_splits << i for i in range(num_n_blocks.bit_length()))
+        if num_n_blocks % s == 0
+        and num_n_blocks // s >= 2
+        and waves(head_groups, s) <= waves(head_groups, 1) + extra_waves
+    ]
+    splits = min(candidates, key=lambda s: waves(head_groups, s) / s)
+
+    def grow_head_groups(groups, min_heads):
+        while (
+            qhead_per_kvhead // (2 * groups) in supported
+            and qhead_per_kvhead // (2 * groups) >= min_heads
+            and waves(2 * groups, splits) == waves(groups, splits)
+        ):
+            groups *= 2
+        return groups
+
+    # Fill the last wave: head groups down to 16 heads, then one block per split, then 8 heads.
+    head_groups = grow_head_groups(head_groups, 16)
+    if 2 * splits == num_n_blocks and (
+        waves(head_groups, num_n_blocks) == waves(head_groups, splits)
     ):
-        cost = waves(ctas * candidate) / candidate
-        if cost < best_cost:
-            splits, best_cost = candidate, cost
-        candidate *= 2
-    # Add head groups while the grid still fits the same number of waves.
-    while (
-        2 * head_groups <= 8
-        and qhead_per_kvhead // (2 * head_groups) in supported
-        and waves(2 * ctas * splits) == waves(ctas * splits)
-    ):
-        head_groups, ctas = 2 * head_groups, 2 * ctas
+        splits = num_n_blocks
+    head_groups = grow_head_groups(head_groups, 8)
     return head_groups, splits
 
 

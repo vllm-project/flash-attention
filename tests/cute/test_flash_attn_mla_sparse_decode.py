@@ -14,7 +14,7 @@ from flash_attn.cute import flash_attn_varlen_func
 NUM_KV_ROWS = 4096
 HEADS = [8, 16, 32, 64]
 # one total_q per (G, S) class the split rule produces at 148 SMs, plus multi-wave grids
-TOTAL_Q = [1, 9, 18, 37, 74, 148, 222, 300]
+TOTAL_Q = [1, 2, 4, 9, 18, 37, 74, 148, 222, 300]
 
 pytestmark = pytest.mark.skipif(not IS_SM100, reason="sparse MLA forward is SM100 only")
 

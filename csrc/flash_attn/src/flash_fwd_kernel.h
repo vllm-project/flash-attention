@@ -1222,7 +1222,29 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
+                // gLSE_unpadded's final_layout addresses this as batch*params.seqlen_q +
+                // row (i.e. assumes every batch occupies exactly params.seqlen_q slots),
+                // which only matches the real (unpadded/concatenated) softmax_lse output
+                // tensor -- shape (h, total_q), addressed via cu_seqlens_q -- when every
+                // batch's true length equals params.seqlen_q. For a ragged varlen batch
+                // (cu_seqlens_q set, ragged batch), decode this flat offset into its
+                // (batch, head, row) coordinates the same way the O write-back below does,
+                // skip rows past that batch's real length, and address the true output
+                // tensor via cu_seqlens_q directly instead of gLSE_unpadded's padded
+                // layout. (Borrowed from vllm-project/flash-attention#2542, which fixed
+                // this same case but wasn't merged; adapted to this function's naming.)
+                if (params.cu_seqlens_q != nullptr) {
+                    const int batch_idx = lse_offset / (params.h * params.seqlen_q);
+                    const int head_idx = (lse_offset - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
+                    const int row = lse_offset - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
+                    const int actual_seqlen_q = params.cu_seqlens_q[batch_idx + 1] - params.cu_seqlens_q[batch_idx];
+                    if (row < actual_seqlen_q) {
+                        const index_t lse_addr = head_idx * index_t(params.total_q) + params.cu_seqlens_q[batch_idx] + row;
+                        reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)[lse_addr] = lse_logsum;
+                    }
+                } else {
+                    gLSE_unpadded(lse_offset) = lse_logsum;
+                }
             }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
@@ -1295,7 +1317,21 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
             // The index to the rows of Q
             const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride
+            // The combine grid is sized off params.seqlen_q (the padded/representative
+            // per-batch query count), but for varlen (cu_seqlens_q != nullptr) calls the
+            // final output tensor is unpadded/concatenated (shape (total_q, h, d), no
+            // per-batch stride). BlockInfo::q_offset already encodes exactly this
+            // distinction (used by every other write path in this file); reusing it here
+            // instead of `batch_idx * params.o_batch_stride` fixes address collisions
+            // across batches whenever this combine path is reached with cu_seqlens_q set
+            // (o_batch_stride is 0 in that layout, so the old formula collapsed to 0
+            // regardless of batch_idx). If a batch's true length is shorter than the
+            // padded params.seqlen_q (ragged varlen), skip rows past its real length —
+            // there is no destination slot for them in the concatenated output tensor.
+            const BlockInfo</*Varlen=*/true> binfo(params, batch_idx);
+            if (row >= binfo.actual_seqlen_q) { continue; }
+            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr)
+                + binfo.q_offset(params.o_batch_stride, params.o_row_stride, batch_idx)
                 + head_idx * params.o_head_stride + row * params.o_row_stride;
             #pragma unroll
             for (int k = 0; k < size<2>(rO); ++k) {

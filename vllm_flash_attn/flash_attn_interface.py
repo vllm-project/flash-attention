@@ -248,8 +248,22 @@ def flash_attn_varlen_func(
                 )
         if s_aux is not None:
             raise NotImplementedError("FA2 does not support s_aux")
-        if num_splits > 1:
-            raise NotImplementedError("FA2 does not support num_splits > 1")
+        # NOTE: num_splits > 1 used to be unconditionally rejected here for
+        # every FA2 varlen call. It's now permitted for paged_KV (block_table
+        # is not None) calls that explicitly request it (see PR description /
+        # #2448 /#2550 /#2542), matching csrc/flash_attn/flash_api.cpp's gate
+        # (paged_KV && num_splits > 1). For the non-paged_KV case this PR does
+        # not touch, keep the explicit rejection here rather than dropping it:
+        # the C++ side silently ignores num_splits > 1 in that case (falls
+        # through to the "no split" branch, params.num_splits stays 0) instead
+        # of erroring, and a caller who asked for a specific split count
+        # should be told it was not honored rather than have it dropped
+        # quietly.
+        if num_splits > 1 and block_table is None:
+            raise NotImplementedError(
+                "FA2 does not support num_splits > 1 without paged KV "
+                "(block_table)"
+            )
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
             out,

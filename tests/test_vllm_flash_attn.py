@@ -279,6 +279,18 @@ def test_flash_attn_with_paged_kv(
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("aot_schedule", [True, False])
 @pytest.mark.parametrize("fa_version", VERSIONS)
+# num_splits > 1 for varlen + paged KV (max_seqlen_q > 1, i.e. not the
+# seqlenq_ngroups_swapped decode path) used to be hard-blocked (see #2448/#2550/
+# #2542): combine_attn_seqk_parallel's O/LSE write-back assumed a fixed-shape
+# (non-varlen) output tensor and collided addresses across batches whenever a
+# real split was reached with cu_seqlens_q set. Fixed via BlockInfo::q_offset
+# (matching the convention every other write path in that file already used).
+# This test's seq_lens are already ragged (query lens 1/5/129), so parametrizing
+# num_splits here exercises both the write-back fix and its row >=
+# binfo.actual_seqlen_q boundary skip for ragged batches, on top of the existing
+# correctness sweep (dtype/head_size/block_size/soft_cap/...). Only meaningful
+# for FA2 (this fix is in csrc/flash_attn, not the FA3 sources under hopper/).
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
 @torch.inference_mode()
 def test_varlen_with_paged_kv(
         seq_lens: List[Tuple[int, int]],
@@ -291,7 +303,10 @@ def test_varlen_with_paged_kv(
         num_blocks: int,
         aot_schedule: bool,
         fa_version: int,
+        num_splits: int,
 ) -> None:
+    if num_splits > 1 and fa_version != 2:
+        pytest.skip("num_splits > 1 for varlen paged KV is only fixed for FA2")
     torch.set_default_device("cuda")
     torch.cuda.manual_seed_all(0)
     num_seqs = len(seq_lens)
@@ -360,7 +375,8 @@ def test_varlen_with_paged_kv(
         block_table=block_tables,
         softcap=soft_cap if soft_cap is not None else 0,
         scheduler_metadata=scheduler_metadata,
-        fa_version=fa_version
+        fa_version=fa_version,
+        num_splits=num_splits,
     )
 
     ref_output = ref_paged_attn(

@@ -753,8 +753,32 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
+    // #2448 widened split-KV eligibility to any paged_KV call, which (per #2550/#2542)
+    // exposed a pre-existing combine_attn_seqk_parallel bug: its O/LSE write-back assumed
+    // a fixed-shape (non-varlen) output tensor and collided addresses across batches once
+    // num_splits > 1 was actually reached with cu_seqlens_q set. #2542 fixed that bug but
+    // was closed ("performance gains are minimal") because gating on paged_KV alone
+    // enables split-KV unconditionally for every paged_KV call regardless of caller
+    // intent, including cases where it isn't worth the combine overhead (its own
+    // benchmark showed splits=2/4 slower than splits=0 across kv_len 512-16384) --
+    // diluting the average across callers who never asked for it.
+    //
+    // The fix above (BlockInfo::q_offset / cu_seqlens_q-based LSE addressing) is
+    // correctness-general: it doesn't depend on max_seqlen_q or how ragged the batch is.
+    // So rather than have this function guess when splitting is worth it, gate purely on
+    // whether the caller explicitly requested a specific num_splits > 1 (mha_varlen_fwd
+    // already exposes num_splits as a parameter, added in #110) -- that is strictly
+    // narrower than #2448/#2542's blanket "any paged_KV call" gate, since it only fires
+    // for callers that opt in, and it puts the perf tradeoff where the caller (who knows
+    // its own access pattern, e.g. a speculative-decoding verify step reusing the same
+    // small max_seqlen_q every round) can make it. The default num_splits == 0 ("let the
+    // heuristic decide") is deliberately EXCLUDED from this gate, not just num_splits == 1:
+    // almost every existing caller never sets num_splits and relies on that 0 default, so
+    // routing 0 into set_params_splitkv here would silently auto-split (and hit the new
+    // combine code path) for callers who never opted into anything, which is exactly the
+    // blanket-enable #2542 was closed for. num_splits == 0 or == 1 both reproduce the exact
+    // pre-existing #2550 behavior; only an explicit num_splits > 1 request takes this path.
+    if (seqlenq_ngroups_swapped || (paged_KV && num_splits > 1)) {
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,

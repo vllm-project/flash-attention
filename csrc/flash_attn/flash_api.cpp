@@ -753,16 +753,11 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
-        std::tie(softmax_lse_accum, out_accum) =
-            set_params_splitkv(params, batch_size, num_heads, head_size,
-                               max_seqlen_k, max_seqlen_q, head_size_rounded,
-                               p_dropout, num_splits, get_num_sm(get_current_device()), q);
-    } else if (paged_KV) {
-        STD_TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
-        params.num_splits = num_splits;
-    }
+    std::tie(softmax_lse_accum, out_accum) =
+        set_params_splitkv(params, batch_size, num_heads, head_size,
+                           max_seqlen_k, max_seqlen_q, head_size_rounded,
+                           p_dropout, num_splits, get_num_sm(get_current_device()), q);
+    if (num_splits < 1 && params.num_splits == 1) { params.num_splits = 0; }
 
     if (leftpad_k_.has_value()) {
         auto leftpad_k = leftpad_k_.value();

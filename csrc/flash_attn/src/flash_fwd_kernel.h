@@ -1222,7 +1222,23 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
+                if (params.cu_seqlens_q != nullptr && !params.seqlenq_ngroups_swapped) {
+                    // Varlen: the unpadded LSE is (h, total_q) packed by
+                    // cu_seqlens_q; the uniform remap above assumes equal
+                    // sequence lengths and would misplace shorter ones.
+                    const int b_i = lse_offset / (params.h * params.seqlen_q);
+                    const int h_i = (lse_offset - (index_t)b_i * params.h * params.seqlen_q) / params.seqlen_q;
+                    const int r_i = lse_offset - ((index_t)b_i * params.h + h_i) * params.seqlen_q;
+                    const int q_start = params.cu_seqlens_q[b_i];
+                    const int q_len_b = params.cu_seqlens_q[b_i + 1] - q_start;
+                    if (r_i < q_len_b) {
+                        const index_t total_q = params.cu_seqlens_q[params.b];
+                        reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)
+                            [(index_t)h_i * total_q + q_start + r_i] = lse_logsum;
+                    }
+                } else {
+                    gLSE_unpadded(lse_offset) = lse_logsum;
+                }
             }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
@@ -1295,8 +1311,21 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
             // The index to the rows of Q
             const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride
-                + head_idx * params.o_head_stride + row * params.o_row_stride;
+            index_t o_row_offset;
+            if (params.cu_seqlens_q != nullptr && !params.seqlenq_ngroups_swapped) {
+                // Varlen: O rows are packed by cu_seqlens_q — there is no
+                // batch stride, and rows beyond a sequence's actual length
+                // have no O slot (params.seqlen_q is the max across seqs).
+                const int q_start = params.cu_seqlens_q[batch_idx];
+                const int q_len_b = params.cu_seqlens_q[batch_idx + 1] - q_start;
+                if (row >= q_len_b) { continue; }
+                o_row_offset = (index_t)(q_start + row) * params.o_row_stride
+                    + head_idx * params.o_head_stride;
+            } else {
+                o_row_offset = batch_idx * params.o_batch_stride
+                    + head_idx * params.o_head_stride + row * params.o_row_stride;
+            }
+            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + o_row_offset;
             #pragma unroll
             for (int k = 0; k < size<2>(rO); ++k) {
                 if (Is_even_K || tOpOaccum(k)) {

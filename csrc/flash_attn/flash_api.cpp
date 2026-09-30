@@ -363,6 +363,13 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::stable::new_empty(ref, {params.num_splits, batch_size, num_heads, max_seqlen_q}, ScalarType::Float);
             out_accum = torch::stable::new_empty(ref, {params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded}, ScalarType::Float);
+            // Pre-initialize the accumulators: with varlen + paged KV +
+            // causal multi-token queries, empty splits can leave slots
+            // unwritten; uninitialized memory then reaches the combine
+            // kernel (observed as NaN in the second sequence of a batch).
+            // -inf LSE marks a slot as "empty split" for the combine.
+            torch::stable::fill_(softmax_lse_accum, -INFINITY);
+            torch::stable::zero_(out_accum);
             params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
             params.oaccum_ptr = out_accum.data_ptr();
         }
@@ -753,8 +760,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
+    if (seqlenq_ngroups_swapped || (paged_KV && max_seqlen_q <= 64)) {
+        // Split-k for decoding AND for short multi-token queries (spec-decode
+        // verify): without it a paged varlen call with 1 < q_len <= 64 walks
+        // the whole KV serially in one CTA per (batch, head).
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,

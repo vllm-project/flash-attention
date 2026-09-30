@@ -75,6 +75,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # SM90 compensated FP8-MMA path: native fp16/bf16 Q, E4M3 paged K/V,
         # FP8 WGMMA QK/PV, FP32 accumulation, and native fp16/bf16 O.
         self.fp8_kv_dequant = fp8_kv_dequant
+        assert not self.fp8_kv_dequant or self.mma_pv_is_rs, (
+            "SM90 FP8 KV dequant requires RS-mode PV because its shared storage "
+            "does not allocate sP"
+        )
         self.kv_dtype = kv_dtype if kv_dtype is not None else self.dtype
         # Hopper FP8 WGMMA needs FP8 on both inputs. Q is quantized once per output
         # tile. P is scaled before its FP8 cast to preserve long-context softmax
@@ -718,11 +722,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             sVt = layout_utils.transpose_view(sV)
         sP = None
-        sP_res = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
-            if const_expr(self.fp8_kv_dequant):
-                sP_res = storage.sP_res.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
         # FP8 staging buffer: TMA destination and WGMMA-layout rearrangement source.
         sStage = None
         if const_expr(self.fp8_kv_dequant):
@@ -817,7 +818,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sK,
                 sVt,
                 sP,
-                sP_res,
                 sO,
                 sQ_mma,
                 sQ_res,
@@ -913,10 +913,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx, num_splits
             )
+            # A bidirectional entry in a dynamic-causal batch owns a slice of
+            # the full KV range, not the causal range.  This must mirror the
+            # consumer's range calculation exactly: each emitted K/V stage has
+            # a matching consumer wait.
+            if const_expr(self._mDynamicCausal is not None):
+                psc = self._mDynamicCausal[batch_idx]
+                if not psc:
+                    n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+                    if const_expr(self.is_split_kv):
+                        num_n_blocks_per_split = cute.ceil_div(
+                            n_block_max_full, num_splits
+                        )
+                        n_block_min = split_idx * num_n_blocks_per_split
+                        n_block_max = cutlass.min(
+                            n_block_min + num_n_blocks_per_split, n_block_max_full
+                        )
+                    else:
+                        n_block_min = Int32(0)
+                        n_block_max = n_block_max_full
+
+            # An empty SplitKV partition still needs the same one K and one V
+            # pipeline transaction as the consumer's first/last-half sequence.
+            # Use physical page 0 as a known-valid dummy source; its result is
+            # discarded by the matching consumer-side empty-partition path.
+            is_empty_split = n_block_min >= n_block_max
+            if is_empty_split:
+                n_block_min = Int32(0)
+                n_block_max = Int32(1)
 
             # ---- Prologue emit: stage K[n_block_max - 1] (warp 0 only) ----
+            page_idx = Int32(0)
             if warp_idx_in_wg == 0:
-                page_idx = mPageTable[batch_idx, n_block_max - 1]
+                if is_empty_split:
+                    page_idx = Int32(0)
+                else:
+                    page_idx = mPageTable[batch_idx, n_block_max - 1]
                 pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
                 stage_copy_K(src_idx=page_idx, dst_idx=0, tma_bar_ptr=stage_full_bar)
                 stage_producer_phase ^= 1
@@ -953,7 +985,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     stage_producer_phase ^= 1
 
                 # ---- Epilogue emit: stage V[n_block_min] ----
-                page_idx = mPageTable[batch_idx, n_block_min]
+                page_idx = Int32(0)
+                if is_empty_split:
+                    page_idx = Int32(0)
+                else:
+                    page_idx = mPageTable[batch_idx, n_block_min]
                 pipeline_stage.producer_acquire_w_index_phase(0, stage_producer_phase)
                 stage_copy_V(src_idx=page_idx, dst_idx=0, tma_bar_ptr=stage_full_bar)
                 stage_producer_phase ^= 1
@@ -1312,7 +1348,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sK: cute.Tensor,
         sVt: cute.Tensor,
         sP: Optional[cute.Tensor],
-        sP_res: Optional[cute.Tensor],
         sO: cute.Tensor,
         # FP8 high and residual Q terms used by the compensated QK WGMMA.
         sQ_mma: cute.Tensor,
@@ -1667,7 +1702,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else:
                         n_block_min = Int32(0)
                         n_block_max = n_block_max_full
-            n_block_max_orig = n_block_max
+            # Mirror load_fp8: empty partitions consume a known-valid dummy
+            # K/V pair so the pipeline transaction count stays matched.  Their
+            # partial result is suppressed before SplitKV combine below.
+            is_empty_split = n_block_min >= n_block_max
+            if const_expr(self.fp8_kv_dequant):
+                if is_empty_split:
+                    n_block_min = Int32(0)
+                    n_block_max = Int32(1)
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             if const_expr(quantize_q):
                 self._quantize_q_to_fp8(q_narrow_params)
@@ -1827,11 +1869,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             row_scale = softmax_tile.finalize(final_scale=v_descale_tile, sink_val=sink_val)
             softmax_tile.rescale_O(acc_O, row_scale)
 
-            # Override empty splits so combine kernel gives zero weight
-            if const_expr(self.is_split_kv):
-                if n_block_min >= n_block_max_orig:
-                    acc_O.fill(Float32(0.0))
-                    softmax_tile.row_sum.fill(-Float32.inf)
+            # Make an empty partition contribute zero weight to SplitKV combine.
+            # This also defines an all-empty sequence as a zero output.
+            if is_empty_split:
+                acc_O.fill(Float32(0.0))
+                softmax_tile.row_sum.fill(-Float32.inf)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue

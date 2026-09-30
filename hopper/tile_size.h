@@ -51,43 +51,31 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             return {128, is_local ? 64 : 80, true, true};  // 128 x 80 hits the limit of smem
         }
     } else {
-        // FP8 path
-        if (use_one_mma_wg) {
-            // Decode tiles — independent of two-level accumulation setting
-            if (headdim <= 96) {
-                return {64, 128, true, true};
-            } else {
-                return {64, 96, true, true};
-            }
-        } else {
-            // Prefill tiles — two-level accumulation needs smaller tiles to reduce
-            // register pressure from the separate fp32 accumulator (tOrO_accum).
-            // Currently just optimized for causal case.
+        // FP8 path — decode/prefill share kBlockN (fix FP8 KV logprob drift)
 #ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
-            if (headdim <= 64) {
-                return {192, 128, true, true};
-            } else if (headdim <= 96) {
-                return {128, 128, true, true};
-            } else if (headdim <= 128) {
-                return {128, 192, true, true};
-            } else if (headdim <= 192) {
-                return {128, 96, true, true};
-            } else {
-                return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};  // TODO: FP8 prefill ~0.54x of BF16 with two-level accum at hd256
-            }
+        int const kBlockN =
+            headdim <= 64 ? 128 :
+            headdim <= 96 ? 128 :
+            headdim <= 128 ? 192 :
+            headdim <= 192 ? 96 :
+            (is_local ? 64 : 128);
+        int const kBlockM = headdim <= 64 ? 192 : 128;
 #else
-            if (headdim <= 64) {
-                return {192, 160, true, true};
-            } else if (headdim <= 96) {
-                return {192, 128, true, true};
-            } else if (headdim <= 128) {
-                return {128, paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224), true, true};
-            } else if (headdim <= 192) {
-                return {128, (paged_kv_non_TMA || softcap) && is_local ? 128 : 160, true, true};
-            } else {
-                return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};
-            }
+        int const kBlockN =
+            headdim <= 64 ? 160 :
+            headdim <= 96 ? 128 :
+            headdim <= 128 ? (paged_kv_non_TMA ? 160 : (v_colmajor || (softcap && is_local) ? 192 : 224)) :
+            headdim <= 192 ? ((paged_kv_non_TMA || softcap) && is_local ? 128 : 160) :
+            (is_local ? 64 : 128);
+        int const kBlockM = headdim <= 96 ? 192 : 128;
 #endif
+        // Decode keeps kBlockM=64. Prefill keeps its original kBlockM and
+        // IntraWGOverlap choices; only kBlockN is shared.
+        if (use_one_mma_wg) {
+            return {64, kBlockN, true, true};
+        } else {
+            bool const intra_wg_overlap = headdim <= 192 ? true : !paged_kv_non_TMA;
+            return {kBlockM, kBlockN, true, intra_wg_overlap};
         }
     }
 }

@@ -790,18 +790,19 @@ def _flash_attn_fwd(
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
         assert page_table is not None, "fp8_kv_dequant requires paged KV (page_table)"
-        if dynamic_causal is not None:
-            raise NotImplementedError(
-                "FA4 SM90 FP8 MMA does not support dynamic_causal"
-            )
         if block_sparse_tensors is not None:
             raise NotImplementedError(
                 "FA4 SM90 FP8 MMA does not support block sparsity"
             )
-        assert head_dim == head_dim_v == 512, (
-            "FA4 SM90 FP8 MMA currently requires head_dim == head_dim_v == 512; "
-            f"got head_dim={head_dim}, head_dim_v={head_dim_v}."
-        )
+        if head_dim != 512 or head_dim_v != 512:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 MMA requires head_dim == head_dim_v == 512; "
+                f"got head_dim={head_dim}, head_dim_v={head_dim_v}."
+            )
+        if intra_wg_overlap is False:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 MMA requires intra_wg_overlap=True"
+            )
     else:
         input_tensors = {"q": q, "k": k, "v": v, "qv": qv}
         present = {name: t for name, t in input_tensors.items() if t is not None}
@@ -1035,25 +1036,22 @@ def _flash_attn_fwd(
     intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     if fp8_kv_dequant:
-        assert intra_wg_overlap, (
-            "FA4 SM90 FP8 MMA requires intra_wg_overlap=True until a compatible "
-            "non-overlap control flow is implemented."
-        )
+        if not intra_wg_overlap:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 MMA requires intra_wg_overlap=True until a compatible "
+                "non-overlap control flow is implemented."
+            )
         # Force RS-mode PV: frees sP for the fp8 staging buffer, keeping smem within
         # budget at d=512 while preserving intra-WG overlap.
         mma_pv_is_rs = True
         # The SM90 fp8-KV-dequant producer is TMA-only (no cp.async fallback): a paged
-        # page_size != tile_n gives use_tma_KV=False -> a None TMA atom. Assert here so
-        # it fails with a clear message instead of crashing later.
-        assert page_size == tile_n, (
-            f"FA4 SM90 fp8-KV-dequant requires the paged-KV page_size == tile_n ({tile_n}); "
-            f"got page_size={page_size}. "
-        )
-        # This path shares one staging buffer between K and V.
-        assert head_dim == head_dim_v, (
-            "FA4 SM90 fp8-KV-dequant requires head_dim == head_dim_v (one staging "
-            f"buffer serves K and V); got head_dim={head_dim}, head_dim_v={head_dim_v}."
-        )
+        # page_size != tile_n gives use_tma_KV=False -> a None TMA atom. Reject it here
+        # with a clear message instead of crashing later.
+        if page_size != tile_n:
+            raise NotImplementedError(
+                f"FA4 SM90 FP8 MMA requires the paged-KV page_size == tile_n ({tile_n}); "
+                f"got page_size={page_size}."
+            )
 
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
@@ -1475,6 +1473,7 @@ def _flash_attn_fwd(
         cu_seqlens_k is None,
         seqused_q is None,
         seqused_k is None,
+        dynamic_causal is not None,
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,

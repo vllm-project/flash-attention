@@ -2801,26 +2801,28 @@ def test_flash_attn_sm100_hdim256_seqused_paged_kv_fwd(
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 @pytest.mark.parametrize("k_scale,v_scale", [(1.0, 1.0), (0.5, 0.25)])
 @pytest.mark.parametrize("num_splits", [1, 2])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type):
-    """SM90 fp16-Q + fp8-KV-cache dequant paged forward (d=512).
+def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_type, q_dtype):
+    """SM90 fp16/bf16-Q + fp8-KV-cache Tensor Core paged forward (d=512).
 
-    fp16 Q with per-tensor FP8 (e4m3) paged K/V cast in-kernel to fp16 (the
-    compute/output dtype). Per-(batch, kv_head) descales are folded by the kernel
+    fp16/bf16 Q and per-tensor FP8 (e4m3) paged K/V execute QK and PV with FP8 WGMMA.
+    Compensated FP8 pairs preserve Q and softmax-P accuracy without widening the
+    K/V operands to fp16. Per-(batch, kv_head) descales are folded by the kernel
     (q*k into the score scale, v into final output normalization/final_scale). The
     reference reads the exact paged FP8 bytes the kernel indexes (gathered through
     page_table, cast to fp16) and applies the same descales via attention_ref
     (dequantize-then-attend). num_splits=2 exercises the SplitKV path (fp32
-    partials combined back to fp16). Q is true fp16 -> q_descale is identity
-    (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
+    partials combined back to the Q dtype). Q is not pre-quantized, so q_descale is
+    identity (None on both sides). page_size must equal tile_n (64 for d=512 on SM90).
     """
     device, d, page_size, causal = "cuda", 512, 64, True
     batch_size, nheads, seqlen_q, seqlen_k = 2, 4, 5, 256
     nheads_k = nheads if mha_type == "mha" else 2
     torch.random.manual_seed(0)
 
-    # fp16 Q (true precision -> no q_descale); bf16 paged K/V from the shared builder.
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.float16)
+    # True-precision Q (no q_descale); bf16 paged K/V from the shared builder.
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=q_dtype)
     _, _, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
         seqlen_k, page_size, batch_size, nheads_k, d, d, device, torch.bfloat16, torch.bfloat16
     )
@@ -2840,21 +2842,22 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
     arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
     key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
 
-    # Reference reads the EXACT fp8 bytes the kernel reads: gather the paged fp8 through the
-    # page table into dense (b, seqlen_k, nheads_k, d), then to fp16 (the kernel casts
-    # fp8 -> fp16). attention_ref applies k/v_descale = dequant; out is fp16 (== kernel O dtype).
+    # Reference reads the exact FP8 bytes the kernel reads: gather the paged FP8 through
+    # the page table, then widen only the reference copy. attention_ref applies the K/V
+    # descales while the kernel folds the same scales around its FP8 MMA operations.
     gather = lambda paged: rearrange(
         paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
     )[:, :seqlen_k].to(torch.float16)
     k_ref, v_ref = gather(k_paged_fp8), gather(v_paged_fp8)
     common = dict(causal=causal, k_descale=k_descale, v_descale=v_descale)
     out_ref, _ = attention_ref(q, k_ref, v_ref, None, key_padding_mask, **common)
-    # out_pt models fp16 arithmetic (NO fp8 intermediate_dtype) -> sets the error bar.
+    # out_pt models input-type arithmetic (without FP8 intermediates) and sets the error bar.
+    k_pt, v_pt = k_ref.to(q_dtype), v_ref.to(q_dtype)
     out_pt, _ = attention_ref(
-        q, k_ref, v_ref, None, key_padding_mask, upcast=False, reorder_ops=True, **common
+        q, k_pt, v_pt, None, key_padding_mask, upcast=False, reorder_ops=True, **common
     )
 
-    # ---- kernel under test: fp16 Q + fp8 paged K/V, cast in-kernel ----
+    # ---- kernel under test: fp16/bf16 Q + fp8 paged K/V, FP8 Tensor Core MMA ----
     out, *_ = _flash_attn_fwd(
         q=q,
         k=k_paged_fp8,
@@ -2875,12 +2878,586 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    print(
+        "Output cosine: "
+        f"{torch.nn.functional.cosine_similarity(out.float().flatten(), out_ref.float().flatten(), dim=0).item()}"
+    )
     print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
     print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-    # Same max/mean multiplier style as test_flash_attn_kvcache (fp8 bar).
-    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
-    assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
+    # FP8 products have a wider numerical envelope than fp16 MMA even with the
+    # compensated representation. Bound both worst-case and aggregate error.
+    assert (out - out_ref).abs().max().item() <= 8 * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 6 * (out_pt - out_ref).abs().mean().item()
+
+
+@pytest.mark.skipif(not IS_SM90, reason="fp8-KV Tensor Core forward is SM90-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_v_layout_sm90():
+    """FP8 PV must preserve token-to-output mapping after the K-major V transpose."""
+    d, page_size = 512, 64
+    q = torch.zeros(1, 1, 1, d, device="cuda", dtype=torch.float16)
+    k = torch.zeros(1, page_size, 1, d, device="cuda", dtype=torch.float8_e4m3fn)
+    v_fp16 = torch.zeros(1, page_size, 1, d, device="cuda", dtype=torch.float16)
+    token_idx = torch.arange(page_size, device="cuda")
+    v_fp16[0, token_idx, 0, token_idx] = 1
+    v = v_fp16.to(torch.float8_e4m3fn)
+    page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    seqused_k = torch.full((1,), page_size, device="cuda", dtype=torch.int32)
+    descale = torch.ones(1, 1, device="cuda", dtype=torch.float32)
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=1,
+        max_seqlen_k=page_size,
+        k_descale=descale,
+        v_descale=descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    expected = torch.zeros_like(out)
+    expected[..., :page_size] = 1 / page_size
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def _make_sm90_fp8_mma_inputs(head_dim=512, seqlen_k=64, requires_grad=False):
+    """Build the smallest paged FP8-KV input accepted by the SM90 interface."""
+    page_size = 64
+    num_pages = math.ceil(seqlen_k / page_size)
+    q = torch.zeros(
+        1,
+        1,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+        requires_grad=requires_grad,
+    )
+    k = torch.zeros(
+        num_pages,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.float8_e4m3fn,
+    )
+    v = torch.zeros_like(k)
+    page_table = torch.arange(num_pages, device="cuda", dtype=torch.int32).unsqueeze(0)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    descale = torch.ones((), device="cuda", dtype=torch.float32).expand(1, 1)
+    return q, k, v, page_table, seqused_k, descale
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("head_dim", [128, 256, 384])
+def test_flash_attn_kvcache_fp8_mma_rejects_unsupported_head_dim_sm90(head_dim):
+    q, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs(head_dim)
+    with pytest.raises(NotImplementedError, match="head_dim == head_dim_v == 512"):
+        _flash_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            k_descale=descale,
+            v_descale=descale,
+            fp8_kv_dequant=True,
+        )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+def test_flash_attn_kvcache_fp8_mma_rejects_nonoverlap_sm90():
+    q, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs()
+    with pytest.raises(NotImplementedError, match="intra_wg_overlap=True"):
+        _flash_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            k_descale=descale,
+            v_descale=descale,
+            fp8_kv_dequant=True,
+            intra_wg_overlap=False,
+        )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+def test_flash_attn_kvcache_fp8_mma_rejects_requires_grad_sm90():
+    q, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs(
+        requires_grad=True
+    )
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        _flash_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            k_descale=descale,
+            v_descale=descale,
+            fp8_kv_dequant=True,
+        )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+def test_flash_attn_kvcache_fp8_mma_rejects_qv_only_sm90():
+    qv, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs()
+    with pytest.raises(AssertionError, match="requires Q and does not support QV-only"):
+        _flash_attn_fwd(
+            q=None,
+            qv=qv,
+            k=k,
+            v=v,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            k_descale=descale,
+            v_descale=descale,
+            fp8_kv_dequant=True,
+        )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize(
+    "unsupported_kwarg,error", [("block_sparse_tensors", "does not support block sparsity")]
+)
+def test_flash_attn_kvcache_fp8_mma_rejects_unsupported_scheduling_sm90(
+    unsupported_kwarg, error
+):
+    q, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs()
+    unsupported_value = object()
+    with pytest.raises(NotImplementedError, match=error):
+        _flash_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=1,
+            max_seqlen_k=64,
+            k_descale=descale,
+            v_descale=descale,
+            fp8_kv_dequant=True,
+            **{unsupported_kwarg: unsupported_value},
+        )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("num_splits", [1, 2])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_learnable_sink_gqa_sm90(num_splits):
+    """FP8-MMA applies one nonzero sink logit per Q head, including SplitKV."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 1, 7, 128
+    nheads, nheads_kv, d, page_size = 4, 2, 512, 64
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.float16)
+    k_source = torch.randn(
+        batch_size * seqlen_k // page_size,
+        page_size,
+        nheads_kv,
+        d,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_scale, v_scale = 0.5, 0.25
+    k = (k_source / k_scale).to(torch.float8_e4m3fn)
+    v = (v_source / v_scale).to(torch.float8_e4m3fn)
+    page_table = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    k_descale = torch.full((batch_size, nheads_kv), k_scale, device="cuda", dtype=torch.float32)
+    v_descale = torch.full((batch_size, nheads_kv), v_scale, device="cuda", dtype=torch.float32)
+    sink = torch.tensor([1.25, -0.5, 0.75, -1.0], device="cuda", dtype=torch.float32)
+
+    k_ref = k.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    v_ref = v.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    out_ref, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=True,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        learnable_sink=sink,
+    )
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=True,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=num_splits,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        learnable_sink=sink,
+        fp8_kv_dequant=True,
+    )
+    if not is_fake_mode():
+        torch.testing.assert_close(out, out_ref, atol=8e-2, rtol=8e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("seqlen_k", [1, 63, 65, 193])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_partial_kv_blocks_sm90(seqlen_k):
+    q, k, v, page_table, seqused_k, descale = _make_sm90_fp8_mma_inputs(
+        seqlen_k=seqlen_k
+    )
+    # Make padded tokens conspicuously different so an incorrect tail mask fails.
+    values = ((torch.arange(seqlen_k, device="cuda") % 5) - 2).to(torch.float16)
+    v.view(-1, 1, 512)[:seqlen_k].copy_(
+        values[:, None, None].expand(seqlen_k, 1, 512).to(torch.float8_e4m3fn)
+    )
+    v.view(-1, 1, 512)[seqlen_k:].fill_(16)
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        q_descale=None,
+        k_descale=descale,
+        v_descale=descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    assert descale.stride(-1) == 0  # Exercise broadcast scale canonicalization.
+    expected = values.float().mean().expand_as(out.float())
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_v_only_descale_sm90():
+    """A missing middle K scale must not shift V scale into the QK scale slot."""
+    q, k, v, page_table, seqused_k, _ = _make_sm90_fp8_mma_inputs()
+    v.fill_(1)
+    v_descale = torch.full((1, 1), 0.25, device="cuda", dtype=torch.float32)
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=1,
+        max_seqlen_k=64,
+        q_descale=None,
+        k_descale=None,
+        v_descale=v_descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    expected = torch.full_like(out.float(), 0.25)
+    torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_empty_splitkv_partition_sm90():
+    """Empty SplitKV partitions stage a dummy tile without indexing page_table OOB."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, max_seqlen_k = 2, 2, 64
+    nheads, nheads_kv, d, page_size = 2, 1, 512, 64
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.float16)
+    k_source = torch.randn(
+        batch_size,
+        page_size,
+        nheads_kv,
+        d,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_scale, v_scale = 0.5, 0.25
+    k = (k_source / k_scale).to(torch.float8_e4m3fn)
+    v = (v_source / v_scale).to(torch.float8_e4m3fn)
+    page_table = torch.tensor([[0], [1]], device="cuda", dtype=torch.int32)
+    # Batch item 0 has no valid keys; item 1 has one tile.  Four splits make
+    # every partition of item 0 and three partitions of item 1 empty.
+    seqused_k = torch.tensor([0, max_seqlen_k], device="cuda", dtype=torch.int32)
+    k_descale = torch.full((batch_size, nheads_kv), k_scale, device="cuda", dtype=torch.float32)
+    v_descale = torch.full((batch_size, nheads_kv), v_scale, device="cuda", dtype=torch.float32)
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        num_splits=4,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    k_ref = k[1:].to(torch.float16)
+    v_ref = v[1:].to(torch.float16)
+    out_ref, _ = attention_ref(
+        q[1:],
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=False,
+        k_descale=k_descale[1:],
+        v_descale=v_descale[1:],
+    )
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), atol=0, rtol=0)
+    torch.testing.assert_close(out[1], out_ref[0], atol=8e-2, rtol=8e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_long_context_splitkv_sm90():
+    """Validate compensated FP8 QK/PV accuracy at a 4K target context."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 1, 1, 4096
+    nheads, nheads_kv, d, page_size = 2, 1, 512, 64
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.float16
+    )
+    k_source = torch.randn(
+        batch_size * seqlen_k // page_size,
+        page_size,
+        nheads_kv,
+        d,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_scale, v_scale = 0.5, 0.25
+    k = (k_source / k_scale).to(torch.float8_e4m3fn)
+    v = (v_source / v_scale).to(torch.float8_e4m3fn)
+    page_table = torch.arange(
+        seqlen_k // page_size, device="cuda", dtype=torch.int32
+    ).unsqueeze(0)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    k_descale = torch.full((1, 1), k_scale, device="cuda", dtype=torch.float32)
+    v_descale = torch.full((1, 1), v_scale, device="cuda", dtype=torch.float32)
+
+    k_ref = k.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    v_ref = v.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    out_ref, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=False,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=False,
+        upcast=False,
+        reorder_ops=True,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=4,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    assert (out - out_ref).abs().max().item() <= (
+        8 * (out_pt - out_ref).abs().max().item() + 1e-5
+    )
+    assert (out - out_ref).abs().mean().item() <= (
+        8 * (out_pt - out_ref).abs().mean().item() + 1e-5
+    )
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("num_splits", [1, 4])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_dynamic_causal_mixed_batch_sm90(num_splits):
+    """A mixed causal/bidirectional batch must stage the same tile range it consumes."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 64, 128
+    nheads, nheads_kv, d, page_size = 2, 1, 512, 64
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.float16)
+    k_source = torch.randn(
+        batch_size * seqlen_k // page_size,
+        page_size,
+        nheads_kv,
+        d,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    v_source = torch.randn_like(k_source)
+    k_scale, v_scale = 0.5, 0.25
+    k = (k_source / k_scale).to(torch.float8_e4m3fn)
+    v = (v_source / v_scale).to(torch.float8_e4m3fn)
+    page_table = torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.int32)
+    seqused_k = torch.full((batch_size,), seqlen_k, device="cuda", dtype=torch.int32)
+    dynamic_causal = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+    k_descale = torch.full((batch_size, nheads_kv), k_scale, device="cuda", dtype=torch.float32)
+    v_descale = torch.full((batch_size, nheads_kv), v_scale, device="cuda", dtype=torch.float32)
+
+    k_ref = k.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    v_ref = v.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    out_causal, _ = attention_ref(
+        q[:1], k_ref[:1], v_ref[:1], None, None, causal=True,
+        k_descale=k_descale[:1], v_descale=v_descale[:1],
+    )
+    out_bidirectional, _ = attention_ref(
+        q[1:], k_ref[1:], v_ref[1:], None, None, causal=False,
+        k_descale=k_descale[1:], v_descale=v_descale[1:],
+    )
+    out_ref = torch.cat((out_causal, out_bidirectional), dim=0)
+
+    out_static_ref, _ = attention_ref(
+        q, k_ref, v_ref, None, None, causal=True,
+        k_descale=k_descale, v_descale=v_descale,
+    )
+    # Alternate optional argument presence with otherwise identical shapes so
+    # the JIT cache cannot reuse a static-causal signature for dynamic causal.
+    for causal_flags in (None, dynamic_causal, None, dynamic_causal):
+        out, *_ = _flash_attn_fwd(
+            q=q,
+            k=k,
+            v=v,
+            causal=True,
+            dynamic_causal=causal_flags,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+            num_splits=num_splits,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            fp8_kv_dequant=True,
+        )
+        if not is_fake_mode():
+            expected = out_static_ref if causal_flags is None else out_ref
+            torch.testing.assert_close(out, expected, atol=8e-2, rtol=8e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("q_magnitude", [448.0, 512.0])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_large_q_sm90(q_magnitude):
+    """Stress the fixed Q scale at and beyond one E4M3 component's range.
+
+    Q is represented as two compensated E4M3 components.  The 512 case therefore
+    also verifies that the residual component recovers values above 448 instead
+    of silently relying on a single E4M3 conversion.  K is inversely scaled so
+    the attention-score envelope remains well conditioned.
+    """
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 1, 1, 256
+    nheads, nheads_kv, d, page_size = 2, 1, 512, 64
+    q = torch.empty(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=torch.float16
+    ).uniform_(-q_magnitude, q_magnitude)
+    k_source = torch.empty(
+        seqlen_k // page_size,
+        page_size,
+        nheads_kv,
+        d,
+        device="cuda",
+        dtype=torch.float16,
+    ).uniform_(-1, 1)
+    v_source = torch.empty_like(k_source).uniform_(-1, 1)
+    k_scale, v_scale = 1.0 / q_magnitude, 0.25
+    k = k_source.to(torch.float8_e4m3fn)
+    v = (v_source / v_scale).to(torch.float8_e4m3fn)
+    page_table = torch.arange(
+        seqlen_k // page_size, device="cuda", dtype=torch.int32
+    ).unsqueeze(0)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    k_descale = torch.full((1, 1), k_scale, device="cuda", dtype=torch.float32)
+    v_descale = torch.full((1, 1), v_scale, device="cuda", dtype=torch.float32)
+
+    k_ref = k.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    v_ref = v.view(batch_size, seqlen_k, nheads_kv, d).to(torch.float16)
+    out_ref, _ = attention_ref(
+        q,
+        k_ref,
+        v_ref,
+        None,
+        None,
+        causal=False,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        causal=False,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+
+    if q_magnitude > 448:
+        assert q.abs().max().item() > 448
+    assert torch.isfinite(out).all()
+    assert (out.float() - out_ref.float()).abs().max().item() < 1e-3
+    assert torch.nn.functional.cosine_similarity(
+        out.float().flatten(), out_ref.float().flatten(), dim=0
+    ).item() > 0.9999
 
 
 def _run_fp8_paged_decode(q, k, v, page_size=128):

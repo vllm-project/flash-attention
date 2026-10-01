@@ -19,6 +19,8 @@ class NamedBarrierFwd(enum.IntEnum):
     # FP8-KV bf16-Q in-place narrow (flash_fwd_sm90.py): 256-thread sync so the full
     # fp16 Q (cast in place from bf16) is visible to both MMA warpgroups before QK.
     NarrowQ = enum.auto()
+    # hdim>256: PV split along hdimv across 2 WGs, both read the full P tile.
+    PSync = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

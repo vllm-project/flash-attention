@@ -721,6 +721,23 @@ def _flash_attn_fwd(
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
+    # SM100 has no dense hd512 kernel (TMEM capacity), so d = dv = 512 GQA runs on
+    # the MLA kernel with Q in the qv slot and separate K and V.
+    gqa_on_mla = (
+        qv is None
+        and q is not None
+        and q.shape[-1] == v.shape[-1] == 512
+        and (_get_device_arch() if _arch is None else _arch) // 10 in [10, 11]
+    )
+    if gqa_on_mla:
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        if any(t is not None and t.dtype in fp8_dtypes for t in (q, k, v)):
+            raise NotImplementedError("SM100 head_dim 512 does not support FP8 inputs")
+        q, qv = None, q
+        num_splits = 1
+        # The MLA kernel keeps LSE heads-contiguous; callers see the usual (.., h, s).
+        if lse is not None:
+            lse = lse.mT
     q_descale, k_descale, v_descale = [
         maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
     ]
@@ -914,6 +931,8 @@ def _flash_attn_fwd(
                     if cu_seqlens_q is None
                     else learnable_sink[:, None]
                 )
+        if gqa_on_mla and lse is not None:
+            lse = lse.mT
         return out, lse, None, None
 
     if is_fp8 or fp8_kv_dequant:
@@ -1474,6 +1493,7 @@ def _flash_attn_fwd(
         is_static_persistent,
         q is not None,
         qv is not None,
+        k is not None,
         p is not None,
         row_max is not None,
         gather_kv_length,
@@ -1486,7 +1506,7 @@ def _flash_attn_fwd(
         # fp8_kv_dequant forces compute dtype = fp16, so the Q/O tensor dtypes (which the
         # kernel derives from mQ/mO and which select the in-kernel narrow/widen) are no
         # longer captured by `dtype` above -- key on them explicitly. Redundant elsewhere.
-        q.dtype,
+        q_dtype,
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
@@ -1662,7 +1682,6 @@ def _flash_attn_fwd(
                     is_topk_gather=sparse_kv,
                     pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead,
-                    nheads_kv=num_head_kv,
                     has_seqused_q=seqused_q is not None,
                     has_cu_seqlens_q=cu_seqlens_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
@@ -1865,6 +1884,8 @@ def _flash_attn_fwd(
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
     if compile_only:
+        if gqa_on_mla and lse is not None:
+            lse = lse.mT
         return out, lse, None, None
 
     if not fake_mode:
@@ -2018,6 +2039,8 @@ def _flash_attn_fwd(
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
         # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
+    if gqa_on_mla and lse is not None:
+        lse = lse.mT
     return out, lse, p, row_max
 
 

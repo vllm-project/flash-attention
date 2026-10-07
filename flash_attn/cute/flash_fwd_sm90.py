@@ -104,14 +104,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
     def _get_tiled_mma(self):
-        atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
+        self.atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
+            atom_layout_mnk=(self.tile_m // 64, self.atom_layout_n, 1),
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
@@ -122,7 +122,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
-                atom_layout_n,
+                self.atom_layout_n,
                 1,
             ),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, min(256, self.tile_hdimv)),
@@ -308,9 +308,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         # hdim > 256: two MMA warpgroups each read the whole sP tile in the PV GEMM.
-        self.p_shared_across_wg = (
-            self.tile_hdim > 256 or self.tile_hdimv > 256
-        ) and not self.mma_pv_is_rs
+        self.p_shared_across_wg = self.atom_layout_n == 2
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
@@ -1981,8 +1979,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Each warp reads back its own P rows; for hdim > 256 the
-            # cross-warpgroup hazard is handled by cross_wg_p_barrier() before the P store.
+            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
@@ -2058,8 +2055,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Each warp reads back its own P rows; for hdim > 256 the
-            # cross-warpgroup hazard is handled by cross_wg_p_barrier() before the P store.
+            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         return smem_pipe_read
 
     @cute.jit
@@ -2125,16 +2121,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def cross_wg_p_barrier(self):
-        """WAR barrier on sP for hdim > 256.
-
-        With atom_layout_n == 2 both MMA warpgroups compute the full S/P tile redundantly
-        and store identical P into the same sP, while the PV GEMM is split along hdimv, so
-        each warpgroup's PV reads the whole sP. Without this barrier the faster warpgroup
-        overwrites sP with P_{n+1} while the slower one is still reading P_n.
-        Placed before the P store, both warpgroups have already waited on their previous
-        PV GEMM. If QK/softmax is ever split across warpgroups (each writing only part of P),
-        a second barrier after the store (RAW) becomes necessary as well.
-        """
+        """WAR barrier on sP for hdim > 256: both MMA warpgroups read the whole sP in the PV
+        GEMM, so neither may overwrite it with the next P before the other is done reading."""
         if const_expr(self.p_shared_across_wg):
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.PSync), number_of_threads=self.num_mma_threads

@@ -54,7 +54,6 @@ class FlashAttentionMLAForwardSm100:
         is_topk_gather: bool = True,
         pack_gqa: bool = False,
         qhead_per_kvhead: int = 1,
-        nheads_kv: int = 1,
         hdim: int = 64,
         hdimv: int = 512,
         has_seqused_q: bool = False,
@@ -68,7 +67,6 @@ class FlashAttentionMLAForwardSm100:
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         assert qhead_per_kvhead <= 128
-        self.nheads_kv = nheads_kv
         self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
@@ -378,7 +376,7 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.has_qk):
             assert mQ is not None and mK is not None, "has_qk requires mQ and mK"
         else:
-            assert mQ is None and mK is None, "not has_qk disallows mQ and mK"
+            assert mQ is None, "not has_qk disallows mQ"
 
         # ==== dtype info ====
         self.dtype_Q = mQ.element_type if self.has_qk else cutlass.BFloat16
@@ -424,6 +422,9 @@ class FlashAttentionMLAForwardSm100:
         # (total_k, dv, h_k) -> (dv, total_k, h_k)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mVt = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
+        if const_expr(not self.has_qk and mK is not None):
+            # GQA (d = dv): K takes the latent's place in the scores GEMM, V only feeds PV.
+            mK, mV = None, mK
         # (b, s_q, topk) -> (topk, s_q, b) or (total_q, topk) -> (topk, total_q)
         topk_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mIndexTopk = (
@@ -462,14 +463,15 @@ class FlashAttentionMLAForwardSm100:
         mO_og = mO
         mP_og = mP
         if const_expr(self.pack_gqa):
+            nheads_kv = mV.shape[2]
             mQ, mQv, mO, mP, mRowMax = [
-                pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
+                pack_gqa_layout(mX, self.qhead_per_kvhead, nheads_kv, head_idx=2)
                 if mX is not None
                 else None
                 for mX in (mQ, mQv, mO, mP, mRowMax)
             ]
             if const_expr(mLSE is not None):
-                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
         # ==== Prepare MMAs ====
         # (local_var, dtype_a, major_a, major_b, mma_tiler, operand_source_a)

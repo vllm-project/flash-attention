@@ -307,6 +307,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
+        # hdim > 256: two MMA warpgroups each read the whole sP tile in the PV GEMM.
+        self.p_shared_across_wg = (
+            self.tile_hdim > 256 or self.tile_hdimv > 256
+        ) and not self.mma_pv_is_rs
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
@@ -1772,6 +1776,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP_cur.store(tOrP_acc.load().to(self.dtype))
 
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
             # Fence and barrier to make smem store visible to WGMMA
@@ -1969,13 +1974,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # 2 elements. So we just call ptx directly.
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         softmax.rescale_O(acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            cute.arch.sync_warp()  # Each warp reads back its own P rows; for hdim > 256 the
+            # cross-warpgroup hazard is handled by cross_wg_p_barrier() before the P store.
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
@@ -2041,6 +2048,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # 2 elements. So we just call ptx directly.
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         if const_expr(not self.rescale_O_before_gemm):
@@ -2050,7 +2058,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            cute.arch.sync_warp()  # Each warp reads back its own P rows; for hdim > 256 the
+            # cross-warpgroup hazard is handled by cross_wg_p_barrier() before the P store.
         return smem_pipe_read
 
     @cute.jit
@@ -2113,6 +2122,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             scores_scale.store(row_scale.load())
         return smem_pipe_read
+
+    @cute.jit
+    def cross_wg_p_barrier(self):
+        """WAR barrier on sP for hdim > 256.
+
+        With atom_layout_n == 2 both MMA warpgroups compute the full S/P tile redundantly
+        and store identical P into the same sP, while the PV GEMM is split along hdimv, so
+        each warpgroup's PV reads the whole sP. Without this barrier the faster warpgroup
+        overwrites sP with P_{n+1} while the slower one is still reading P_n.
+        Placed before the P store, both warpgroups have already waited on their previous
+        PV GEMM. If QK/softmax is ever split across warpgroups (each writing only part of P),
+        a second barrier after the store (RAW) becomes necessary as well.
+        """
+        if const_expr(self.p_shared_across_wg):
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PSync), number_of_threads=self.num_mma_threads
+            )
 
     @cute.jit
     def mma_init(self):

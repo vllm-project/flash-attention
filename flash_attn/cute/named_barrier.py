@@ -21,6 +21,8 @@ class NamedBarrierFwd(enum.IntEnum):
     NarrowQ = enum.auto()
     # hdim>256: PV split along hdimv across 2 WGs, both read the full P tile.
     PSync = enum.auto()
+    # hdim>256: RAW on sP, after the P store + proxy fence, before the PV GEMM.
+    PSyncRAW = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

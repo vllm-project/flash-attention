@@ -1780,6 +1780,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make smem store visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
+            self.cross_wg_p_raw_barrier()
 
         # For RescaleOBeforeGemm: initialize acc_O
         if const_expr(self.rescale_O_before_gemm):
@@ -1980,6 +1981,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            self.cross_wg_p_raw_barrier()
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
@@ -2056,6 +2058,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            self.cross_wg_p_raw_barrier()
         return smem_pipe_read
 
     @cute.jit
@@ -2126,6 +2129,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.p_shared_across_wg):
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.PSync), number_of_threads=self.num_mma_threads
+            )
+
+    @cute.jit
+    def cross_wg_p_raw_barrier(self):
+        """RAW barrier on sP for hdim > 256: after the P store and proxy fence, before the PV
+        GEMM, so neither warpgroup's wgmma reads sP before the other's store is fenced."""
+        if const_expr(self.p_shared_across_wg):
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PSyncRAW), number_of_threads=self.num_mma_threads
             )
 
     @cute.jit

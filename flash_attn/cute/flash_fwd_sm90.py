@@ -104,14 +104,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
 
     def _get_tiled_mma(self):
-        atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
+        self.atom_layout_n = 2 if self.tile_hdim > 256 or self.tile_hdimv > 256 else 1
         tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
             self.dtype,
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, atom_layout_n, 1),
+            atom_layout_mnk=(self.tile_m // 64, self.atom_layout_n, 1),
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
@@ -122,7 +122,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
-                atom_layout_n,
+                self.atom_layout_n,
                 1,
             ),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, min(256, self.tile_hdimv)),
@@ -307,6 +307,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
+        # hdim > 256: two MMA warpgroups each read the whole sP tile in the PV GEMM.
+        self.p_shared_across_wg = self.atom_layout_n == 2
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         # Per-tensor smem dtypes. FP8-KV is the one special case: sK/sV hold the fp16
@@ -1772,11 +1774,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP_cur.store(tOrP_acc.load().to(self.dtype))
 
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
             # Fence and barrier to make smem store visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
+            self.cross_wg_p_raw_barrier()
 
         # For RescaleOBeforeGemm: initialize acc_O
         if const_expr(self.rescale_O_before_gemm):
@@ -1969,6 +1973,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # 2 elements. So we just call ptx directly.
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         softmax.rescale_O(acc_O, row_scale)
@@ -1976,6 +1981,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            self.cross_wg_p_raw_barrier()
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # O += P @ V
@@ -2041,6 +2047,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # 2 elements. So we just call ptx directly.
         utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
+            self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
         if const_expr(not self.rescale_O_before_gemm):
@@ -2051,6 +2058,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
+            self.cross_wg_p_raw_barrier()
         return smem_pipe_read
 
     @cute.jit
@@ -2113,6 +2121,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             scores_scale.store(row_scale.load())
         return smem_pipe_read
+
+    @cute.jit
+    def cross_wg_p_barrier(self):
+        """WAR barrier on sP for hdim > 256: both MMA warpgroups read the whole sP in the PV
+        GEMM, so neither may overwrite it with the next P before the other is done reading."""
+        if const_expr(self.p_shared_across_wg):
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PSync), number_of_threads=self.num_mma_threads
+            )
+
+    @cute.jit
+    def cross_wg_p_raw_barrier(self):
+        """RAW barrier on sP for hdim > 256: after the P store and proxy fence, before the PV
+        GEMM, so neither warpgroup's wgmma reads sP before the other's store is fenced."""
+        if const_expr(self.p_shared_across_wg):
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierFwd.PSyncRAW), number_of_threads=self.num_mma_threads
+            )
 
     @cute.jit
     def mma_init(self):

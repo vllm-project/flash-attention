@@ -137,7 +137,7 @@ if (FA2_ENABLED)
 
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
-        cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        cuda_archs_loose_intersection(FA2_ARCHS "8.0;9.0a;10.0f;11.0a;12.0f+PTX" "${CUDA_ARCHS}")
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
         set_gencode_flags_for_srcs(

@@ -2883,6 +2883,56 @@ def test_flash_attn_kvcache_fp8_dequant_sm90(num_splits, k_scale, v_scale, mha_t
     assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 hdim 512 forward")
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(1, 2048), (64, 128), (256, 1024)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hdim512_multi_kv_block_sm90(seqlen_q, seqlen_k, dtype, causal, mha_type, paged):
+    """SM90 hdim 512 forward over more than one KV block.
+
+    For hdim > 256 both MMA warpgroups read the whole shared P tile in the PV GEMM.
+    Single-KV-block cases cannot expose a missing cross-warpgroup sync on sP, so every
+    case here spans >= 2 KV blocks (tile_n = 64). Also checks run-to-run determinism.
+    """
+    device, d, batch_size, nheads, page_size = "cuda", 512, 2, 8, 64
+    nheads_k = nheads if mha_type == "mha" else 2
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k, page_size, batch_size, nheads_k, d, d, device, dtype, dtype
+    )
+    k_cache, v_cache = k_cache.contiguous(), v_cache.contiguous()
+
+    def run():
+        if paged:
+            out, *_ = _flash_attn_fwd(
+                q=q,
+                k=k_cache_paged,
+                v=v_cache_paged,
+                causal=causal,
+                page_table=page_table,
+                seqused_k=torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device),
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                num_splits=1,
+            )
+        else:
+            out, _ = flash_attn_func(q, k_cache, v_cache, causal=causal, num_splits=1)
+        return out
+
+    out = run()
+    if is_fake_mode():
+        return
+    out_ref, _ = attention_ref(q, k_cache, v_cache, causal=causal)
+    out_pt, _ = attention_ref(q, k_cache, v_cache, causal=causal, upcast=False, reorder_ops=True)
+    print_diff_stats("Output", out, out_ref, out_pt)
+    check_tensor_vs_ref("Output", out, out_ref, out_pt)
+    assert torch.equal(out, run()), "hdim 512 forward is not deterministic across launches"
+
+
 def _run_fp8_paged_decode(q, k, v, page_size=128):
     """Run a single-sequence FP8 paged decode with unit descales."""
     seqlen_k, nheads_kv, d = k.shape

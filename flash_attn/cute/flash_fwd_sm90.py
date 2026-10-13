@@ -2201,8 +2201,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self._transpose_fp8_v_tile(dp, dp.tStage_V0, dp.tsV0)
         else:
             self._transpose_fp8_v_tile(dp, dp.tStage_V1, dp.tsV1)
-        dp.pipeline_stage.consumer_release_w_index(0)
+        # Order the LDSM reads before the next V TMA; lane 0 of each warp releases.
         cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        dp.pipeline_stage.consumer_release_w_index(0)
 
     @cute.jit
     def _permute_Cregs_fp8(self, acc):

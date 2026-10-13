@@ -1428,8 +1428,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self._gemm_qk_fp8_compensated,
                 tiled_mma_qk,
                 (self.tile_m, self.tile_n),
-                tSrQ,
+                # Residual terms first, while the running sum is still small.
                 tSrQ_res,
+                tSrQ,
                 tSrK,
             )
         else:

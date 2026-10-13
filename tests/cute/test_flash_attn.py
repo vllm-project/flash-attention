@@ -3322,6 +3322,37 @@ def test_flash_attn_kvcache_fp8_mma_long_context_splitkv_sm90():
 
 
 @pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("seqlen_k", [32768, 131072])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_long_split_keeps_mass_sm90(seqlen_k):
+    """q = 0 and V = 1 give exactly 1 at any length in one split."""
+    nheads, nheads_kv, d, page_size = 2, 1, 512, 64
+    n_pages = seqlen_k // page_size
+    q = torch.zeros(1, 1, nheads, d, device="cuda", dtype=torch.bfloat16)
+    shape = (n_pages, page_size, nheads_kv, d)
+    k = torch.zeros(shape, device="cuda").to(torch.float8_e4m3fn)
+    v = torch.ones(shape, device="cuda").to(torch.float8_e4m3fn)
+    page_table = torch.arange(n_pages, device="cuda", dtype=torch.int32).unsqueeze(0)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=1.0,
+        num_splits=1,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+    ones = torch.ones_like(out, dtype=torch.float32)
+    torch.testing.assert_close(out.float(), ones, atol=1e-3, rtol=0)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
 @pytest.mark.parametrize("num_splits", [1, 4])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_kvcache_fp8_mma_dynamic_causal_mixed_batch_sm90(num_splits):

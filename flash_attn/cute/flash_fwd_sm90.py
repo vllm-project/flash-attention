@@ -1444,15 +1444,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), sP, sVt
         )
         tOrP_res = None
+        pv_scratch = None
         if const_expr(self.fp8_kv_dequant):
+            # FP8 WGMMA sums below FP32 (PTX 9.7.16.5.2): promote PV every block.
+            assert self.rescale_O_before_gemm
             tOrP_res = cute.make_rmem_tensor_like(tOrP)
+            pv_scratch = self._make_pv_scratch(
+                sVt, warp_group_thread_layout(warp_group_idx), pv_cols=64
+            )
             mma_pv_fn = partial(
-                self._gemm_pv_fp8_compensated,
-                tiled_mma_pv,
-                acc_O,
-                tOrP,
-                tOrP_res,
-                tOrVt,
+                self._gemm_pv_fp8_promoted, pv_scratch, acc_O, tOrP, tOrP_res
             )
         else:
             mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
@@ -2040,20 +2041,56 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self._gemm_two_fp8_a(tiled_mma, acc, tQ_first, tQ_second, rK, True, wg_wait, mid=mid)
         return acc
 
+    def _make_pv_scratch(self, sVt, wg_thr_layout, pv_cols: int):
+        """PV column chunks: one 64 x pv_cols WGMMA per WG into a shared FP32 scratch."""
+        half = min(256, self.tile_hdimv)
+        assert half == 256 and self.tile_hdimv == 2 * half and half % pv_cols == 0
+        tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
+            self.kv_dtype,
+            self.kv_dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            Float32,
+            atom_layout_mnk=(self.tile_m // 64, 2, 1),
+            tiler_mn=(64, pv_cols),
+            a_source=warpgroup.OperandSource.RMEM,
+        )
+        wg_mma = tiled_mma.get_slice(wg_thr_layout)
+        # Rows [c * pv_cols, (c + 1) * pv_cols) of each WG's half of sVt, K-major.
+        chunk_layout = cute.make_layout(
+            ((8, pv_cols // 8, 2), (self.tile_n, 1), (1, 1)),
+            stride=((self.tile_n, 8 * self.tile_n, half * self.tile_n), (1, 0), (0, 0)),
+        )
+        tVs = []
+        acc = None
+        for c in range(half // pv_cols):
+            sVt_c = cute.make_tensor(sVt.iterator + c * pv_cols * self.tile_n, chunk_layout)
+            acc, _, tV_c = sm90_utils.partition_fragment_ABC(
+                wg_mma, (self.tile_m, 2 * pv_cols, self.tile_n), None, sVt_c
+            )
+            tVs.append(tV_c)
+        return SimpleNamespace(tiled_mma=tiled_mma, acc=acc, tVs=tVs, n8=pv_cols // 8)
+
     @cute.jit
-    def _gemm_pv_fp8_compensated(
-        self,
-        tiled_mma,
-        acc,
-        tP_hi,
-        tP_res,
-        tV,
-        zero_init,
-        B_idx=None,
-        wg_wait: int = -1,
+    def _gemm_pv_fp8_promoted(
+        self, pv, acc_O, tP_hi, tP_res, zero_init=False, B_idx=None, wg_wait: int = -1
     ):
-        rV = tV if const_expr(B_idx is None) else tV[None, None, None, B_idx]
-        self._gemm_two_fp8_a(tiled_mma, acc, tP_hi, tP_res, rV, zero_init, wg_wait)
+        """O += P @ V per 64-key block, added in FP32; zero_init and wg_wait are unused."""
+        for c in cutlass.range_constexpr(len(pv.tVs)):
+            rV = pv.tVs[c] if const_expr(B_idx is None) else pv.tVs[c][None, None, None, B_idx]
+            self._gemm_two_fp8_a(pv.tiled_mma, pv.acc, tP_hi, tP_res, rV, True, 0)
+            self._pv_fold(pv, acc_O, c)
+
+    @cute.jit
+    def _pv_fold(self, pv, acc_O, c: cutlass.Constexpr[int]):
+        fo = cute.group_modes(acc_O, 1, cute.rank(acc_O))
+        fc = cute.group_modes(pv.acc, 1, cute.rank(pv.acc))
+        for mi in cutlass.range_constexpr(cute.size(fc.shape[1])):
+            for e in cutlass.range_constexpr(2):
+                for r in cutlass.range_constexpr(2):
+                    for j in cutlass.range_constexpr(pv.n8):
+                        idx = ((e, r, c * pv.n8 + j), mi)
+                        fo[idx] = fo[idx] + fc[((e, r, j), mi)]
 
     @cute.jit
     def _quantize_q_to_fp8(self, q_narrow_params):

@@ -76,6 +76,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # SM90 compensated FP8-MMA path: native fp16/bf16 Q, E4M3 paged K/V,
         # FP8 WGMMA QK/PV, FP32 accumulation, and native fp16/bf16 O.
         self.fp8_kv_dequant = fp8_kv_dequant
+        # Split the FP8 QK sum in two; non-causal builds would serialize WGMMAs (ptxas C7511).
+        self.qk_split = fp8_kv_dequant and (self.is_causal or self.is_local)
         assert not self.fp8_kv_dequant or self.mma_pv_is_rs, (
             "SM90 FP8 KV dequant requires RS-mode PV because its shared storage "
             "does not allocate sP"
@@ -1588,6 +1590,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             check_inf=True,
             scores_scale=scores_scale,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
+            **(dict(qk_split_acc=pv_scratch.acc) if const_expr(self.qk_split) else {}),
         )
 
         process_first_half_block = partial(
@@ -2035,12 +2038,68 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _gemm_qk_fp8_compensated(
-        self, tiled_mma, shape, tQ_first, tQ_second, tK, B_idx=None, wg_wait: int = -1, mid=None
+        self,
+        tiled_mma,
+        shape,
+        tQ_first,
+        tQ_second,
+        tK,
+        B_idx=None,
+        wg_wait: int = -1,
+        mid=None,
+        split_acc=None,
     ):
         acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rK = tK if const_expr(B_idx is None) else tK[None, None, None, B_idx]
-        self._gemm_two_fp8_a(tiled_mma, acc, tQ_first, tQ_second, rK, True, wg_wait, mid=mid)
+        if const_expr(not self.qk_split):
+            self._gemm_two_fp8_a(tiled_mma, acc, tQ_first, tQ_second, rK, True, wg_wait, mid=mid)
+        elif const_expr(split_acc is None):
+            # First block: own second accumulator, always waited for and folded here.
+            acc2 = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
+            self._gemm_qk_fp8_split(tiled_mma, acc, acc2, tQ_first, tQ_second, rK, None)
+            warpgroup.wait_group(0)
+            self._fold_qk_split(acc, acc2)
+        else:
+            # wg_wait is unused: the caller waits and folds split_acc before reusing it.
+            self._gemm_qk_fp8_split(tiled_mma, acc, split_acc, tQ_first, tQ_second, rK, mid)
         return acc
+
+    @cute.jit
+    def _gemm_qk_fp8_split(
+        self,
+        tiled_mma,
+        acc,
+        acc2,
+        tA_first,
+        tA_second,
+        rK,
+        mid,
+    ):
+        """One commit group: k-steps in the first half sum into acc, the rest into acc2."""
+        nk = const_expr(cute.size(tA_first.shape[2]))
+        warpgroup.fence()
+        a1 = cute.make_mma_atom(tiled_mma.op)
+        a2 = cute.make_mma_atom(tiled_mma.op)
+        a1.set(warpgroup.Field.ACCUMULATE, False)
+        a2.set(warpgroup.Field.ACCUMULATE, False)
+        for t in cutlass.range_constexpr(2):
+            tA = tA_first if const_expr(t == 0) else tA_second
+            if const_expr(t == 1 and mid is not None):
+                mid()
+                warpgroup.fence()
+            for k in cutlass.range_constexpr(nk):
+                if const_expr(k < nk // 2):
+                    cute.gemm(a1, acc, tA[None, None, k], rK[None, None, k], acc)
+                    a1.set(warpgroup.Field.ACCUMULATE, True)
+                else:
+                    cute.gemm(a2, acc2, tA[None, None, k], rK[None, None, k], acc2)
+                    a2.set(warpgroup.Field.ACCUMULATE, True)
+        warpgroup.commit_group()
+
+    @cute.jit
+    def _fold_qk_split(self, acc, acc2):
+        for i in cutlass.range_constexpr(cute.size(acc)):
+            acc[i] = acc[i] + acc2[i]
 
     def _make_pv_scratch(self, sVt, wg_thr_layout, pv_cols: int):
         """PV column chunks: one 64 x pv_cols WGMMA per WG into a shared FP32 scratch."""
@@ -2465,6 +2524,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         dequant_params: Optional[SimpleNamespace] = None,
+        qk_split_acc: Optional[cute.Tensor] = None,
     ):
         # FP8-KV intra-WG overlap: wait for K[n] for QK[n], then cast V[n_prev]
         # between the two Q terms of QK[n] for PV[n_prev]. Separate from the generic overlap
@@ -2491,10 +2551,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # ---- 2. S = Q @ K.T (async), with step 3 between its two Q terms ----
         self.warp_scheduler_barrier_sync()
-        acc_S = mma_qk_fn(B_idx=ks, wg_wait=-1, mid=_vstep)
+        if const_expr(self.qk_split):
+            acc_S = mma_qk_fn(B_idx=ks, wg_wait=-1, mid=_vstep, split_acc=qk_split_acc)
+        else:
+            acc_S = mma_qk_fn(B_idx=ks, wg_wait=-1, mid=_vstep)
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
-        # ---- 4. O += P @ V (async), then wait QK then PV ----
+        # ---- 4. O += P @ V; the promoted passes wait for QK and PV ----
+        if const_expr(self.qk_split):
+            # The PV passes reuse the scratch: QK must land and fold first.
+            warpgroup.wait_group(0)
+            self._fold_qk_split(acc_S, qk_split_acc)
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)

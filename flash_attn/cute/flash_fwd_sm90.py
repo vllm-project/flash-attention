@@ -73,8 +73,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         self.is_split_kv = is_split_kv
-        # SM90 compensated FP8-MMA path: native fp16/bf16 Q, E4M3 paged K/V,
-        # FP8 WGMMA QK/PV, FP32 accumulation, and native fp16/bf16 O.
+        # SM90 FP8-MMA path: FP8 WGMMA sums below FP32, so PV is promoted per KV block.
         self.fp8_kv_dequant = fp8_kv_dequant
         # Split the FP8 QK sum in two; non-causal builds would serialize WGMMAs (ptxas C7511).
         self.qk_split = fp8_kv_dequant and (self.is_causal or self.is_local)
@@ -271,7 +270,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             # FP8-KV: K/V are fp8 (rejected by the symmetric _check_type). Q/O may each be
             # fp16 or bf16. Q and softmax P use compensated pairs of E4M3 values;
-            # QK and PV both execute as FP8 WGMMA with fp32 accumulation.
+            # QK and PV run as FP8 WGMMA, which sums below FP32; PV is promoted per block.
             assert self.dtype == Float16, (
                 "fp8_kv_dequant requires fp16 auxiliary conversion layouts"
             )

@@ -3425,8 +3425,7 @@ def test_flash_attn_kvcache_fp8_mma_large_q_sm90(q_magnitude):
     """Stress the fixed Q scale at and beyond one E4M3 component's range.
 
     Q is represented as two compensated E4M3 components.  The 512 case therefore
-    also verifies that the residual component recovers values above 448 instead
-    of silently relying on a single E4M3 conversion.  K is inversely scaled so
+    also covers values above 448 (up to 896, at most 2.2% error).  K is inversely scaled so
     the attention-score envelope remains well conditioned.
     """
     torch.manual_seed(0)

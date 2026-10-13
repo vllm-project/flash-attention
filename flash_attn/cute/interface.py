@@ -777,15 +777,14 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     if fp8_kv_dequant:
-        # SM90 FP8 MMA: fp16/bf16 Q is represented as compensated E4M3 pairs;
-        # paged E4M3 K/V remain FP8 WGMMA operands, and accumulation is FP32.
-        # The epilogue casts FP32 accumulators to the native fp16/bf16 output dtype.
+        # SM90 FP8 MMA: E4M3 Q pairs and K/V; WGMMA sums below FP32 (PTX 9.7.16.5.2).
         assert q is not None and qv is None, (
             "fp8_kv_dequant requires Q and does not support QV-only input"
         )
         assert q.dtype in (torch.float16, torch.bfloat16), (
             "fp8_kv_dequant requires fp16 or bf16 Q"
         )
+        # fp16 Q keeps 8 of its 11 significant bits in the E4M3 pair; bf16 Q is exact.
         assert k.dtype == v.dtype == torch.float8_e4m3fn, (
             "fp8_kv_dequant requires fp8 e4m3 K/V"
         )
@@ -981,9 +980,7 @@ def _flash_attn_fwd(
     kv_dtype = torch2cute_dtype_map[k.dtype] if fp8_kv_dequant else dtype
     if fp8_kv_dequant:
         assert arch // 10 == 9, "fp8_kv_dequant is an SM90-only forward (compute capability 9.x)"
-        # This dtype selects fp16 auxiliary layouts/conversions. QK and PV use
-        # compensated E4M3 operands with FP8 WGMMA and FP32 accumulation; mQ/mO
-        # retain the caller's fp16/bf16 input and output dtypes.
+        # fp16 selects the auxiliary layouts; mQ/mO keep the caller's fp16/bf16 dtypes.
         dtype = torch2cute_dtype_map[torch.float16]
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."

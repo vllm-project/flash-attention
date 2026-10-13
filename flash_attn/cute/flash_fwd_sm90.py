@@ -2008,32 +2008,36 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self,
         tiled_mma,
         acc,
-        tA_hi,
-        tA_res,
+        tA_first,
+        tA_second,
         tB,
         zero_init: cutlass.Constexpr[bool],
         wg_wait: cutlass.Constexpr[int],
+        mid=None,
     ):
-        """Issue high and residual FP8 A terms in one WGMMA commit group."""
+        """Issue two FP8 A terms in one WGMMA commit group; mid() runs between them."""
         warpgroup.fence()
         mma_atom = cute.make_mma_atom(tiled_mma.op)
         mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
-        for k in cutlass.range_constexpr(cute.size(tA_hi.shape[2])):
-            cute.gemm(mma_atom, acc, tA_hi[None, None, k], tB[None, None, k], acc)
+        for k in cutlass.range_constexpr(cute.size(tA_first.shape[2])):
+            cute.gemm(mma_atom, acc, tA_first[None, None, k], tB[None, None, k], acc)
             mma_atom.set(warpgroup.Field.ACCUMULATE, True)
-        for k in cutlass.range_constexpr(cute.size(tA_res.shape[2])):
-            cute.gemm(mma_atom, acc, tA_res[None, None, k], tB[None, None, k], acc)
+        if const_expr(mid is not None):
+            mid()
+            warpgroup.fence()
+        for k in cutlass.range_constexpr(cute.size(tA_second.shape[2])):
+            cute.gemm(mma_atom, acc, tA_second[None, None, k], tB[None, None, k], acc)
         warpgroup.commit_group()
         if const_expr(wg_wait >= 0):
             warpgroup.wait_group(wg_wait)
 
     @cute.jit
     def _gemm_qk_fp8_compensated(
-        self, tiled_mma, shape, tQ_hi, tQ_res, tK, B_idx=None, wg_wait: int = -1
+        self, tiled_mma, shape, tQ_first, tQ_second, tK, B_idx=None, wg_wait: int = -1, mid=None
     ):
         acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rK = tK if const_expr(B_idx is None) else tK[None, None, None, B_idx]
-        self._gemm_two_fp8_a(tiled_mma, acc, tQ_hi, tQ_res, rK, True, wg_wait)
+        self._gemm_two_fp8_a(tiled_mma, acc, tQ_first, tQ_second, rK, True, wg_wait, mid=mid)
         return acc
 
     @cute.jit
@@ -2425,7 +2429,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         dequant_params: Optional[SimpleNamespace] = None,
     ):
         # FP8-KV intra-WG overlap: wait for K[n] for QK[n], then cast V[n_prev]
-        # under the QK WGMMA for PV[n_prev]. Separate from the generic overlap
+        # between the two Q terms of QK[n] for PV[n_prev]. Separate from the generic overlap
         # to keep that path unchanged.
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
@@ -2434,17 +2438,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ---- 1. wait for K[n] in its sK slot ----
         ks, kp = self._kslot(n_block, dp.nmax)
         pipeline_k.consumer_wait_w_index_phase(ks, kp)
-        # ---- 2. S = Q @ K.T (async) ----
+
+        # ---- 3. cast V[n_prev] -> sV (WG-split) while the first Q term's QGMMAs run ----
+        def _vstep():
+            self._transpose_staged_fp8_v(dp, smem_pipe_read_v.phase)
+            if dp.warp_group_idx == 0:
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg
+                )
+            else:
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.DequantV1), number_of_threads=nthr_wg
+                )
+
+        # ---- 2. S = Q @ K.T (async), with step 3 between its two Q terms ----
         self.warp_scheduler_barrier_sync()
-        acc_S = mma_qk_fn(B_idx=ks, wg_wait=-1)
+        acc_S = mma_qk_fn(B_idx=ks, wg_wait=-1, mid=_vstep)
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
-        # ---- 3. cast V[n_prev] -> sV (WG-split) WHILE QK[n] runs ----
-        self._transpose_staged_fp8_v(dp, smem_pipe_read_v.phase)
-        if dp.warp_group_idx == 0:
-            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV0), number_of_threads=nthr_wg)
-        else:
-            cute.arch.barrier(barrier_id=int(NamedBarrierFwd.DequantV1), number_of_threads=nthr_wg)
         # ---- 4. O += P @ V (async), then wait QK then PV ----
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()

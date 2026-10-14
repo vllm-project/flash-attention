@@ -135,9 +135,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_dtype,
             mma_dtype,
             warpgroup.OperandMajorMode.K,
-            warpgroup.OperandMajorMode.K
-            if self.fp8_kv_dequant
-            else warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.K if self.fp8_kv_dequant else warpgroup.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(
                 self.tile_m // 64,
@@ -320,9 +318,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_threads_per_warp_group = 128
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         if const_expr(self.fp8_kv_dequant):
-            assert self.num_wg_mma == 2, (
-                "SM90 d512 FP8 MMA requires exactly two MMA warp groups"
-            )
+            assert self.num_wg_mma == 2, "SM90 d512 FP8 MMA requires exactly two MMA warp groups"
         assert self.num_wg_mma in [1, 2, 3]
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
@@ -723,18 +719,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQ_mma = sQ
         sQ_res = sQ
         if const_expr(self.fp8_kv_dequant):
-            sQ_mma = storage.sQ_mma.get_tensor(
-                sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner
-            )
+            sQ_mma = storage.sQ_mma.get_tensor(sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner)
             # Reuse the now-dead FP16 Q input bytes for the FP8 residual term.
             sQ_res = storage.sQ.get_tensor(
                 sQ_mma_layout.outer, swizzle=sQ_mma_layout.inner, dtype=self.kv_dtype
             )
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         if const_expr(self.fp8_kv_dequant):
-            sVt = storage.sV_mma.get_tensor(
-                sV_mma_layout.outer, swizzle=sV_mma_layout.inner
-            )
+            sVt = storage.sV_mma.get_tensor(sV_mma_layout.outer, swizzle=sV_mma_layout.inner)
             sV = layout_utils.transpose_view(sVt)
         elif const_expr(not self.Q_in_regs):
             sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
@@ -927,9 +919,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (0, 0, None))
             gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
 
-            load_K, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_K, 0, cute.make_layout(1), gK, sK
-            )
+            load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK)
             stage_copy_V, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_V, 0, cute.make_layout(1), gV, sStage
             )
@@ -946,9 +936,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if not psc:
                     n_block_max_full = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
                     if const_expr(self.is_split_kv):
-                        num_n_blocks_per_split = cute.ceil_div(
-                            n_block_max_full, num_splits
-                        )
+                        num_n_blocks_per_split = cute.ceil_div(n_block_max_full, num_splits)
                         n_block_min = split_idx * num_n_blocks_per_split
                         n_block_max = cutlass.min(
                             n_block_min + num_n_blocks_per_split, n_block_max_full
@@ -1454,9 +1442,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pv_scratch = self._make_pv_scratch(
                 sVt, warp_group_thread_layout(warp_group_idx), pv_cols=64
             )
-            mma_pv_fn = partial(
-                self._gemm_pv_fp8_promoted, pv_scratch, acc_O, tOrP, tOrP_res
-            )
+            mma_pv_fn = partial(self._gemm_pv_fp8_promoted, pv_scratch, acc_O, tOrP, tOrP_res)
         else:
             mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 

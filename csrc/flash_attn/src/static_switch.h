@@ -76,6 +76,30 @@
   #define LOCAL_SWITCH BOOL_SWITCH
 #endif
 
+#ifdef FLASHATTENTION_DISABLE_APPENDKV
+// Drops the in-kernel KV-append path (and with it the in-kernel rotary
+// embedding), which vLLM never uses — it appends KV via reshape_and_cache
+// and applies RoPE outside attention. Required for sm75: the rotary copies
+// trip layout static_asserts against the non-cp.async gmem copy atoms.
+  #define APPENDKV_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                          \
+    constexpr static bool CONST_NAME = false;    \
+    return __VA_ARGS__();                        \
+  }()
+#else
+  #define APPENDKV_SWITCH BOOL_SWITCH
+#endif
+
+#ifdef FLASHATTENTION_DISABLE_BF16
+// fp16-only build (e.g. Turing/sm75, whose kernel traits force half_t and
+// cannot instantiate the bf16 kernels). The API entry points reject bf16
+// inputs before dispatch ever gets here.
+#define FP16_SWITCH(COND, ...)               \
+  [&] {                                      \
+    using elem_type = cutlass::half_t;       \
+    return __VA_ARGS__();                    \
+  }()
+#else
 #define FP16_SWITCH(COND, ...)               \
   [&] {                                      \
     if (COND) {                              \
@@ -86,6 +110,7 @@
       return __VA_ARGS__();                  \
     }                                        \
   }()
+#endif
 
 #define HEADDIM_SWITCH(HEADDIM, ...)   \
   [&] {                                    \

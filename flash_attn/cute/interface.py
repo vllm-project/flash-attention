@@ -30,6 +30,7 @@ from flash_attn.cute.config import (
     bwd_q_subtile_factor,
     bwd_selection_reads_num_sms,
     config_kv_subtile_factor,
+    fits_two_ctas_sm90_native_fp8,
     select_bwd_config,
     select_fwd_config,
     select_mla_fwd_config,
@@ -1545,6 +1546,24 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
+    # SM90 native FP8 launch-shape choices; each one is part of the compile key.
+    native_fp8_ctas_per_sm = 1
+    if native_fp8:
+        heads_per_tile = qhead_per_kvhead if config.pack_gqa else 1
+        num_ctas = (
+            batch_size
+            * (num_head_kv if config.pack_gqa else num_head)
+            * ((host_max_seqlen_q * heads_per_tile + config.tile_m - 1) // config.tile_m)
+            * num_splits
+        )
+        # Two CTAs per SM only pay off when the grid exceeds one wave.
+        native_fp8_ctas_per_sm = (
+            2
+            if num_ctas > num_sms
+            and fits_two_ctas_sm90_native_fp8(config.tile_m, config.tile_n, head_dim, head_dim_v)
+            else 1
+        )
+        compile_key += (native_fp8_ctas_per_sm,)
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -1710,6 +1729,7 @@ def _flash_attn_fwd(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
                 native_fp8_tma_box_n=native_fp8_tma_box_n,
+                native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

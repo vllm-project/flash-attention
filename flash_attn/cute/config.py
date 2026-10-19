@@ -323,6 +323,25 @@ def select_sm90_native_fp8_tile(inputs: FwdHeuristicInputs) -> tuple[int, int]:
     return 128, 64
 
 
+def fits_two_ctas_sm90_native_fp8(tile_m: int, tile_n: int, head_dim: int, head_dim_v: int) -> bool:
+    """Whether two single-warpgroup native FP8 CTAs (tile_m 64, hdim_v <= 128) fit on one SM,
+    i.e. a 2-stage pipeline fits in half of the SM's shared memory.
+
+    Shared memory per CTA: per stage K + V as loaded + the transposed V
+    (tile_n x (hdim + 2 * hdim_v) bytes), plus the Q / O tile and 1 KB of barriers. An H100 / H200
+    SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's get_smem_capacity_in_bytes
+    gives the 227 KB per-CTA maximum, not the per-SM total).
+    """
+    smem_per_sm, reserved_per_cta, num_stages = 228 * 1024, 1024, 2
+    smem_bytes = (
+        max(tile_m * head_dim, 2 * tile_m * head_dim_v)
+        + 1024
+        + num_stages * tile_n * (head_dim + 2 * head_dim_v)
+    )
+    budget = smem_per_sm // 2 - reserved_per_cta - 1024
+    return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
+
+
 # === SM100 TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
 # Values:
@@ -1431,10 +1450,15 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             num_splits = 1
     # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
     # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
-    if inputs.is_sm90_native_fp8 and num_splits > 1:
-        num_splits = min(
-            num_splits, max(1, num_n_blocks), max(1, inputs.num_sms // max(1, total_mblocks))
-        )
+    # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
+    if inputs.is_sm90_native_fp8:
+        mblocks = max(1, total_mblocks)
+        if num_splits > 1:
+            num_splits = min(num_splits, max(1, num_n_blocks), max(1, inputs.num_sms // mblocks))
+        if inputs.requested_num_splits is None and fits_two_ctas_sm90_native_fp8(
+            tile_m, tile_n, inputs.head_dim, inputs.head_dim_v
+        ):
+            num_splits = max(num_splits, min(2 * inputs.num_sms // mblocks, num_n_blocks // 4, 128))
     if inputs.requested_num_splits is None and num_splits > 1:
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))
 

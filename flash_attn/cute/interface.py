@@ -219,6 +219,49 @@ def _tile_size_fwd_sm90_native_fp8(
     return 128, 64
 
 
+# Shared-memory model for SM90 native FP8: per stage, K plus V loaded row-major plus V^T
+# (tile_n x (hdim + 2 * hdim_v) bytes), plus Q / O and barriers.
+_SM90_SMEM_PER_SM_BYTES = 228 * 1024
+_SM90_SMEM_RESERVED_PER_CTA_BYTES = 1024
+
+
+def _smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_stages):
+    stage_bytes = tile_n * (head_dim + 2 * head_dim_v)
+    fixed_bytes = max(tile_m * head_dim, 2 * tile_m * head_dim_v) + 1024
+    return fixed_bytes + num_stages * stage_bytes
+
+
+def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+    """Two single-warpgroup CTAs (tile_m 64, hdim_v <= 128) fit per SM when a 2-stage
+    pipeline fits in half of the SM's shared memory."""
+    budget = _SM90_SMEM_PER_SM_BYTES // 2 - _SM90_SMEM_RESERVED_PER_CTA_BYTES - 1024
+    return (
+        tile_m == 64
+        and head_dim_v <= 128
+        and (_smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, 2) <= budget)
+    )
+
+
+def _ctas_per_sm_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_ctas, num_SMs):
+    if num_ctas > num_SMs and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+        return 2
+    return 1
+
+
+def _num_splits_sm90_native_fp8(
+    num_splits, total_mblocks, num_n_blocks, num_SMs, two_ctas_fit, auto_splits
+):
+    """Clamp static splits to whole N tiles and one wave; with the auto heuristic and two
+    CTAs per SM, fill both CTA slots."""
+    if num_splits > 1:
+        num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // max(1, total_mblocks)))
+    if auto_splits and two_ctas_fit:
+        num_splits = max(
+            num_splits, min(2 * num_SMs // max(1, total_mblocks), num_n_blocks // 4, 128)
+        )
+    return num_splits
+
+
 def _seqlen_k_loaded_sm90_native_fp8(
     max_seqlen_k, local, window_size_left, window_size_right, tile_m
 ):
@@ -529,6 +572,7 @@ def _get_fwd_config(
     intra_wg_overlap: Optional[bool] = None,
     native_fp8: bool = False,
 ) -> FwdConfig:
+    auto_splits = num_splits < 1
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
 
@@ -613,11 +657,17 @@ def _get_fwd_config(
 
     # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
     # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
-    if arch // 10 == 9 and native_fp8 and num_splits > 1:
+    # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
+    if arch // 10 == 9 and native_fp8:
         if num_SMs is None:
             num_SMs = get_num_sms_for_selection(device.index, arch)
-        num_splits = min(
-            num_splits, max(1, num_n_blocks), max(1, num_SMs // max(1, total_mblocks))
+        num_splits = _num_splits_sm90_native_fp8(
+            num_splits,
+            total_mblocks,
+            num_n_blocks,
+            num_SMs,
+            _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v),
+            auto_splits,
         )
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
@@ -1732,6 +1782,29 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
+    # SM90 native FP8 launch-shape choices; each one is part of the compile key.
+    native_fp8_ctas_per_sm = 1
+    if native_fp8:
+        seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
+            qhead_per_kvhead if pack_gqa else 1
+        )
+        num_ctas = (
+            batch_size
+            * (num_head_kv if pack_gqa else num_head)
+            * ((seqlen_q_rows + tile_m - 1) // tile_m)
+            * max(1, num_splits)
+        )
+        native_fp8_ctas_per_sm = _ctas_per_sm_sm90_native_fp8(
+            tile_m,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            num_ctas,
+            get_num_sms_for_selection(device.index, arch),
+        )
+        compile_key += (
+            native_fp8_ctas_per_sm,
+        )
     if use_dedicated_hd256_kernel:
         compile_key += (
             hd256_varlen_b1,
@@ -1890,6 +1963,7 @@ def _flash_attn_fwd(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
                 native_fp8_tma_box_n=native_fp8_tma_box_n,
+                native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

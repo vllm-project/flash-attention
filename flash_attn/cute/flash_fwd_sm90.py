@@ -45,6 +45,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    WorkTileInfo,
 )
 from cutlass.cute import FastDivmodDivisor
 
@@ -136,6 +137,65 @@ def _stmatrix_x4_b16(
     )
 
 
+class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
+    """Varlen scheduler for launches where every batch has exactly one M block (decode).
+
+    The grid is (head, split, batch), so each CTA reads its tile coordinates directly from
+    blockIdx instead of searching the cumulative M-block counts in global memory.
+    """
+
+    def __init__(
+        self, params, head_idx: Int32, batch_idx: Int32, split_idx: Int32, *, loc=None, ip=None
+    ):
+        self.params = params
+        self._head_idx = head_idx
+        self._batch_idx = batch_idx
+        self._split_idx = split_idx
+        self._is_first_block = True
+        self._ctx = None
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    @cute.jit
+    def create(params, ctx=None, *, loc=None, ip=None) -> "SingleMBlockVarlenScheduler":
+        head_idx, split_idx, batch_idx = cute.arch.block_idx()
+        return SingleMBlockVarlenScheduler(params, head_idx, batch_idx, split_idx, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params, *, loc=None, ip=None):
+        d = params.decoder
+        return (d.num_head, d.num_splits, d.num_batch)
+
+    @cute.jit
+    def _decode_work_tile(self) -> WorkTileInfo:
+        d = self.params.decoder
+        split_idx = self._split_idx if const_expr(d.is_split_kv) else Int32(0)
+        return WorkTileInfo(
+            (Int32(0), Int32(self._head_idx), Int32(self._batch_idx), Int32(split_idx)),
+            self._is_first_block,
+        )
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = ([], [])
+        for obj in (self.params, self._head_idx, self._batch_idx, self._split_idx):
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            (self.params, self._head_idx, self._batch_idx, self._split_idx), self._values_pos
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        scheduler = SingleMBlockVarlenScheduler(*obj_list, loc=self._loc)
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
+
+
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def __init__(
         self,
@@ -149,6 +209,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8: bool = False,
         native_fp8_o_dtype=None,
         native_fp8_tma_box_n: Optional[int] = None,
+        native_fp8_direct_3d_grid: bool = False,
         native_fp8_ctas_per_sm: int = 1,
         **kwargs,
     ):
@@ -157,6 +218,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.native_fp8 = native_fp8
+        self.direct_3d_grid = native_fp8 and native_fp8_direct_3d_grid
         self.ctas_per_sm = native_fp8_ctas_per_sm if native_fp8 else 1
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
@@ -795,7 +857,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             # TODO: dispatch to DynamicPersistentVarlenScheduler when appropriate
-            TileScheduler = SingleTileVarlenScheduler
+            TileScheduler = (
+                SingleMBlockVarlenScheduler
+                if const_expr(self.direct_3d_grid and mSeqUsedQ is None)
+                else SingleTileVarlenScheduler
+            )
         else:
             TileScheduler = (
                 SingleTileScheduler
@@ -945,6 +1011,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         descale_tensors=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        SeqlenInfoCls = partial(
+            SeqlenInfoQK.create,
+            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
+            seqlen_k_static=mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets
+                if blocksparse_tensors is not None
+                else None
+            ),
+            # Don't need to pass in tile_mn because we won't access offset_padded
+        )
+        # Decode with a direct (head, split, batch) grid: read the first tile's seqlens before
+        # the barrier setup so their global-memory latency overlaps it.
+        self._seqlen_first = None
+        if const_expr(self.native_fp8 and TileScheduler is SingleMBlockVarlenScheduler):
+            _, _, first_batch, _ = (
+                TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
+            )
+            self._seqlen_first = SeqlenInfoCls(first_batch)
         # Prefetch tma descriptor
         if warp_idx == 0:
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
@@ -1126,26 +1220,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             num_splits=num_splits,
-        )
-        SeqlenInfoCls = partial(
-            SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0]
-            if const_expr(mPageTable is None)
-            else mK.shape[0] * mPageTable.shape[1],
-            mCuSeqlensQ=mCuSeqlensQ,
-            mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=mSeqUsedQ,
-            mSeqUsedK=mSeqUsedK,
-            mCuTotalMBlocks=(
-                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
-            ),
-            mCuBlockIdxOffsets=(
-                blocksparse_tensors.cu_block_idx_offsets
-                if blocksparse_tensors is not None
-                else None
-            ),
-            # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
             AttentionMask,
@@ -1778,7 +1852,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            seqlen = SeqlenInfoCls(batch_idx)
+            seqlen = (
+                SeqlenInfoCls(batch_idx)
+                if const_expr(self._seqlen_first is None)
+                else self._seqlen_first
+            )
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -2494,7 +2572,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             # shape: (atom_v_m * rest_m)
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            seqlen = SeqlenInfoCls(batch_idx)
+            seqlen = (
+                SeqlenInfoCls(batch_idx)
+                if const_expr(self._seqlen_first is None)
+                else self._seqlen_first
+            )
 
             softmax_tile = softmax
             softmax_scale_eff = softmax_scale

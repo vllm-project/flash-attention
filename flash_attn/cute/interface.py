@@ -1783,6 +1783,15 @@ def _flash_attn_fwd(
         decode_splits,
     )
     # SM90 native FP8 launch-shape choices; each one is part of the compile key.
+    native_fp8_one_m_block_per_batch = (
+        native_fp8
+        and cu_seqlens_q is not None
+        and (seqused_q is None)
+        and (not use_block_sparsity)
+        and isinstance(max_seqlen_q, int)
+        and (max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= tile_m)
+    )
+    native_fp8_direct_3d_grid = native_fp8_one_m_block_per_batch and batch_size <= 65535
     native_fp8_ctas_per_sm = 1
     if native_fp8:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
@@ -1803,6 +1812,8 @@ def _flash_attn_fwd(
             get_num_sms_for_selection(device.index, arch),
         )
         compile_key += (
+            native_fp8_one_m_block_per_batch,
+            native_fp8_direct_3d_grid,
             native_fp8_ctas_per_sm,
         )
     if use_dedicated_hd256_kernel:
@@ -1963,6 +1974,7 @@ def _flash_attn_fwd(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
                 native_fp8_tma_box_n=native_fp8_tma_box_n,
+                native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
             )
         elif arch // 10 in [10, 11]:

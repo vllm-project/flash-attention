@@ -2654,6 +2654,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
                 )
+                interior_mask_fn = partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                # Native FP8 without mask_mod: blocks between the boundary blocks need no mask.
+                if const_expr(
+                    self.native_fp8 and self.mask_mod is None and self._mDynamicCausal is None
+                ):
+                    interior_mask_fn = None
                 # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_before_local_mask = {}, n_block_min = {}", n_block_min_before_local_mask, n_block_min)
                 for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                     kv_consumer_state = mma_one_n_block(
@@ -2661,7 +2667,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         n_block=n_block_max - 1 - n_tile,
                         seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
+                        mask_fn=interior_mask_fn,
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left

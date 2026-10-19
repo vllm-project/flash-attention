@@ -174,7 +174,7 @@ class Softmax(ParamsBase):
                 row_max_cur_scaled = row_max_cur * scale_log2
                 if cutlass.const_expr(self.max_offset != 0):
                     acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 - row_max_cur_scaled + max_offset, fastmath=True
+                        acc_S_row * scale_log2 + (max_offset - row_max_cur_scaled), fastmath=True
                     )
                 else:
                     acc_S_row_exp = cute.math.exp2(
@@ -186,7 +186,7 @@ class Softmax(ParamsBase):
                 row_max_cur_scaled = row_max_cur * scale_log2
                 if cutlass.const_expr(self.max_offset != 0):
                     acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 - row_max_cur_scaled + max_offset, fastmath=True
+                        acc_S_row * scale_log2 + (max_offset - row_max_cur_scaled), fastmath=True
                     )
                 else:
                     acc_S_row_exp = cute.math.exp2(

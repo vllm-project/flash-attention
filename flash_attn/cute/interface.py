@@ -203,7 +203,9 @@ def _tile_size_fwd_sm90_native_fp8(
     if short_decode and head_dim == head_dim_v == 128 and not is_local:
         return 64, 96
     if short_decode and head_dim in (64, 128, 192):
-        return 128, 64 if is_local and page_size == 64 else 96
+        return (64, 64 if is_local and page_size == 64 else 96)
+    if short_decode:
+        return (64, 64)
     if head_dim == 64:
         return 192, 128
     if head_dim <= 96:
@@ -215,6 +217,18 @@ def _tile_size_fwd_sm90_native_fp8(
     # FA3's 128x128 d256 tile exceeds this kernel's shared-memory budget because the
     # native FP8 V tile is staged twice (row-major load + K-major PV operand).
     return 128, 64
+
+
+def _seqlen_k_loaded_sm90_native_fp8(
+    max_seqlen_k, local, window_size_left, window_size_right, tile_m
+):
+    """Keys one M tile can touch: the full KV for global attention, else the window span."""
+    if not local:
+        return max_seqlen_k
+    right = window_size_right if window_size_right is not None else max_seqlen_k
+    left = window_size_left if window_size_left is not None else max_seqlen_k
+    return max(0, min(max_seqlen_k, right + left + 1 + tile_m))
+
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -550,8 +564,14 @@ def _get_fwd_config(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
+    # SM90 native FP8 sizes splits by the real window span; `window_size_right or ...` below
+    # treats a right window of 0 as unbounded.
     seqlen_k_loaded = (
-        max_seqlen_k
+        _seqlen_k_loaded_sm90_native_fp8(
+            max_seqlen_k, local, window_size_left, window_size_right, tile_m
+        )
+        if arch // 10 == 9 and native_fp8
+        else max_seqlen_k
         if not local
         else max(
             0,

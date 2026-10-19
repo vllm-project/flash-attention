@@ -1117,6 +1117,13 @@ def _flash_attn_fwd(
                 f"FA4 SM90 FP8 MMA requires the paged-KV page_size == tile_n ({config.tile_n}); "
                 f"got page_size={page_size}."
             )
+    # SM90 native FP8 paged KV whose page size differs from tile_n: load each KV tile as
+    # tile_n / box_n page-aligned TMA boxes instead of falling back to cp.async.
+    native_fp8_tma_box_n = None
+    if native_fp8 and page_table is not None and page_size != config.tile_n:
+        box_n = math.gcd(page_size, config.tile_n)
+        if box_n % 8 == 0 and config.tile_n // box_n <= 32:
+            native_fp8_tma_box_n = box_n
 
     decode_splits = None
     if use_sparse_decode:
@@ -1504,6 +1511,7 @@ def _flash_attn_fwd(
         block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
         arch,
         paged_kv_tma,
+        native_fp8_tma_box_n,  # native FP8 paged KV as page-sized TMA boxes
         q_subtile_factor,
         kv_subtile_factor,
         num_splits_dynamic is not None,
@@ -1689,7 +1697,9 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
-                paged_kv_non_tma=page_size not in [None, config.tile_n],
+                paged_kv_non_tma=(
+                    page_size not in [None, config.tile_n] and native_fp8_tma_box_n is None
+                ),
                 registers=config.registers,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
@@ -1699,6 +1709,7 @@ def _flash_attn_fwd(
                 native_fp8_o_dtype=(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
+                native_fp8_tma_box_n=native_fp8_tma_box_n,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

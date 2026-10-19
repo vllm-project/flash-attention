@@ -130,7 +130,15 @@ class DescaleTensors(NamedTuple):
     v_descale: Optional[cute.Tensor] = None
 
     def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
+        new_fields = []
+        idx = 0
+        for original in self:
+            if original is None:
+                new_fields.append(None)
+            else:
+                new_fields.append(values[idx])
+                idx += 1
+        return DescaleTensors(*new_fields)
 
 
 class FlashAttentionForwardSm100:

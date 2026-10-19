@@ -570,7 +570,7 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM90 else []))
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
 @pytest.mark.parametrize("has_learnable_sink", [False, True])
@@ -733,9 +733,12 @@ def test_flash_attn_output(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink_base = torch.randn(nheads, dtype=dtype, device=device)
+            learnable_sink_base = torch.randn(nheads, dtype=dtype_ref, device=device)
             learnable_sink_ref = learnable_sink_base.detach().clone().requires_grad_()
-            learnable_sink = learnable_sink_base.detach().clone().requires_grad_()
+            # FP8 is forward-only, so like q/k/v the kernel's sink must not require grad.
+            learnable_sink = learnable_sink_base.detach().clone().requires_grad_(
+                dtype != torch.float8_e4m3fn
+            )
         else:
             learnable_sink_ref = None
             learnable_sink = None
@@ -1905,7 +1908,7 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float8_e4m3fn] if IS_SM90 else []))
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
@@ -3531,6 +3534,164 @@ def test_flash_attn_kvcache_fp8_mma_large_q_sm90(q_magnitude):
     assert torch.nn.functional.cosine_similarity(
         out.float().flatten(), out_ref.float().flatten(), dim=0
     ).item() > 0.9999
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_qkv_sm90(num_splits, local, page_size, d, mha_type):
+    """SM90 FP8 Q/K/V (native_fp8) paged decode: E4M3 Q/K/V on FP8 WGMMA, bf16 output.
+
+    Several query tokens per request (speculative-decode verify) against paged FP8 K/V
+    with per-(batch, kv_head) descales, causal with an optional left window, and SplitKV.
+    page_size 64 matches tile_n for some tiles (TMA K/V), 16 never does (cp.async K/V).
+    The reference reads the exact FP8 bytes the kernel reads; out_pt also rounds P to FP8
+    and sets the error bar.
+    """
+    device, causal, fp8 = "cuda", True, torch.float8_e4m3fn
+    batch_size, nheads, seqlen_q, seqlen_k = 4, 8, 4, 1024
+    nheads_k = nheads if mha_type == "mha" else 4
+    window_size = (255, 0) if local else (None, None)
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=torch.bfloat16).to(fp8)
+    _, _, page_table, k_cache_paged, v_cache_paged, _ = _generate_block_kvcache(
+        seqlen_k, page_size, batch_size, nheads_k, d, d, device, fp8, torch.bfloat16
+    )
+    k_paged, v_paged = k_cache_paged.to(fp8), v_cache_paged.to(fp8)
+    b = torch.arange(batch_size, device=device, dtype=torch.float32)[:, None]
+    h = torch.arange(nheads_k, device=device, dtype=torch.float32)[None, :]
+    q_descale, k_descale, v_descale = ((base + 0.05 * b + 0.03 * h) for base in (0.5, 0.75, 0.6))
+    cache_seqlens = torch.tensor(
+        [seqlen_k - 37 * i for i in range(batch_size)], dtype=torch.int32, device=device
+    )
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k_paged,
+        v=v_paged,
+        causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        page_table=page_table,
+        seqused_k=cache_seqlens,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=num_splits,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    if is_fake_mode():
+        return
+
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
+    gather = lambda paged: rearrange(
+        paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
+    )[:, :seqlen_k].to(torch.bfloat16)
+    q_ref, k_ref, v_ref = q.to(torch.bfloat16), gather(k_paged), gather(v_paged)
+    common = dict(
+        causal=causal,
+        window_size=window_size,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, key_padding_mask, **common)
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, None, key_padding_mask,
+        upcast=False, reorder_ops=True, intermediate_dtype=fp8, **common,
+    )
+    print_diff_stats("Output", out, out_ref, out_pt)
+    assert out.dtype == torch.bfloat16
+    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "descale_layout",
+    [
+        "none",
+        "scalar",
+        "contiguous",
+        "batch_broadcast",
+        "head_broadcast",
+        "both_broadcast",
+        "no_q",
+        "no_k",
+        "no_v",
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_qkv_descales_sm90(descale_layout, out_dtype):
+    """SM90 FP8 Q/K/V (native_fp8) descales and output dtype.
+
+    Each of q/k/v descale may be absent, a 0-d tensor, or (batch, kv_heads) contiguous or
+    broadcast along either dimension; broadcast descales are read in place. Omitting any
+    one descale must not shift the others to the wrong operand.
+    """
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_k, d = 2, 17, 157, 8, 2, 128
+    torch.random.manual_seed(0)
+    q, k, v = (
+        torch.randn(batch_size, s, nh, d, device=device, dtype=torch.bfloat16).to(fp8)
+        for s, nh in ((seqlen_q, nheads), (seqlen_k, nheads_k), (seqlen_k, nheads_k))
+    )
+    b = torch.arange(batch_size, device=device, dtype=torch.float32)[:, None]
+    h = torch.arange(nheads_k, device=device, dtype=torch.float32)[None, :]
+
+    def make_descale(base, layout):
+        if layout == "scalar":
+            return torch.tensor(base, device=device, dtype=torch.float32)
+        if layout == "contiguous":
+            return (base + 0.1 * b + 0.05 * h).contiguous()
+        if layout == "batch_broadcast":
+            return (base + 0.05 * h).expand(batch_size, nheads_k)
+        if layout == "head_broadcast":
+            return (base + 0.1 * b).expand(batch_size, nheads_k)
+        assert layout == "both_broadcast"
+        return torch.tensor([[base]], device=device, dtype=torch.float32).expand(batch_size, nheads_k)
+
+    layout = "contiguous" if descale_layout.startswith("no_") else descale_layout
+    descales = [
+        None if layout == "none" or descale_layout == f"no_{name}" else make_descale(base, layout)
+        for name, base in zip("qkv", (0.5, 0.75, 0.6))
+    ]
+    out, *_ = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        causal=True,
+        q_descale=descales[0],
+        k_descale=descales[1],
+        v_descale=descales[2],
+        out_dtype=out_dtype,
+    )
+    if is_fake_mode():
+        return
+
+    ref_descales = [None if t is None else t.expand(batch_size, nheads_k) for t in descales]
+    common = dict(
+        causal=True,
+        q_descale=ref_descales[0],
+        k_descale=ref_descales[1],
+        v_descale=ref_descales[2],
+    )
+    q_ref, k_ref, v_ref = (x.to(torch.bfloat16) for x in (q, k, v))
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, **common)
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, upcast=False, reorder_ops=True, intermediate_dtype=fp8, **common
+    )
+    print_diff_stats("Output", out, out_ref, out_pt)
+    assert out.dtype == out_dtype
+    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
 
 
 @pytest.mark.skipif(not IS_SM90, reason="SM90 hdim 512 forward")

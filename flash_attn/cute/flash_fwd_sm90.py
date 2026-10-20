@@ -52,12 +52,10 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
 
 
-def _use_intra_wg_overlap_sm90(intra_wg_overlap, native_fp8, paged_kv_non_tma, hdimv=None):
-    # Native FP8 with paged non-TMA K/V keeps intra-warpgroup overlap only when the O
-    # accumulator leaves room for it (hdim_v <= 128); the V transpose runs in the producer.
-    return intra_wg_overlap and (
-        not native_fp8 or not paged_kv_non_tma or (hdimv is not None and hdimv <= 128)
-    )
+def _use_intra_wg_overlap_sm90(intra_wg_overlap, native_fp8):
+    # Native FP8 runs the non-overlapped mainloop: its two-level PV accumulation keeps a second
+    # O accumulator in registers, which leaves no room for the next tile's scores.
+    return intra_wg_overlap and not native_fp8
 
 
 def _convert_layout_acc_frgA_fp8(acc_layout: cute.Layout) -> cute.Layout:
@@ -166,9 +164,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 "native_fp8_o_dtype must be Float16 or BFloat16"
             )
             self.o_dtype = native_fp8_o_dtype
-        self.intra_wg_overlap = _use_intra_wg_overlap_sm90(
-            intra_wg_overlap, self.native_fp8, paged_kv_non_tma, self.tile_hdimv
-        )
+        self.intra_wg_overlap = _use_intra_wg_overlap_sm90(intra_wg_overlap, self.native_fp8)
         # Match the FA3 FP8 path: keep softmax probabilities in registers for PV.
         # SM90 FP8 needs a different accumulator-to-A-fragment mapping than FP16.
         self.mma_pv_is_rs = mma_pv_is_rs
@@ -649,9 +645,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_mma_regs = 232 if const_expr(self.use_tma_Q and self.use_tma_KV) else 224
         if const_expr(self.transpose_v_in_producer and self.num_wg_mma == 3):
             self.num_mma_regs, self.num_producer_regs = (152, 56)
-        self.rescale_O_before_gemm = (
-            self.tile_hdimv > 128 and self.intra_wg_overlap and not self.native_fp8
-        )
+        self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         # hdim > 256: two MMA warpgroups each read the whole sP tile in the PV GEMM.
         self.p_shared_across_wg = self.atom_layout_n == 2
         self._setup_attributes()
@@ -2277,6 +2271,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         tOrP_res = None
         pv_scratch = None
+        acc_O_pv = None
         if const_expr(self.fp8_kv_dequant):
             # FP8 WGMMA sums below FP32 (PTX 9.7.16.5.2): promote PV every block.
             assert self.rescale_O_before_gemm
@@ -2285,6 +2280,49 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sVt, warp_group_thread_layout(warp_group_idx), pv_cols=64
             )
             mma_pv_fn = partial(self._gemm_pv_fp8_promoted, pv_scratch, acc_O, tOrP, tOrP_res)
+        elif const_expr(self.native_fp8 and self.tile_hdimv <= 192):
+            # Native FP8: FP8 WGMMA does not accumulate in full fp32, so each PV GEMM accumulates
+            # one KV tile from zero and the result is added to the fp32 acc_O (two-level
+            # accumulation, as in FA3's FP8 forward).
+            acc_O_pv = cute.make_rmem_tensor_like(acc_O, Float32)
+            mma_pv_fn = partial(
+                self._mma_pv_tile_native_fp8,
+                partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O_pv, tOrP, tOrVt),
+            )
+        elif const_expr(self.native_fp8):
+            # hdim_v 256: O and a second full-size O do not fit in registers, so the PV GEMM
+            # runs as two hdim_v halves through one half-size tile accumulator.
+            half = self.tile_hdimv // 2
+            tiled_mma_pv_half = sm90_utils_basic.make_trivial_tiled_mma(
+                self.dtype,
+                self.dtype,
+                warpgroup.OperandMajorMode.K,
+                warpgroup.OperandMajorMode.K,
+                Float32,
+                atom_layout_mnk=(self.tile_m // 64, self.atom_layout_n, 1),
+                tiler_mn=(64, half),
+                a_source=warpgroup.OperandSource.RMEM,
+            )
+            wg_mma_pv_half = tiled_mma_pv_half.get_slice(warp_group_thread_layout(warp_group_idx))
+            acc_O_half = cute.make_rmem_tensor(
+                wg_mma_pv_half.partition_shape_C((self.tile_m, half)), Float32
+            )
+            tOrVt_halves = [
+                wg_mma_pv_half.make_fragment_B(
+                    wg_mma_pv_half.partition_B(
+                        cute.local_tile(sVt, (half, self.tile_n), (h, 0, None))
+                    )
+                )
+                for h in range(2)
+            ]
+            mma_pv_fn = partial(
+                self._mma_pv_halves_native_fp8,
+                tiled_mma_pv_half,
+                acc_O,
+                acc_O_half,
+                tOrP,
+                tOrVt_halves,
+            )
         else:
             mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
@@ -2421,6 +2459,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
             **(dict(qk_split_acc=pv_scratch.acc) if const_expr(self.qk_split) else {}),
+            **(dict(acc_O_pv=acc_O_pv) if const_expr(self.native_fp8) else {}),
         )
 
         process_first_half_block = partial(
@@ -2598,6 +2637,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # We also need masking on S if it's causal, for the last several blocks.
             # softmax.reset()  # Don't need reset as we explicitly call softmax w is_first=True
             O_should_accumulate = False
+            if const_expr(self.native_fp8):
+                acc_O.fill(0.0)
 
             # ==========================================
             # MAINLOOP
@@ -2786,6 +2827,33 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
+    def _mma_pv_tile_native_fp8(
+        self, mma_pv_tile_fn: Callable, B_idx: Int32, zero_init=False, wg_wait: int = -1
+    ):
+        """PV GEMM of one KV tile into the zeroed tile accumulator (two-level accumulation)."""
+        mma_pv_tile_fn(B_idx=B_idx, zero_init=True, wg_wait=wg_wait)
+
+    def _mma_pv_halves_native_fp8(
+        self,
+        tiled_mma_half: cute.TiledMma,
+        acc_O: cute.Tensor,
+        acc_O_half: cute.Tensor,
+        tOrP: cute.Tensor,
+        tOrVt_halves: list,
+        B_idx: Int32,
+        zero_init=False,
+        wg_wait: int = -1,
+    ):
+        """PV GEMM of one KV tile in two hdim_v halves: each half accumulates from zero in the
+        tensor cores and is added to its half of the fp32 acc_O (two-level accumulation)."""
+        n = cute.size(acc_O_half)
+        for h in range(2):
+            sm90_utils.gemm_w_idx(
+                tiled_mma_half, acc_O_half, tOrP, tOrVt_halves[h], True, B_idx=B_idx, wg_wait=0
+            )
+            for i in range(n):
+                acc_O[h * n + i] = acc_O[h * n + i] + acc_O_half[i]
+
     @cute.jit
     def first_half_block_overlap(
         self,
@@ -2827,8 +2895,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-        if const_expr(self.native_fp8):
-            _permute_Aregs_fp8(tOrP_cur)
 
         if const_expr(not self.mma_pv_is_rs):
             self.cross_wg_p_barrier()
@@ -3308,6 +3374,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        acc_O_pv: Optional[cute.Tensor] = None,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         # S = Q @ K.T
@@ -3344,7 +3411,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
-        softmax.rescale_O(acc_O, row_scale)
+        if const_expr(acc_O_pv is None):
+            softmax.rescale_O(acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()
@@ -3355,6 +3423,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
         pipeline_v.consumer_release(smem_pipe_read)
+        if const_expr(acc_O_pv is not None):
+            # O = O * row_scale + this tile's P @ V (rescale and two-level add in one FFMA)
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+            acc_O_pv_mn = layout_utils.reshape_acc_to_mn(acc_O_pv)
+            for r in cutlass.range(cute.size(row_scale), unroll_full=True):
+                acc_O_mn[r, None].store(
+                    acc_O_mn[r, None].load() * row_scale[r] + acc_O_pv_mn[r, None].load()
+                )
         smem_pipe_read.advance()
         return smem_pipe_read
 
@@ -3409,16 +3485,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self.mma_pv_is_rs)
             else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
-        if const_expr(self.native_fp8):
-            # The packed f16 conversion below is not valid for E4M3.
-            tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-            _permute_Aregs_fp8(tOrP_cur)
-        else:
-            # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-            # the "to(self.dtype)" conversion fails to vectorize for block sizes other
-            # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
-            # 2 elements. So we just call ptx directly.
-            utils.cvt_f16(tOrP_acc, tOrP_cur)
+        # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
+        # the "to(self.dtype)" conversion fails to vectorize for block sizes other
+        # than 128 x 128, i.e. it calls convert on 1 fp32 element at a time instead of
+        # 2 elements. So we just call ptx directly.
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
         if const_expr(not self.mma_pv_is_rs):
             self.cross_wg_p_barrier()
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)

@@ -3613,6 +3613,57 @@ def test_flash_attn_kvcache_fp8_qkv_sm90(num_splits, local, page_size, d, mha_ty
 
 
 @pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
+@pytest.mark.parametrize("d", [128, 256])
+@pytest.mark.parametrize("seqlen_q", [4, 256])
+@pytest.mark.parametrize("seqlen_k", [8192, 32768])
+@pytest.mark.parametrize("num_splits", [1, 0])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_qkv_long_kv_sm90(num_splits, seqlen_k, seqlen_q, d):
+    """SM90 FP8 Q/K/V over a long KV range (num_splits=1 is one accumulation chain).
+
+    FP8 WGMMA does not accumulate in full fp32, so accumulating P @ V over many KV tiles in the
+    tensor cores loses the small per-tile contributions and shrinks the output. V has a nonzero
+    mean, as real values do; with zero-mean V the loss averages out and goes unnoticed.
+    """
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    batch_size, nheads, nheads_k, page_size = 1, 4, 2, 64
+    torch.random.manual_seed(0)
+    q = (torch.randn(batch_size, seqlen_q, nheads, d, device=device) * 0.5).to(fp8)
+    num_blocks = seqlen_k // page_size
+    k_paged = (torch.randn(num_blocks, page_size, nheads_k, d, device=device) * 0.5).to(fp8)
+    v_paged = (torch.randn(num_blocks, page_size, nheads_k, d, device=device) * 0.5 + 0.5).to(fp8)
+    page_table = torch.arange(num_blocks, dtype=torch.int32, device=device)[None]
+    cache_seqlens = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
+
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k_paged,
+        v=v_paged,
+        causal=True,
+        page_table=page_table,
+        seqused_k=cache_seqlens,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        num_splits=num_splits,
+    )
+    if is_fake_mode():
+        return
+
+    q_ref = q.to(torch.bfloat16)
+    k_ref = rearrange(k_paged, "n p h d -> 1 (n p) h d").to(torch.bfloat16)
+    v_ref = rearrange(v_paged, "n p h d -> 1 (n p) h d").to(torch.bfloat16)
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=True)
+    print_diff_stats("Output", out, out_ref)
+    # No out_pt bar here: attention_ref rounds the normalized P to FP8, which underflows to
+    # zero when attention spreads over thousands of keys. The kernel's rounding of P costs
+    # ~0.2% mean error at any KV length; a truncating accumulator instead shrinks the output
+    # by an amount that grows with the KV length (10% at 8k and 35% at 32k for this V).
+    err, ref = (out - out_ref).float(), out_ref.float()
+    assert err.abs().mean().item() <= 0.01 * ref.abs().mean().item()
+    assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "descale_layout",

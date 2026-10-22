@@ -686,6 +686,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     gather_kv_valid_length: Optional[torch.Tensor] = None,
+    gather_kv_query_group_size: int = 1,
     output_scale: Optional[torch.Tensor] = None,
     compile_only: bool = False,
     fp8_kv_dequant: bool = False,
@@ -1244,6 +1245,20 @@ def _flash_attn_fwd(
             assert gather_kv_valid_length.stride(-1) == 1
             assert not requires_grad, "gather_kv_valid_length is forward-only"
 
+        if gather_kv_query_group_size != 1:
+            # Each row of qv holds query_group_size queries of 128 // query_group_size heads,
+            # and its gather_kv_indices are their top-k union with membership bits (see
+            # topk_gather_kv.GROUPED_ROW_BITS).
+            assert sparse_kv, "gather_kv_query_group_size requires gather_kv_indices"
+            assert gather_kv_query_group_size in (2, 4, 8), (
+                f"gather_kv_query_group_size must be 2, 4 or 8, got {gather_kv_query_group_size}"
+            )
+            assert num_head == 128 and num_head_kv == 1, (
+                "gather_kv_query_group_size needs 128 query heads (the packed queries) per KV head"
+            )
+            assert not causal, "gather_kv_query_group_size takes causality from the top-k lists"
+            assert not requires_grad, "gather_kv_query_group_size is forward-only"
+
         if requires_grad and sparse_kv:
             if cu_seqlens_q is None:
                 p = torch.empty(batch_size, seqlen_q, num_head, gather_kv_length, dtype=q_dtype, device=device)
@@ -1256,6 +1271,7 @@ def _flash_attn_fwd(
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
         assert gather_kv_valid_length is None, "gather_kv_valid_length is only supported with qv"
+        assert gather_kv_query_group_size == 1, "gather_kv_query_group_size is only supported with qv"
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
@@ -1479,6 +1495,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         gather_kv_valid_length is not None,
+        gather_kv_query_group_size,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         output_quant_key,
@@ -1667,6 +1684,7 @@ def _flash_attn_fwd(
                     has_cu_seqlens_q=cu_seqlens_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
                     has_qk=has_qk,
+                    query_group_size=gather_kv_query_group_size,
                 )
             else:
                 if use_dedicated_hd256_kernel:
@@ -3695,6 +3713,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         scheduler_metadata: Optional["SchedulerMetadataTensorsTorch"] = None,
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
+        gather_kv_query_group_size: int = 1,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3733,6 +3752,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_kv_valid_length=gather_kv_valid_length,
+            gather_kv_query_group_size=gather_kv_query_group_size,
             out=out,
             output_scale=output_scale,
             scheduler_metadata=scheduler_metadata,
@@ -3806,7 +3826,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             if ctx.shared_kv:
                 return dqv, dv, None, None, *((None,) * 30)
             else:
-                return dq, dk, dv, dqv, *((None,) * 30)
+                return dq, dk, dv, dqv, *((None,) * 31)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3840,7 +3860,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 16)
+            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 17)
 
 
 def flash_attn_func(
@@ -3932,6 +3952,7 @@ def flash_attn_varlen_func(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_kv_valid_length: Optional[torch.Tensor] = None,
+    gather_kv_query_group_size: int = 1,
 ):
     """
     Tensor arguments:
@@ -3975,6 +3996,11 @@ def flash_attn_varlen_func(
         computing metadata fresh.
 
     gather_kv_valid_length: leading valid entries per row; entries past it must be out of range.
+
+    gather_kv_query_group_size: number of queries packed into each row of qv (2, 4 or 8). The
+        row holds the 128 // gather_kv_query_group_size heads of each query, query-major, and
+        its gather_kv_indices entries are row | (membership << 24) with -1 padding, where bit t
+        of membership marks the top-k of query t. Rows must be below 2**24 - 1. Forward only.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -4011,6 +4037,7 @@ def flash_attn_varlen_func(
         scheduler_metadata,
         seqlen_k_per_split,
         disable_scheduler_metadata,
+        gather_kv_query_group_size,
     )
 
 

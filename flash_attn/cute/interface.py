@@ -178,12 +178,6 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         return FwdConfig(64, tile_n, False, True)
 
 
-# (head_dim, head_dim_v) pairs supported by the SM90 native FP8 (E4M3 Q/K/V) forward.
-_SM90_NATIVE_FP8_HEAD_DIM_CELLS = frozenset(
-    [(head_dim, head_dim) for head_dim in (64, 96, 128, 192, 256)] + [(192, 128)]
-)
-
-
 def _tile_size_fwd_sm90_native_fp8(
     head_dim,
     head_dim_v,
@@ -219,58 +213,23 @@ def _tile_size_fwd_sm90_native_fp8(
     return 128, 64
 
 
-# Shared-memory model for SM90 native FP8: per stage, K plus V loaded row-major plus V^T
-# (tile_n x (hdim + 2 * hdim_v) bytes), plus Q / O and barriers.
-_SM90_SMEM_PER_SM_BYTES = 228 * 1024
-_SM90_SMEM_RESERVED_PER_CTA_BYTES = 1024
-
-
-def _smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_stages):
-    stage_bytes = tile_n * (head_dim + 2 * head_dim_v)
-    fixed_bytes = max(tile_m * head_dim, 2 * tile_m * head_dim_v) + 1024
-    return fixed_bytes + num_stages * stage_bytes
-
-
 def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
-    """Two single-warpgroup CTAs (tile_m 64, hdim_v <= 128) fit per SM when a 2-stage
-    pipeline fits in half of the SM's shared memory."""
-    budget = _SM90_SMEM_PER_SM_BYTES // 2 - _SM90_SMEM_RESERVED_PER_CTA_BYTES - 1024
-    return (
-        tile_m == 64
-        and head_dim_v <= 128
-        and (_smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, 2) <= budget)
+    """Whether two single-warpgroup native FP8 CTAs (tile_m 64, hdim_v <= 128) fit on one SM,
+    i.e. a 2-stage pipeline fits in half of the SM's shared memory.
+
+    Shared memory per CTA: per stage K + V as loaded + the transposed V
+    (tile_n x (hdim + 2 * hdim_v) bytes), plus the Q / O tile and 1 KB of barriers. An H100 / H200
+    SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's get_smem_capacity_in_bytes
+    gives the 227 KB per-CTA maximum, not the per-SM total).
+    """
+    smem_per_sm, reserved_per_cta, num_stages = 228 * 1024, 1024, 2
+    smem_bytes = (
+        max(tile_m * head_dim, 2 * tile_m * head_dim_v)
+        + 1024
+        + num_stages * tile_n * (head_dim + 2 * head_dim_v)
     )
-
-
-def _ctas_per_sm_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_ctas, num_SMs):
-    if num_ctas > num_SMs and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
-        return 2
-    return 1
-
-
-def _num_splits_sm90_native_fp8(
-    num_splits, total_mblocks, num_n_blocks, num_SMs, two_ctas_fit, auto_splits
-):
-    """Clamp static splits to whole N tiles and one wave; with the auto heuristic and two
-    CTAs per SM, fill both CTA slots."""
-    if num_splits > 1:
-        num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // max(1, total_mblocks)))
-    if auto_splits and two_ctas_fit:
-        num_splits = max(
-            num_splits, min(2 * num_SMs // max(1, total_mblocks), num_n_blocks // 4, 128)
-        )
-    return num_splits
-
-
-def _seqlen_k_loaded_sm90_native_fp8(
-    max_seqlen_k, local, window_size_left, window_size_right, tile_m
-):
-    """Keys one M tile can touch: the full KV for global attention, else the window span."""
-    if not local:
-        return max_seqlen_k
-    right = window_size_right if window_size_right is not None else max_seqlen_k
-    left = window_size_left if window_size_left is not None else max_seqlen_k
-    return max(0, min(max_seqlen_k, right + left + 1 + tile_m))
+    budget = smem_per_sm // 2 - reserved_per_cta - 1024
+    return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
 
 
 @dataclass(frozen=True)
@@ -372,28 +331,19 @@ torch2cute_dtype_map = {
 
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Value-independent compile classes of an SM90 native FP8 descale.
-_DESCALE_LAYOUT_NONE = "none"
-_DESCALE_LAYOUT_SCALAR = "scalar"
-_DESCALE_LAYOUT_BOTH_BROADCAST = "both_broadcast"
-_DESCALE_LAYOUT_BATCH_BROADCAST = "batch_broadcast"
-_DESCALE_LAYOUT_HEAD_BROADCAST = "head_broadcast"
-_DESCALE_LAYOUT_CONTIGUOUS = "contiguous"
-
-
 def _classify_descale_layout(t, name, batch_size, num_head_kv, device):
-    """Validate one native FP8 descale and return its value-independent compile class.
+    """Validate one native FP8 descale and return its compile-time layout class: None (absent),
+    () (0-d scalar), or (batch_broadcast, head_broadcast) for a (batch_size, num_head_kv) tensor.
 
-    A descale is a 0-d tensor or a (batch_size, num_head_kv) tensor whose strides are
-    contiguous or broadcast (stride 0) along either or both dimensions. Broadcast
-    descales are used as is, without materializing a contiguous copy.
+    Broadcast (stride 0) descales, e.g. a per-tensor scale passed through .expand(), are used as
+    is instead of being copied to a contiguous tensor.
     """
     if t is None:
-        return _DESCALE_LAYOUT_NONE
+        return None
     assert t.dtype == torch.float32, f"{name} dtype {t.dtype} != expected {torch.float32}"
     assert t.device == device, f"{name} device {t.device} != expected {device}"
     if t.ndim == 0:
-        return _DESCALE_LAYOUT_SCALAR
+        return ()
     assert t.ndim == 2, f"{name} must be rank 0 or rank 2, got rank {t.ndim}"
     expected_shape = (batch_size, num_head_kv)
     assert tuple(t.shape) == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
@@ -401,24 +351,25 @@ def _classify_descale_layout(t, name, batch_size, num_head_kv, device):
     assert batch_stride >= 0 and head_stride >= 0, (
         f"{name} must not have negative strides, got {t.stride()}"
     )
-    if batch_stride == 0 and head_stride == 0:
-        return _DESCALE_LAYOUT_BOTH_BROADCAST
-    if batch_stride == 0 and head_stride == 1:
-        return _DESCALE_LAYOUT_BATCH_BROADCAST
-    if head_stride == 0 and batch_stride > 0:
-        return _DESCALE_LAYOUT_HEAD_BROADCAST
-    if tuple(t.stride()) == _contiguous_stride(t.shape):
-        return _DESCALE_LAYOUT_CONTIGUOUS
-    raise AssertionError(
+    layout = (batch_stride == 0, head_stride == 0)
+    # A non-broadcast dimension must be laid out contiguously.
+    supported = {
+        (True, True): True,
+        (True, False): head_stride == 1,
+        (False, True): True,
+        (False, False): tuple(t.stride()) == _contiguous_stride(t.shape),
+    }[layout]
+    assert supported, (
         f"{name} has unsupported strides {t.stride()}; expected both-broadcast, "
         "batch-broadcast, head-broadcast, or contiguous layout"
     )
+    return layout
 
 
 def _to_cute_descale(t, layout_class):
     if t is None:
         return None
-    if layout_class == _DESCALE_LAYOUT_CONTIGUOUS:
+    if layout_class == (False, False):
         # Contiguous rank-2 descales have a unit head stride. Naming that dimension avoids
         # ambiguous singleton (1, 1) layouts while keeping the batch shape/stride dynamic.
         return to_cute_tensor(t, assumed_align=4, leading_dim=1)
@@ -608,16 +559,17 @@ def _get_fwd_config(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
-    # SM90 native FP8 sizes splits by the real window span; `window_size_right or ...` below
-    # treats a right window of 0 as unbounded.
-    seqlen_k_loaded = (
-        _seqlen_k_loaded_sm90_native_fp8(
-            max_seqlen_k, local, window_size_left, window_size_right, tile_m
-        )
-        if arch // 10 == 9 and native_fp8
-        else max_seqlen_k
-        if not local
-        else max(
+    # Keys one M tile can touch: the full KV for global attention, else the window span.
+    if not local:
+        seqlen_k_loaded = max_seqlen_k
+    elif native_fp8:
+        # SM90 native FP8 counts the real window: the `or` below treats a right window of 0 as
+        # unbounded (kept for the other paths so their split choice does not change).
+        right = window_size_right if window_size_right is not None else max_seqlen_k
+        left = window_size_left if window_size_left is not None else max_seqlen_k
+        seqlen_k_loaded = max(0, min(max_seqlen_k, right + left + 1 + tile_m))
+    else:
+        seqlen_k_loaded = max(
             0,
             min(
                 max_seqlen_k,
@@ -627,7 +579,6 @@ def _get_fwd_config(
                 + tile_m,
             ),
         )
-    )
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -658,17 +609,14 @@ def _get_fwd_config(
     # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
     # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
     # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
-    if arch // 10 == 9 and native_fp8:
+    if native_fp8:
         if num_SMs is None:
             num_SMs = get_num_sms_for_selection(device.index, arch)
-        num_splits = _num_splits_sm90_native_fp8(
-            num_splits,
-            total_mblocks,
-            num_n_blocks,
-            num_SMs,
-            _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v),
-            auto_splits,
-        )
+        mblocks = max(1, total_mblocks)
+        if num_splits > 1:
+            num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // mblocks))
+        if auto_splits and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+            num_splits = max(num_splits, min(2 * num_SMs // mblocks, num_n_blocks // 4, 128))
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
 
@@ -1039,7 +987,14 @@ def _flash_attn_fwd(
         assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn, (
             "SM90 native FP8 requires E4M3 Q, K, and V; E5M2 is not supported"
         )
-        assert (head_dim, head_dim_v) in _SM90_NATIVE_FP8_HEAD_DIM_CELLS, (
+        assert (head_dim, head_dim_v) in {
+            (64, 64),
+            (96, 96),
+            (128, 128),
+            (192, 192),
+            (256, 256),
+            (192, 128),
+        }, (
             "SM90 native FP8 supports equal head_dim/head_dim_v in {64, 96, 128, 192, 256} "
             f"and (192, 128); got ({head_dim}, {head_dim_v})"
         )
@@ -1762,13 +1717,12 @@ def _flash_attn_fwd(
             * ((seqlen_q_rows + tile_m - 1) // tile_m)
             * max(1, num_splits)
         )
-        native_fp8_ctas_per_sm = _ctas_per_sm_sm90_native_fp8(
-            tile_m,
-            tile_n,
-            head_dim,
-            head_dim_v,
-            num_ctas,
-            get_num_sms_for_selection(device.index, arch),
+        # Two CTAs per SM only pay off when the grid exceeds one wave.
+        native_fp8_ctas_per_sm = (
+            2
+            if num_ctas > get_num_sms_for_selection(device.index, arch)
+            and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+            else 1
         )
         compile_key += (
             native_fp8_one_m_block_per_batch,

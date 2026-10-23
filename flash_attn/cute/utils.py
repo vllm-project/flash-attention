@@ -697,6 +697,60 @@ def cvt_fp8_to_f16_packed(src_ssa: cute.TensorSSA, dtype) -> cute.TensorSSA:
     return TensorSSA(nvgpu.cvt_fpext(res_ty, src_ssa), src_ssa.shape, dtype)
 
 
+@cute.jit
+def convert_layout_acc_Aregs_fp8(acc_layout: cute.Layout) -> cute.Layout:
+    """For SM90, FP8, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to
+    ((4, 2, 2), MMA_M, (N / 32, MMA_N)).
+
+    CuTeDSL port of the FP8 branch of FA3's ``convert_layout_acc_Aregs``:
+    https://github.com/vllm-project/flash-attention/blob/b273a02621d3c94bc747df67204f591b67f38fae/hopper/utils.h#L134-L155
+    quack's ``layout_utils.convert_layout_acc_frgA`` covers the FP16/BF16 branch.
+    """
+    assert cute.rank(acc_layout) == 3
+    assert cute.rank(acc_layout.shape[0]) == 3
+    assert acc_layout.shape[0][0] == 2 and acc_layout.shape[0][1] == 2
+    assert acc_layout.stride[0][0] == 1 and acc_layout.stride[0][1] == 2
+    assert acc_layout.shape[0][2] % 4 == 0, "FP8 PV requires the score tile N to be divisible by 32"
+    l = cute.logical_divide(
+        acc_layout, ((None, None, cute.make_layout((2, 2))), None, None)
+    )  # ((2, 2, ((2, 2), N / 32)), MMA_M, MMA_N)
+    # This combines the first two modes (<0, 0> and <0, 1>) into one mode.
+    # Will require register shuffling later to be correct (permute_Cregs_fp8).
+    mode_k = cute.coalesce(
+        cute.make_layout((l.shape[0][2][1], l.shape[2]), stride=(l.stride[0][2][1], l.stride[2]))
+    )
+    return cute.make_layout(
+        ((4, l.shape[0][2][0][0], l.shape[0][2][0][1]), l.shape[1], mode_k.shape),
+        stride=((1, l.stride[0][2][0][0], l.stride[0][2][0][1]), l.stride[1], mode_k.stride),
+    )  # ((4, 2, 2), MMA_M, N / 32 * MMA_N)
+
+
+@cute.jit
+def permute_Cregs_fp8(frag: cute.Tensor) -> None:
+    """Swap 64-bit halves of the FP32 score accumulator so that, after the FP8 conversion
+    through convert_layout_acc_Aregs_fp8, each A register holds 4 values of a single row.
+
+    CuTeDSL port of FA3's ``permute_Cregs_fp8``:
+    https://github.com/vllm-project/flash-attention/blob/b273a02621d3c94bc747df67204f591b67f38fae/hopper/utils.h#L556-L572
+    The K order this leaves the probabilities in must match the K order of V^T in smem, so it pairs
+    with a V transpose that writes V^T in that order (FA3's ``transpose_V``). FA3 only needs the
+    cross-thread ``permute_Aregs_fp8`` shuffle when V is already column-major in global memory.
+    """
+    # frag has shape ((2, 2, N / 8), MMA_M, MMA_N), each element is 32 bits
+    assert frag.shape[0][0] == 2 and frag.shape[0][1] == 2
+    assert frag.shape[0][2] % 2 == 0
+    assert frag.layout.stride[0][0] == 1
+    assert frag.element_type.width == 32
+    frag_64b = cute.group_modes(
+        cute.recast_tensor(frag, cutlass.Int64), 1, 3
+    )  # ((1, 2, N / 8), (MMA_M, MMA_N))
+    for mi in cutlass.range_constexpr(cute.size(frag_64b, mode=[1])):
+        for i in cutlass.range_constexpr(cute.size(frag_64b, mode=[0, 2]) // 2):
+            tmp = frag_64b[(0, 1, 2 * i), mi]
+            frag_64b[(0, 1, 2 * i), mi] = frag_64b[(0, 0, 2 * i + 1), mi]
+            frag_64b[(0, 0, 2 * i + 1), mi] = tmp
+
+
 @dsl_user_op
 @cute.jit
 def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:

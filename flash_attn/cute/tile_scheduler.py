@@ -1402,6 +1402,65 @@ class SingleTileVarlenScheduler:
         return scheduler
 
 
+class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
+    """Varlen scheduler for launches where every batch has exactly one M block (decode).
+
+    The grid is (head, split, batch), so each CTA reads its tile coordinates directly from
+    blockIdx instead of searching the cumulative M-block counts in global memory.
+    """
+
+    def __init__(
+        self, params, head_idx: Int32, batch_idx: Int32, split_idx: Int32, *, loc=None, ip=None
+    ):
+        self.params = params
+        self._head_idx = head_idx
+        self._batch_idx = batch_idx
+        self._split_idx = split_idx
+        self._is_first_block = True
+        self._ctx = None
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    @cute.jit
+    def create(params, ctx=None, *, loc=None, ip=None) -> "SingleMBlockVarlenScheduler":
+        head_idx, split_idx, batch_idx = cute.arch.block_idx()
+        return SingleMBlockVarlenScheduler(params, head_idx, batch_idx, split_idx, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params, *, loc=None, ip=None):
+        d = params.decoder
+        return (d.num_head, d.num_splits, d.num_batch)
+
+    @cute.jit
+    def _decode_work_tile(self) -> WorkTileInfo:
+        d = self.params.decoder
+        split_idx = self._split_idx if const_expr(d.is_split_kv) else Int32(0)
+        return WorkTileInfo(
+            (Int32(0), Int32(self._head_idx), Int32(self._batch_idx), Int32(split_idx)),
+            self._is_first_block,
+        )
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = ([], [])
+        for obj in (self.params, self._head_idx, self._batch_idx, self._split_idx):
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            (self.params, self._head_idx, self._batch_idx, self._split_idx), self._values_pos
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        scheduler = SingleMBlockVarlenScheduler(*obj_list, loc=self._loc)
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
+
+
 class DynamicPersistentVarlenScheduler:
     @dataclass
     class Params(ParamsBase):

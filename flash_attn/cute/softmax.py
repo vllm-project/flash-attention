@@ -97,9 +97,9 @@ class Softmax(ParamsBase):
     row_sum: cute.Tensor
     arch: cutlass.Constexpr[int] = 80
     softmax_scale: Float32 | None = None
-    # Native Hopper FP8 stores probabilities with a 2**max_offset bias so the E4M3
-    # conversion retains useful mantissa. The normalization cancels it; the LSE
-    # explicitly removes it in finalize().
+    # Scale P by 2**max_offset before it is cast to a low-precision dtype (8 for FP8, as in FA3 and
+    # SM100; see Note [Low Precision Scaling] in flash_fwd_sm100.py). The normalization cancels it;
+    # finalize() removes it from the LSE.
     max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
@@ -173,25 +173,19 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(is_first):
                 row_max_cur_scaled = row_max_cur * scale_log2
                 if cutlass.const_expr(self.max_offset != 0):
-                    acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 + (max_offset - row_max_cur_scaled), fastmath=True
-                    )
-                else:
-                    acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                    )
+                    row_max_cur_scaled = row_max_cur_scaled - max_offset
+                acc_S_row_exp = cute.math.exp2(
+                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                )
                 acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
                 row_scale[r] = 1.0
             else:
                 row_max_cur_scaled = row_max_cur * scale_log2
                 if cutlass.const_expr(self.max_offset != 0):
-                    acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 + (max_offset - row_max_cur_scaled), fastmath=True
-                    )
-                else:
-                    acc_S_row_exp = cute.math.exp2(
-                        acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                    )
+                    row_max_cur_scaled = row_max_cur_scaled - max_offset
+                acc_S_row_exp = cute.math.exp2(
+                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
+                )
                 # row_scale[r] = cute.math.exp2(row_max_prev * self.scale_log2 - row_max_cur_scaled)
                 row_scale[r] = cute.math.exp2(
                     (row_max_prev - row_max_cur) * scale_log2, fastmath=True

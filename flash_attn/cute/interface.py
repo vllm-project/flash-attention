@@ -1002,7 +1002,10 @@ def _flash_attn_fwd(
             raise NotImplementedError("SM90 native FP8 descales cannot require gradients.")
     else:
         q_descale, k_descale, v_descale = [
-            maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
+            t.clone(memory_format=torch.contiguous_format)
+            if isinstance(t, torch.Tensor) and 0 in t.stride()
+            else maybe_contiguous(t, align_bytes=4)
+            for t in (q_descale, k_descale, v_descale)
         ]
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")

@@ -3105,6 +3105,80 @@ def test_flash_attn_fp8_qkv_decode_launch_sm90(
     assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 16-bit decode launch tuning test")
+@pytest.mark.parametrize("num_splits", [0, 32])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize(
+    "d, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window",
+    _SM90_FP8_DECODE_LAUNCH_CASES
+    + [
+        pytest.param(96, 32, 8, 16, 1, 4096, 0, id="d96-b16-q1-k4k"),
+        pytest.param(192, 16, 4, 8, 2, 4096, 0, id="d192-b8-q2-k4k"),
+        pytest.param(512, 8, 1, 4, 4, 8192, 0, id="d512-b4-q4-k8k"),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_16bit_decode_launch_sm90(
+    d, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window, page_size, num_splits
+):
+    """SM90 BF16 Q/K/V decode with vLLM-style arguments (varlen Q, 16- and 64-token pages,
+    per-request KV lengths, default split heuristic or a static split count) across the native
+    FP8 decode launch shapes plus d96, d192 and d512: 64-row decode tiles, page-sized TMA boxes,
+    one and two CTAs per SM, split-KV with the combine kernel and the direct decode grid."""
+    device, dtype = "cuda", torch.bfloat16
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    num_pages = (seqlen_k + page_size - 1) // page_size
+    num_blocks = batch_size * num_pages
+    k_paged = torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype)
+    v_paged = torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype)
+    page_table = rearrange(
+        torch.randperm(num_blocks, dtype=torch.int32, device=device), "(b n) -> b n", b=batch_size
+    )
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+    )
+    cache_seqlens = torch.tensor(
+        [seqlen_k - 37 * i for i in range(batch_size)], dtype=torch.int32, device=device
+    )
+    window_size = (window - 1, 0) if window else (None, None)
+
+    out, *_ = _flash_attn_fwd(
+        q,
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=cache_seqlens,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        page_table=page_table,
+        causal=True,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        num_splits=num_splits,
+    )
+    if is_fake_mode():
+        return
+
+    gather = lambda paged: rearrange(
+        paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
+    )[:, :seqlen_k]
+    q_ref = rearrange(q, "(b s) h d -> b s h d", b=batch_size)
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
+    ref_args = (q_ref, gather(k_paged), gather(v_paged), None, key_padding_mask)
+    out_ref, _ = attention_ref(*ref_args, causal=True, window_size=window_size)
+    out_pt, _ = attention_ref(
+        *ref_args, causal=True, window_size=window_size, upcast=False, reorder_ops=True
+    )
+    out = rearrange(out, "(b s) h d -> b s h d", b=batch_size)
+    print_diff_stats("Output", out, out_ref)
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+
 @pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(

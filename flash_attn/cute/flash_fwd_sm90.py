@@ -1891,7 +1891,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # This also defines an all-empty sequence as a zero output.
             if is_empty_split:
                 acc_O.fill(Float32(0.0))
-                softmax_tile.row_sum.fill(-Float32.inf)
+                # A non-split launch keeps the learnable sink's LSE, as before;
+                # FP8 consumed a dummy K/V block, so its LSE is not meaningful.
+                if const_expr(self.is_split_kv or self.fp8_kv_dequant):
+                    softmax_tile.row_sum.fill(-Float32.inf)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue

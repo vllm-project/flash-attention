@@ -64,7 +64,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8_o_dtype=None,
         tma_box_n: Optional[int] = None,
         native_fp8_direct_3d_grid: bool = False,
-        native_fp8_ctas_per_sm: int = 1,
+        ctas_per_sm: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -73,7 +73,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         self.native_fp8 = native_fp8
         self.direct_3d_grid = native_fp8 and native_fp8_direct_3d_grid
-        self.ctas_per_sm = native_fp8_ctas_per_sm if native_fp8 else 1
+        self.ctas_per_sm = 1 if fp8_kv_dequant else ctas_per_sm
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )

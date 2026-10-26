@@ -213,21 +213,26 @@ def _tile_size_fwd_sm90_native_fp8(
     return 128, 64
 
 
-def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
-    """Whether two single-warpgroup native FP8 CTAs (tile_m 64, hdim_v <= 128) fit on one SM,
-    i.e. a 2-stage pipeline fits in half of the SM's shared memory.
+def _fits_two_ctas_sm90(tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs=True):
+    """Whether two single-warpgroup CTAs (tile_m 64, hdim_v <= 128) fit on one SM, i.e. a
+    2-stage pipeline fits in half of the SM's shared memory.
 
-    Shared memory per CTA: per stage K + V as loaded + the transposed V
-    (tile_n x (hdim + 2 * hdim_v) bytes), plus the Q / O tile and 1 KB of barriers. An H100 / H200
-    SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's get_smem_capacity_in_bytes
-    gives the 227 KB per-CTA maximum, not the per-SM total).
+    Shared memory per CTA, per stage: native FP8 holds K + V as loaded + the transposed V
+    (tile_n x (hdim + 2 * hdim_v) bytes); 16-bit holds K + V (2 * tile_n x (hdim + hdim_v)
+    bytes). Plus the Q / O tile, sP when PV reads P from shared memory, and 1 KB of barriers.
+    An H100 / H200 SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's
+    get_smem_capacity_in_bytes gives the 227 KB per-CTA maximum, not the per-SM total).
     """
     smem_per_sm, reserved_per_cta, num_stages = 228 * 1024, 1024, 2
-    smem_bytes = (
-        max(tile_m * head_dim, 2 * tile_m * head_dim_v)
-        + 1024
-        + num_stages * tile_n * (head_dim + 2 * head_dim_v)
-    )
+    if native_fp8:
+        fixed_bytes = max(tile_m * head_dim, 2 * tile_m * head_dim_v)
+        stage_bytes = tile_n * (head_dim + 2 * head_dim_v)
+    else:
+        fixed_bytes = 2 * tile_m * max(head_dim, head_dim_v)
+        if not mma_pv_is_rs:
+            fixed_bytes += 2 * tile_m * tile_n
+        stage_bytes = 2 * tile_n * (head_dim + head_dim_v)
+    smem_bytes = fixed_bytes + 1024 + num_stages * stage_bytes
     budget = smem_per_sm // 2 - reserved_per_cta - 1024
     return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
 
@@ -236,11 +241,16 @@ def _tile_size_fwd_sm90_16bit_decode(head_dim, head_dim_v, rows_per_kv_head):
     """Return (tile_m, tile_n) for SM90 16-bit short decode, or None for other shapes.
 
     At most 64 packed query rows share a KV head, so a 64-row tile (one MMA warpgroup) wastes
-    less of the QK and PV GEMMs than the 128/192-row defaults.
+    less of the QK and PV GEMMs than the 128/192-row defaults. When hdim_v <= 128, tile_n is
+    the largest that lets two CTAs share an SM.
     """
     if rows_per_kv_head > 64 or max(head_dim, head_dim_v) > 256:
         return None
-    return 64, 128 if max(head_dim, head_dim_v) <= 128 else 64
+    if head_dim_v <= 128:
+        for tile_n in (128, 96):
+            if _fits_two_ctas_sm90(64, tile_n, head_dim, head_dim_v, native_fp8=False):
+                return 64, tile_n
+    return 64, 64
 
 
 @dataclass(frozen=True)
@@ -628,10 +638,8 @@ def _get_fwd_config(
         mblocks = max(1, total_mblocks)
         if num_splits > 1:
             num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // mblocks))
-        if (
-            native_fp8
-            and auto_splits
-            and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+        if auto_splits and _fits_two_ctas_sm90(
+            tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs
         ):
             num_splits = max(num_splits, min(2 * num_SMs // mblocks, num_n_blocks // 4, 128))
 
@@ -1732,7 +1740,7 @@ def _flash_attn_fwd(
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
     )
-    # SM90 native FP8 launch-shape choices; each one is part of the compile key.
+    # SM90 native FP8 and 16-bit launch-shape choices; each one is part of the compile key.
     native_fp8_one_m_block_per_batch = (
         native_fp8
         and cu_seqlens_q is not None
@@ -1742,8 +1750,8 @@ def _flash_attn_fwd(
         and (max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= tile_m)
     )
     native_fp8_direct_3d_grid = native_fp8_one_m_block_per_batch and batch_size <= 65535
-    native_fp8_ctas_per_sm = 1
-    if native_fp8:
+    sm90_ctas_per_sm = 1
+    if native_fp8 or sm90_16bit:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
             qhead_per_kvhead if pack_gqa else 1
         )
@@ -1754,16 +1762,16 @@ def _flash_attn_fwd(
             * max(1, num_splits)
         )
         # Two CTAs per SM only pay off when the grid exceeds one wave.
-        native_fp8_ctas_per_sm = (
+        sm90_ctas_per_sm = (
             2
             if num_ctas > get_num_sms_for_selection(device.index, arch)
-            and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+            and _fits_two_ctas_sm90(tile_m, tile_n, head_dim, head_dim_v, native_fp8, mma_pv_is_rs)
             else 1
         )
         compile_key += (
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
-            native_fp8_ctas_per_sm,
+            sm90_ctas_per_sm,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1924,7 +1932,7 @@ def _flash_attn_fwd(
                 ),
                 tma_box_n=sm90_tma_box_n,
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
-                native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
+                ctas_per_sm=sm90_ctas_per_sm,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

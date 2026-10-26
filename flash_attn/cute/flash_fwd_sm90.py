@@ -87,6 +87,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # values; the reciprocal is folded into final output normalization.
         self.fp8_q_scale = 1.0
         self.fp8_p_scale = 256.0
+        # The P residual gets its own scale and PV pass, so a probability down to
+        # 2^-23 of the row max survives instead of rounding to 0 below 2^-18.
+        # |residual| <= 8 for p <= 1, so 8 * 32 = 256 stays below E4M3's 448.
+        self.fp8_p_res_scale = 32.0
         # FP8 K is TMA'd straight into two sK slots; sStage holds only V.
         self.num_k_slots_fp8 = 2
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -2120,14 +2124,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def _gemm_pv_fp8_promoted(
         self, pv, acc_O, tP_hi, tP_res, zero_init=False, B_idx=None, wg_wait: int = -1
     ):
-        """O += P @ V per 64-key block, added in FP32; zero_init and wg_wait are unused."""
+        """O += P @ V per 64-key block, added in FP32; zero_init and wg_wait are unused.
+
+        P_hi and the scaled P residual run as separate passes through the same
+        scratch, so the residual is unscaled in FP32 when it is folded into O.
+        """
         for c in cutlass.range_constexpr(len(pv.tVs)):
             rV = pv.tVs[c] if const_expr(B_idx is None) else pv.tVs[c][None, None, None, B_idx]
-            self._gemm_two_fp8_a(pv.tiled_mma, pv.acc, tP_hi, tP_res, rV, True, 0)
-            self._pv_fold(pv, acc_O, c)
+            self._gemm_one_fp8_a(pv.tiled_mma, pv.acc, tP_hi, rV)
+            self._pv_fold(pv, acc_O, c, 1.0)
+            self._gemm_one_fp8_a(pv.tiled_mma, pv.acc, tP_res, rV)
+            self._pv_fold(pv, acc_O, c, 1.0 / self.fp8_p_res_scale)
 
     @cute.jit
-    def _pv_fold(self, pv, acc_O, c: cutlass.Constexpr[int]):
+    def _gemm_one_fp8_a(self, tiled_mma, acc, tA, tB):
+        """acc = tA @ tB as one synchronous FP8 WGMMA commit group."""
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, False)
+        for k in cutlass.range_constexpr(cute.size(tA.shape[2])):
+            cute.gemm(mma_atom, acc, tA[None, None, k], tB[None, None, k], acc)
+            mma_atom.set(warpgroup.Field.ACCUMULATE, True)
+        warpgroup.commit_group()
+        warpgroup.wait_group(0)
+
+    @cute.jit
+    def _pv_fold(
+        self, pv, acc_O, c: cutlass.Constexpr[int], scale: cutlass.Constexpr[float]
+    ):
         fo = cute.group_modes(acc_O, 1, cute.rank(acc_O))
         fc = cute.group_modes(pv.acc, 1, cute.rank(pv.acc))
         for mi in cutlass.range_constexpr(cute.size(fc.shape[1])):
@@ -2135,7 +2159,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 for r in cutlass.range_constexpr(2):
                     for j in cutlass.range_constexpr(pv.n8):
                         idx = ((e, r, c * pv.n8 + j), mi)
-                        fo[idx] = fo[idx] + fc[((e, r, j), mi)]
+                        if const_expr(scale == 1.0):
+                            fo[idx] = fo[idx] + fc[((e, r, j), mi)]
+                        else:
+                            fo[idx] = fo[idx] + fc[((e, r, j), mi)] * Float32(scale)
 
     @cute.jit
     def _quantize_q_to_fp8(self, q_narrow_params):
@@ -2270,7 +2297,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         p_scaled = tP_acc.load() * Float32(self.fp8_p_scale)
         p_hi = p_scaled.to(self.kv_dtype)
         tOrP.store(p_hi)
-        tOrP_res.store((p_scaled - p_hi.to(Float32)).to(self.kv_dtype))
+        p_res = (p_scaled - p_hi.to(Float32)) * Float32(self.fp8_p_res_scale)
+        tOrP_res.store(p_res.to(self.kv_dtype))
 
     @cute.jit
     def first_half_block_overlap_fp8(

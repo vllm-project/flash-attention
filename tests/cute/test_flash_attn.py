@@ -3353,6 +3353,49 @@ def test_flash_attn_kvcache_fp8_mma_long_split_keeps_mass_sm90(seqlen_k):
 
 
 @pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
+@pytest.mark.parametrize("delta", [12.0, 13.0])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_kvcache_fp8_mma_keeps_softmax_tail_sm90(delta):
+    """The last key leads every earlier key by `delta`; the earlier keys hold the tail.
+
+    KV blocks run last to first, so each earlier p = exp(-delta) is quantized against
+    the last key. It must reach PV as well as row_sum, or the output drops toward 0.
+    Every tail key has the same p, so one E4M3 rounding (up to 6.25%) hits them all.
+    """
+    seqlen_k, nheads, nheads_kv, d, page_size = 32768, 2, 1, 512, 64
+    n_pages = seqlen_k // page_size
+    q = torch.zeros(1, 1, nheads, d, device="cuda", dtype=torch.bfloat16)
+    q[..., 0] = 1.0
+    k = torch.zeros(seqlen_k, nheads_kv, d, device="cuda")
+    v = torch.ones(seqlen_k, nheads_kv, d, device="cuda")
+    k[-1, :, 0] = 1.0
+    v[-1] = 0.0
+    shape = (n_pages, page_size, nheads_kv, d)
+    k = k.to(torch.float8_e4m3fn).view(shape)
+    v = v.to(torch.float8_e4m3fn).view(shape)
+    page_table = torch.arange(n_pages, device="cuda", dtype=torch.int32).unsqueeze(0)
+    seqused_k = torch.tensor([seqlen_k], device="cuda", dtype=torch.int32)
+    out, *_ = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=1,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=delta,
+        causal=True,
+        num_splits=1,
+        fp8_kv_dequant=True,
+    )
+    if is_fake_mode():
+        return
+    tail = (seqlen_k - 1) * math.exp(-delta)
+    expected = torch.full_like(out, tail / (tail + 1.0), dtype=torch.float32)
+    torch.testing.assert_close(out.float(), expected, atol=0, rtol=7e-2)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8-KV Tensor Core forward is SM90-only")
 @pytest.mark.parametrize("num_splits", [1, 4])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_kvcache_fp8_mma_dynamic_causal_mixed_batch_sm90(num_splits):

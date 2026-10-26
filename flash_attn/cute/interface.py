@@ -1169,6 +1169,17 @@ def _flash_attn_fwd(
         # Match FA3's paged non-TMA launch policy: K/V without TMA use the PackGQA Q/O copies.
         if page_table is not None and page_size != tile_mn[1]:
             pack_gqa = True
+    # SM90 16-bit Q/K/V (not the FP8-KV dequant path) shares native FP8's launch tuning.
+    sm90_16bit = (
+        arch // 10 == 9
+        and not native_fp8
+        and not fp8_kv_dequant
+        and q is not None
+        and k is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and qv is None
+        and block_sparse_tensors is None
+    )
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1193,13 +1204,13 @@ def _flash_attn_fwd(
         native_fp8=native_fp8,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
-    # SM90 native FP8 paged KV whose page size differs from tile_n: load each KV tile as
+    # SM90 paged KV whose page size differs from tile_n: load each KV tile as
     # tile_n / box_n page-aligned TMA boxes instead of falling back to cp.async.
-    native_fp8_tma_box_n = None
-    if native_fp8 and page_table is not None and page_size != tile_n:
+    sm90_tma_box_n = None
+    if (native_fp8 or sm90_16bit) and page_table is not None and page_size != tile_n:
         box_n = math.gcd(page_size, tile_n)
         if box_n % 8 == 0 and tile_n // box_n <= 32:
-            native_fp8_tma_box_n = box_n
+            sm90_tma_box_n = box_n
     q_stage = fwd_cfg.q_stage
     num_splits = fwd_cfg.num_splits
     mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
@@ -1663,7 +1674,7 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
-        native_fp8_tma_box_n,  # native FP8 paged KV as page-sized TMA boxes
+        sm90_tma_box_n,  # SM90 paged KV as page-sized TMA boxes
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
@@ -1880,7 +1891,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
-                paged_kv_non_tma=page_size not in [None, tile_n] and native_fp8_tma_box_n is None,
+                paged_kv_non_tma=page_size not in [None, tile_n] and sm90_tma_box_n is None,
                 # SplitKV: forward writes FP32 partials, combine does the fold.
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
@@ -1889,7 +1900,7 @@ def _flash_attn_fwd(
                 native_fp8_o_dtype=(
                     torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
                 ),
-                native_fp8_tma_box_n=native_fp8_tma_box_n,
+                tma_box_n=sm90_tma_box_n,
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
             )

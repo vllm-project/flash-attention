@@ -397,6 +397,13 @@ def test_flash_attn_varlen_sm90_fixed_split_cumsum_hint_parity(monkeypatch):
     torch.manual_seed(0)
     num_batch = flash_attn_interface.BIN_BATCH_SEARCH_THRESH + 1
     num_splits = 3
+    # SM90 caps static splits at one wave of M blocks; report enough SMs for 3 splits of
+    # this many batches.
+    monkeypatch.setattr(
+        flash_attn_interface,
+        "get_num_sms_for_selection",
+        lambda *args, **kwargs: num_splits * num_batch,
+    )
     q_lens = torch.arange(num_batch, device="cuda", dtype=torch.int32) % 3 + 1
     k_lens = torch.arange(num_batch, device="cuda", dtype=torch.int32) % 4 * 64 + 65
     cu_seqlens_q = torch.cat(

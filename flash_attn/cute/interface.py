@@ -232,6 +232,17 @@ def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
     return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
 
 
+def _tile_size_fwd_sm90_16bit_decode(head_dim, head_dim_v, rows_per_kv_head):
+    """Return (tile_m, tile_n) for SM90 16-bit short decode, or None for other shapes.
+
+    At most 64 packed query rows share a KV head, so a 64-row tile (one MMA warpgroup) wastes
+    less of the QK and PV GEMMs than the 128/192-row defaults.
+    """
+    if rows_per_kv_head > 64 or max(head_dim, head_dim_v) > 256:
+        return None
+    return 64, 128 if max(head_dim, head_dim_v) <= 128 else 64
+
+
 @dataclass(frozen=True)
 class BwdConfig:
     m_block_size: int
@@ -522,8 +533,10 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
     native_fp8: bool = False,
+    sm90_16bit: bool = False,
 ) -> FwdConfig:
     auto_splits = num_splits < 1
+    sm90_tuned = arch // 10 == 9 and (native_fp8 or sm90_16bit)
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
 
@@ -562,9 +575,9 @@ def _get_fwd_config(
     # Keys one M tile can touch: the full KV for global attention, else the window span.
     if not local:
         seqlen_k_loaded = max_seqlen_k
-    elif native_fp8:
-        # SM90 native FP8 counts the real window: the `or` below treats a right window of 0 as
-        # unbounded (kept for the other paths so their split choice does not change).
+    elif sm90_tuned:
+        # SM90 native FP8 and 16-bit count the real window: the `or` below treats a right window
+        # of 0 as unbounded (kept for the other paths so their split choice does not change).
         right = window_size_right if window_size_right is not None else max_seqlen_k
         left = window_size_left if window_size_left is not None else max_seqlen_k
         seqlen_k_loaded = max(0, min(max_seqlen_k, right + left + 1 + tile_m))
@@ -606,16 +619,20 @@ def _get_fwd_config(
         else:
             num_splits = 1
 
-    # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
-    # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
+    # SM90 native FP8 and 16-bit: static splits own whole N tiles, so splits beyond the tile
+    # count are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
     # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
-    if native_fp8:
+    if sm90_tuned:
         if num_SMs is None:
             num_SMs = get_num_sms_for_selection(device.index, arch)
         mblocks = max(1, total_mblocks)
         if num_splits > 1:
             num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // mblocks))
-        if auto_splits and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+        if (
+            native_fp8
+            and auto_splits
+            and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+        ):
             num_splits = max(num_splits, min(2 * num_SMs // mblocks, num_n_blocks // 4, 128))
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
@@ -1180,6 +1197,10 @@ def _flash_attn_fwd(
         and qv is None
         and block_sparse_tensors is None
     )
+    if sm90_16bit and tile_mn is None and isinstance(max_seqlen_q, int):
+        tile_mn = _tile_size_fwd_sm90_16bit_decode(
+            head_dim, head_dim_v, max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+        )
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1202,6 +1223,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         native_fp8=native_fp8,
+        sm90_16bit=sm90_16bit,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     # SM90 paged KV whose page size differs from tile_n: load each KV tile as

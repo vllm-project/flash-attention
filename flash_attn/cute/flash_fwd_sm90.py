@@ -2506,12 +2506,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
                 )
-                # Interior blocks need no causal / local mask. Native FP8 skips the mask there unless
-                # a mask_mod or dynamic causal still needs it (BF16 keeps upstream's behavior).
+                # Interior blocks need no causal / local mask. Skip the mask there unless a
+                # mask_mod or dynamic causal still needs it (FP8-KV dequant keeps upstream's
+                # behavior).
                 interior_mask_fn = (
                     None
                     if const_expr(
-                        self.native_fp8 and self.mask_mod is None and self._mDynamicCausal is None
+                        not self.fp8_kv_dequant
+                        and self.mask_mod is None
+                        and self._mDynamicCausal is None
                     )
                     else partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
                 )

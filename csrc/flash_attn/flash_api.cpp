@@ -641,18 +641,18 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
 
     void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
 
-    // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+    // Decode can treat GQA groups as query rows to reuse K/V reads.
     // H/t Daniel Haziza
     const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
-        q = torch::stable::reshape(torch::stable::transpose(torch::stable::reshape(q, {batch_size, num_heads_k, ngroups, head_size}), 1, 2), {batch_size * ngroups, num_heads_k, head_size});
+        // Keep the original query layout and address grouped rows by stride.
         max_seqlen_q = ngroups;
         num_heads = num_heads_k;
         cu_seqlens_q_d = nullptr;
     }
 
-    const int total_q = q.size(0);
+    const int total_q = seqlenq_ngroups_swapped ? batch_size * ngroups : q.size(0);
 
     STD_TORCH_CHECK(batch_size > 0, "batch size must be positive");
     STD_TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
@@ -662,7 +662,11 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 
-    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    if (seqlenq_ngroups_swapped) {
+        CHECK_SHAPE(q, batch_size, num_heads_k * ngroups, head_size);
+    } else {
+        CHECK_SHAPE(q, total_q, num_heads, head_size);
+    }
     if (!paged_KV) {
         const int total_k = k.size(0);
         CHECK_SHAPE(k, total_k, num_heads_k, head_size);
@@ -755,7 +759,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         // `out` is allocated in the final [batch, num_heads_k, ngroups, head_size] layout and
         // the kernel's (batch, head, row) indices map onto (batch, num_heads_k, ngroups), so
         // the splitkv/combine kernels write the result there directly. Override the strides
-        // that set_params_fprop derived from the packed q layout.
+        // that set_params_fprop derived before this logical remapping.
+        params.q_batch_stride = q.stride(0);
+        params.q_head_stride = q.stride(1) * ngroups;
+        params.q_row_stride = q.stride(1);
         params.o_batch_stride = out.stride(0);
         params.o_head_stride = out.stride(1);
         params.o_row_stride = out.stride(2);

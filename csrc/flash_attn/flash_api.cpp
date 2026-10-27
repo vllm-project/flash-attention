@@ -647,6 +647,14 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         // Keep the original query layout and address grouped rows by stride.
+        // Vectorized Q loads require 16-byte aligned addresses. Packing used
+        // to provide that alignment implicitly for non-contiguous queries.
+        if (reinterpret_cast<std::uintptr_t>(q.data_ptr()) % 16 != 0 ||
+            q.stride(1) % 8 != 0 || (batch_size > 1 && q.stride(0) % 8 != 0)) {
+            // contiguous() can retain an unaligned pointer on an otherwise
+            // contiguous view, so allocate a fresh aligned copy explicitly.
+            q = torch::stable::clone(q);
+        }
         max_seqlen_q = ngroups;
         num_heads = num_heads_k;
         cu_seqlens_q_d = nullptr;

@@ -1184,7 +1184,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             )
                             kv_producer_state.advance()
                 else:
-                    # Block sparsity: use TMA closures directly (not paged)
+                    # Block sparsity: map logical blocks to physical pages for TMA loads.
                     # Load Q on pipeline_q, separate from K/V pipeline
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
@@ -1207,8 +1207,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             m_block,
                             seqlen,
                             kv_producer_state,
-                            tma_load_K_fn,
-                            tma_load_V_fn,
+                            partial(self.load_sparse_tma, tma_load_K_fn, mPageTable, batch_idx),
+                            partial(self.load_sparse_tma, tma_load_V_fn, mPageTable, batch_idx),
                             pipeline_k,
                             pipeline_v,
                             self.intra_wg_overlap,
@@ -1226,6 +1226,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
                 pipeline_v.producer_tail(kv_producer_state)
+
+    @cute.jit
+    def load_sparse_tma(self, load_fn, page_table, batch_idx, src_idx, producer_state):
+        # Sparse block indices are logical; TMA addresses the physical KV page.
+        # Keep the existing sparse TMA pipeline protocol; only translate the index.
+        if const_expr(page_table is not None):
+            src_idx = page_table[batch_idx, src_idx]
+        load_fn(src_idx=src_idx, producer_state=producer_state)
 
     @cute.jit
     def load_KV(

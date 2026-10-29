@@ -14,6 +14,11 @@ from quack.cute_dsl_utils import ParamsBase
 
 import math
 
+# Grouped entries (query_group_size > 1) are row | (membership << GROUPED_ROW_BITS), with -1 as
+# padding: bit t of membership is set iff the KV row is in the top-k of query t of the group.
+GROUPED_ROW_BITS = 24
+GROUPED_ROW_MASK = (1 << GROUPED_ROW_BITS) - 1
+
 
 @dataclass
 class CpasyncGatherKVManager(ParamsBase):
@@ -49,6 +54,7 @@ class CpasyncGatherKVManager(ParamsBase):
     cpasync_barrier: Optional[pipeline.NamedBarrier]
 
     disable_bitmask: cutlass.Constexpr[Boolean]
+    query_group_size: cutlass.Constexpr[Int32]
 
     @staticmethod
     def create(
@@ -69,7 +75,9 @@ class CpasyncGatherKVManager(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        query_group_size: cutlass.Constexpr[Int32] = 1,
     ):
+        assert query_group_size == 1 or not disable_bitmask
         assert tile_n % num_threads == 0
         assert num_threads == 128
         assert hdim % 64 == 0
@@ -130,6 +138,7 @@ class CpasyncGatherKVManager(ParamsBase):
             pipeline_bitmask,
             cpasync_barrier,
             disable_bitmask,
+            query_group_size,
         )
 
     @cute.jit
@@ -172,19 +181,39 @@ class CpasyncGatherKVManager(ParamsBase):
         assert cute.size(self.rTopk_NonInterleaved) == 1
         bitmask = Uint32(0)
 
-        # Step 1. Construct per-thread bitmask
-        topk_idx = self.rTopk_NonInterleaved[0]
-        is_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
-        if is_valid:
-            bitmask = Uint32(1 << lane_idx)
+        if const_expr(self.query_group_size == 1):
+            # Step 1. Construct per-thread bitmask
+            topk_idx = self.rTopk_NonInterleaved[0]
+            is_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+            if is_valid:
+                bitmask = Uint32(1 << lane_idx)
 
-        # Step 2. Warp shuffle bitwise OR = add since indices are exclusive.
-        bitmask = warp_reduce(bitmask, operator.add)
+            # Step 2. Warp shuffle bitwise OR = add since indices are exclusive.
+            bitmask = warp_reduce(bitmask, operator.add)
 
-        self.pipeline_bitmask.producer_acquire(producer_state_bitmask)
-        # store to smem and sync threads
-        if lane_idx == 0:
-            self.sBitmask[self.warp_idx, producer_state_bitmask.index] = bitmask
+            self.pipeline_bitmask.producer_acquire(producer_state_bitmask)
+            # store to smem and sync threads
+            if lane_idx == 0:
+                self.sBitmask[self.warp_idx, producer_state_bitmask.index] = bitmask
+        else:
+            # One word per query of the group: bit `lane` is set iff this lane's entry is valid and
+            # in that query's top-k.
+            entry = self.rTopk_NonInterleaved[0]
+            is_valid = entry != -1 and (entry & GROUPED_ROW_MASK) < self.seqlen_k_limit
+            membership = (entry >> GROUPED_ROW_BITS) & ((1 << self.query_group_size) - 1)
+            words = cute.make_rmem_tensor((self.query_group_size,), Uint32)
+            for t in cutlass.range_constexpr(self.query_group_size):
+                in_t = is_valid and ((membership >> t) & 1) == 1
+                words[t] = Uint32(cute.arch.vote_ballot_sync(in_t))
+
+            self.pipeline_bitmask.producer_acquire(producer_state_bitmask)
+            # store to smem and sync threads; query t's words start at t * (tile_n // 32)
+            words_per_query = self.tile_n // 32
+            if lane_idx == 0:
+                for t in cutlass.range_constexpr(self.query_group_size):
+                    self.sBitmask[
+                        self.warp_idx + t * words_per_query, producer_state_bitmask.index
+                    ] = words[t]
         self.cpasync_barrier.arrive_and_wait()
 
         self.pipeline_bitmask.producer_commit(producer_state_bitmask)
@@ -205,7 +234,11 @@ class CpasyncGatherKVManager(ParamsBase):
 
         for i in cutlass.range_constexpr(entries_per_thread):
             topk_idx = rTopk[i]
-            if const_expr(not self.disable_bitmask):
+            if const_expr(self.query_group_size > 1):
+                row_valid = topk_idx != -1 and (topk_idx & GROUPED_ROW_MASK) < self.seqlen_k_limit
+                topk_idx = (topk_idx & GROUPED_ROW_MASK) if row_valid else Int32(0)
+                tPrRowValid[i] = row_valid
+            elif const_expr(not self.disable_bitmask):
                 row_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
                 tPrRowValid[i] = row_valid
             if const_expr(not transpose):

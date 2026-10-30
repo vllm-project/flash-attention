@@ -4,6 +4,12 @@ project(vllm_flash_attn LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# CUDA 13+ CCCL headers require MSVC's conforming preprocessor.
+if (WIN32)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zc:preprocessor")
+endif()
+
 set(FA2_ENABLED ON)
 set(FA3_ENABLED ON)
 
@@ -44,6 +50,18 @@ set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx11
 set(TORCH_SUPPORTED_VERSION_CUDA "2.4.0")
 
 find_python_constrained_versions(${PYTHON_SUPPORTED_VERSIONS})
+
+if (WIN32)
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/fix_cutlass_msvc.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass"
+        RESULT_VARIABLE CUTLASS_MSVC_PATCH_RESULT
+        ERROR_VARIABLE CUTLASS_MSVC_PATCH_ERROR)
+    if (NOT CUTLASS_MSVC_PATCH_RESULT STREQUAL "0")
+        message(FATAL_ERROR "Failed to patch CUTLASS for MSVC: ${CUTLASS_MSVC_PATCH_ERROR}")
+    endif()
+endif()
 
 #
 # Update cmake's `CMAKE_PREFIX_PATH` with torch location.
@@ -138,6 +156,14 @@ if (FA2_ENABLED)
     # For CUDA we set the architectures on a per file basis
     if (VLLM_GPU_LANG STREQUAL "CUDA")
         cuda_archs_loose_intersection(FA2_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        if(WIN32 AND ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+            if("10.0" IN_LIST CUDA_ARCHS)
+                list(APPEND FA2_ARCHS "10.0f")
+            endif()
+            if("12.0" IN_LIST CUDA_ARCHS)
+                list(APPEND FA2_ARCHS "12.0f")
+            endif()
+        endif()
         message(STATUS "FA2_ARCHS: ${FA2_ARCHS}")
 
         set_gencode_flags_for_srcs(
@@ -325,3 +351,16 @@ if (FA3_ENABLED AND ${CMAKE_CUDA_COMPILER_VERSION} GREATER_EQUAL 12.0)
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_LESS 12.0)
     message(STATUS "FA3 is disabled because CUDA version is not 12.0 or later.")
 endif ()
+
+if (WIN32)
+    foreach (_fa_tgt _vllm_fa2_C _vllm_fa3_C)
+        if (TARGET ${_fa_tgt})
+            target_compile_options(${_fa_tgt} PRIVATE
+                $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+                $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>)
+        endif()
+    endforeach()
+    if (TARGET _vllm_fa2_C)
+        target_compile_definitions(_vllm_fa2_C PRIVATE _USE_MATH_DEFINES)
+    endif()
+endif()

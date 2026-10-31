@@ -3058,9 +3058,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warpgroup.wait_group(0)
 
     @cute.jit
-    def _pv_fold(
-        self, pv, acc_O, c: cutlass.Constexpr[int], scale: cutlass.Constexpr[float]
-    ):
+    def _pv_fold(self, pv, acc_O, c: cutlass.Constexpr[int], scale: cutlass.Constexpr[float]):
         fo = cute.group_modes(acc_O, 1, cute.rank(acc_O))
         fc = cute.group_modes(pv.acc, 1, cute.rank(pv.acc))
         for mi in cutlass.range_constexpr(cute.size(fc.shape[1])):

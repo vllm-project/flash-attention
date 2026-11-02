@@ -4,7 +4,10 @@ project(vllm_flash_attn LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(FA2_ENABLED ON)
+# Parent projects (e.g. vLLM) may pre-set FA2_ENABLED to skip building FA2.
+if(NOT DEFINED FA2_ENABLED)
+    set(FA2_ENABLED ON)
+endif()
 set(FA3_ENABLED ON)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)

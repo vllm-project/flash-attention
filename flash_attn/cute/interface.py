@@ -1256,6 +1256,9 @@ def _flash_attn_fwd(
             assert num_head == 128 and num_head_kv == 1, (
                 "gather_kv_query_group_size needs 128 query heads (the packed queries) per KV head"
             )
+            assert pack_gqa, (
+                "gather_kv_query_group_size maps tile rows to queries, so it needs pack_gqa"
+            )
             assert not causal, "gather_kv_query_group_size takes causality from the top-k lists"
             assert not requires_grad, "gather_kv_query_group_size is forward-only"
 
@@ -3824,7 +3827,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 min_seqlen_k=ctx.min_seqlen_k,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 30)
+                return dqv, dv, None, None, *((None,) * 31)
             else:
                 return dq, dk, dv, dqv, *((None,) * 31)
         else:

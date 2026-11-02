@@ -96,6 +96,18 @@ def build_groups(idx, counts, group):
     return enc.to(idx.device), lens.to(idx.device)
 
 
+def keep_rows_below(idx, counts, limit):
+    """The lists as the kernel should see them with seqused_k = limit: rows >= limit dropped."""
+    kept = torch.full_like(idx, -1)
+    kept_counts = []
+    for m, n in enumerate(counts):
+        rows = idx[m, :n]
+        rows = rows[rows < limit]
+        kept[m, : rows.numel()] = rows
+        kept_counts.append(rows.numel())
+    return kept, kept_counts
+
+
 def ref_sparse_mla(q, qv, kv, idx, counts, upcast=True):
     """Per-query torch attention over each query's own top-k; lse in natural log."""
     compute_dtype = torch.float32 if upcast else q.dtype
@@ -136,15 +148,18 @@ def run_grouped(q, qv, k, v, num_kv_rows, enc, lens, group):
     return out.reshape(total_q, heads, KV_LORA_RANK), lse.reshape(total_q, heads)
 
 
-def check(group, overlap, counts, num_kv_rows=32768, seed=0):
+def check(group, overlap, counts, num_kv_rows=32768, seed=0, seqused_k=None):
     heads = 128 // group
     total_q = len(counts)
     kv, k, v = make_flat_kv(num_kv_rows, "cuda", seed=seed)
     q, qv = make_q(total_q, heads, "cuda", seed=seed + 1)
     idx = make_topk(total_q, num_kv_rows, counts, overlap, "cuda", seed=seed + 2, group=group)
     enc, lens = build_groups(idx, counts, group)
+    if seqused_k is None:
+        seqused_k = num_kv_rows
 
-    out, lse = run_grouped(q, qv, k, v, num_kv_rows, enc, lens, group)
+    out, lse = run_grouped(q, qv, k, v, seqused_k, enc, lens, group)
+    idx, counts = keep_rows_below(idx, counts, seqused_k)
     out_ref, lse_ref = ref_sparse_mla(q, qv, kv, idx, counts)
     out_pt, _ = ref_sparse_mla(q, qv, kv, idx, counts, upcast=False)
 
@@ -158,14 +173,14 @@ def check(group, overlap, counts, num_kv_rows=32768, seed=0):
     assert err <= 2 * pt_err + 1e-3, f"out max diff {err} vs torch-bf16 {pt_err}"
     lse_err = (lse[sel] - lse_ref[sel]).abs().max().item()
     assert lse_err <= 5e-3, f"lse max diff {lse_err}"
-    return lens
+    return lens, counts
 
 
 @pytest.mark.parametrize("group", [2, 4, 8])
 @pytest.mark.parametrize("overlap", [0.9, 0.0, 1.0])
 def test_grouped_matches_per_query_reference(group, overlap):
     counts = [TOPK] * (4 * group)
-    lens = check(group, overlap, counts)
+    lens, _ = check(group, overlap, counts)
     if overlap == 0.0:
         assert int(lens.max()) == group * TOPK, "disjoint top-k must fill the whole union width"
     if overlap == 1.0:
@@ -178,7 +193,7 @@ def test_grouped_ragged_counts_and_empty_queries(group):
     pattern = [TOPK, 0, 1, TILE_N + 1, 777, TOPK - 1, 0, 300]
     counts = (pattern * (2 * group))[: 4 * group]
     counts[group : 2 * group] = [0] * group  # a group with no entries at all
-    lens = check(group, 0.8, counts, seed=10)
+    lens, _ = check(group, 0.8, counts, seed=10)
     assert int(lens[1]) == 0
     assert any(int(n) % TILE_N for n in lens), "expected a union length off the 128 grid"
 
@@ -197,20 +212,24 @@ def test_grouped_without_valid_length_is_bit_identical():
     assert torch.equal(lse_len, lse_none)
 
 
-def test_grouped_rejects_causal():
-    """Causality lives in each query's top-k; a per-tile causal limit would be wrong."""
+@pytest.mark.parametrize(
+    "option, match", [(dict(causal=True), "causality"), (dict(pack_gqa=False), "pack_gqa")]
+)
+def test_grouped_rejects_unsupported_options(option, match):
+    """Causality lives in each query's top-k, so a per-tile causal limit would be wrong; and the
+    tile row -> query map assumes the heads are packed into the tile rows."""
     group, heads = 8, 16
     kv, k, v = make_flat_kv(4096, "cuda")
     q, qv = make_q(group, heads, "cuda")
     enc = torch.full((1, TILE_N), -1, device="cuda", dtype=torch.int32)
-    with pytest.raises(AssertionError, match="causality"):
+    with pytest.raises(AssertionError, match=match):
         flash_attn_varlen_func(
             q.reshape(1, 128, QK_ROPE_HEAD_DIM), k, v, qv=qv.reshape(1, 128, KV_LORA_RANK),
             cu_seqlens_q=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
             cu_seqlens_k=torch.zeros(2, device="cuda", dtype=torch.int32),
             seqused_k=torch.full((1,), 4096, device="cuda", dtype=torch.int32),
             max_seqlen_q=1, max_seqlen_k=4096, gather_kv_indices=enc,
-            gather_kv_query_group_size=group, softmax_scale=SOFTMAX_SCALE, causal=True,
+            gather_kv_query_group_size=group, softmax_scale=SOFTMAX_SCALE, **option,
         )
 
 
@@ -220,3 +239,14 @@ def test_grouped_rows_with_high_membership_bit():
     counts = [0] * 7 + [TOPK]
     counts = counts * 2
     check(group, 0.5, counts, seed=20)
+
+
+@pytest.mark.parametrize("group", [2, 8])
+def test_grouped_masks_rows_past_seqused_k(group):
+    """Union entries index the whole KV buffer: rows >= seqused_k must be dropped whatever their
+    membership bits, and a query whose rows all lie past it must come out empty."""
+    pattern = [TOPK, 1, 300, 1, 777, 0, 1, TILE_N + 1]
+    counts = (pattern * (2 * group))[: 4 * group]
+    _, kept = check(group, 0.8, counts, seed=50, seqused_k=16384)
+    emptied = [i for i, (n, m) in enumerate(zip(counts, kept)) if n > 0 and m == 0]
+    assert emptied, "expected a query whose rows all lie past seqused_k"

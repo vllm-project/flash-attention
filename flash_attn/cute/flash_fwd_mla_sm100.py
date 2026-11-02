@@ -2562,6 +2562,12 @@ class FlashAttentionMLAForwardSm100:
             self.num_softmax_threads // 32
         )
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        bitmask_query_offset = None
+        if const_expr(self.query_group_size > 1):
+            # tile rows are query-major, so each query owns cluster_tile_m // group size rows
+            row = cta_rank_in_cluster * self.cta_tile_m + tidx % self.cta_tile_m
+            rows_per_query = self.cluster_tile_m // self.query_group_size
+            bitmask_query_offset = row // rows_per_query * (self.tile_n // 32)
 
         tSAcc = tStS[(None, None), 0, 0, 0]
         tSAcc_staged = [tStS[(None, None), 0, 0, stage] for stage in range(self.num_stages_S)]
@@ -2704,6 +2710,7 @@ class FlashAttentionMLAForwardSm100:
                 warp_idx,
                 store_P=store_P,
                 gRowMax=gRowMax,
+                bitmask_query_offset=bitmask_query_offset,
             )
 
             ### first iteration ###
@@ -2840,6 +2847,7 @@ class FlashAttentionMLAForwardSm100:
         is_first: Boolean = False,
         store_P: Optional[Callable] = None,
         gRowMax: Optional[cute.Tensor] = None,
+        bitmask_query_offset: Optional[Int32] = None,
     ):
         leader_warp = warp_idx == 0
         tSrP = cute.make_rmem_tensor(tSrS_t2r.shape, self.dtype_P)
@@ -2858,10 +2866,7 @@ class FlashAttentionMLAForwardSm100:
             rBitmask = cute.make_rmem_tensor((self.tile_n // 64,), dtype=Uint32)
             bitmask_col_offset = self.tile_n // 64 if warp_idx >= 2 else 0
             if const_expr(self.query_group_size > 1):
-                # tile rows are query-major, so a row belongs to query row // (128 // group size)
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                row = cta_rank * self.cta_tile_m + tidx % self.cta_tile_m
-                bitmask_col_offset += row // (128 // self.query_group_size) * (self.tile_n // 32)
+                bitmask_col_offset += bitmask_query_offset
             for i in cutlass.range_constexpr(cute.size(rBitmask)):
                 rBitmask[i] = sBitmask[bitmask_col_offset + i, consumer_state_bitmask.index]
 

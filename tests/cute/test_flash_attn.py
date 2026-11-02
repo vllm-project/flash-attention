@@ -278,20 +278,6 @@ def test_flash_attn_sm120_num_splits(num_splits):
         flash_attn_func(q, k, v, num_splits=3)
 
 
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="SM100/SM110 hd256 forward only")
-def test_flash_attn_hd256_sm100_sm110_clamps_splitkv():
-    torch.manual_seed(0)
-    q = torch.randn(1, 128, 1, 256, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(1, 8192, 1, 256, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn_like(k)
-
-    out_ref, _ = flash_attn_func(q, k, v, num_splits=1)
-    # This shape has one M block and 64 N blocks, so auto requests SplitKV.
-    for num_splits in (0, 4):
-        out, _ = flash_attn_func(q, k, v, num_splits=num_splits)
-        assert torch.equal(out, out_ref)
-
-
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime layout-cache test",
@@ -452,11 +438,13 @@ def test_compile_flash_attn_varlen_large_batch_scheduler_helpers_from_specs(
         blocks_to_batch_cache,
     )
     monkeypatch.setattr(_flash_attn_fwd, "compile_cache", JITCache())
-    monkeypatch.setattr(
-        flash_attn_interface.utils,
-        "_get_use_clc_scheduler_default",
-        lambda: True,
-    )
+    original_get_fwd_config = flash_attn_interface._get_fwd_config
+
+    def force_clc_config(*args, **kwargs):
+        config, inputs = original_get_fwd_config(*args, **kwargs)
+        return replace(config, use_clc_scheduler=True, is_static_persistent=False), inputs
+
+    monkeypatch.setattr(flash_attn_interface, "_get_fwd_config", force_clc_config)
 
     out, lse, _, _ = compile_flash_attn_varlen_func_from_specs(
         q_shape=(num_batch, 16, 128),

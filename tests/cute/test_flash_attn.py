@@ -55,6 +55,20 @@ from flash_attn.cute.interface import (
     _flash_attn_bwd,
 )
 
+def print_diff_stats(name, actual, ref, pt=None, verbose=True):
+    if actual is None:
+        return
+    if pt is not None:
+        diff_pt = (pt - ref).abs()
+        print(f"{name} Pytorch max diff: {diff_pt.max().item()}")
+        print(f"{name} Pytorch mean diff: {diff_pt.mean().item()}")
+    diff = (actual - ref).abs()
+    print(f"{name} max diff: {diff.max().item()}")
+    print(f"{name} mean diff: {diff.mean().item()}")
+    if verbose:
+        coords = torch.unravel_index(diff.argmax(), diff.shape)
+        print(f"  at coordinates {tuple(c.item() for c in coords)}: {name}={actual[coords].item()}, {name}_ref={ref[coords].item()}")
+
 def retry_on_oom(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -501,9 +515,9 @@ def test_compile_flash_attn_varlen_sm90_keeps_fixed_splits(monkeypatch, num_spli
     original_get_fwd_config = flash_attn_interface._get_fwd_config
 
     def record_fwd_config(*args, **kwargs):
-        config = original_get_fwd_config(*args, **kwargs)
+        config, inputs = original_get_fwd_config(*args, **kwargs)
         resolved_configs.append(config)
-        return config
+        return config, inputs
 
     monkeypatch.setattr(
         flash_attn_interface,

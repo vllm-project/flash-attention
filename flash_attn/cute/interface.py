@@ -140,11 +140,11 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_hdim256_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 512 and 8 <= head_dim_v <= 512
+    is_sm90_range = (8 <= head_dim <= 256 and 8 <= head_dim_v <= 256) or head_dim == head_dim_v == 512
     if compute_capability == 9:
         assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}, or (512, 512)."
         )
     elif compute_capability in [10, 11]:
         assert (is_standard_range or is_deepseek_shape or is_deepseek_mla_absorbed_shape or is_hdim256_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
@@ -4396,7 +4396,7 @@ def compile_flash_attn_varlen_func_from_specs(
         out=out,
         lse=lse,
         compile_only=True,
-    )
+    )[:4]
 
 
 def _compile_fwd_combine(

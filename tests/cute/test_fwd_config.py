@@ -107,8 +107,8 @@ def test_selection_policy(changes, expected):
         (_DECODE, 128, 128),
         ({**_DECODE, "max_seqlen_k": 8192}, 64, 128),
         ({"requested_num_splits": None}, 1, 128),
-        # Only SM100/SM110 implement SplitKV.
-        ({**_DECODE, "device_arch": 90}, 1, 128),
+        ({**_DECODE, "device_arch": 90}, 128, 128),
+        ({**_DECODE, "device_arch": 120}, 1, 128),
         # Diff-head SplitKV reselects: tile_n=64 for long KV, no split for short KV.
         ({**_DECODE, **_HD192, "requested_num_splits": 4}, 128, 64),
         ({**_DECODE, **_HD192, "requested_num_splits": 4, "max_seqlen_k": 1024}, 1, 128),

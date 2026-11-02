@@ -519,7 +519,9 @@ def check_register_record(registers: object, expected: type, kernel: str) -> Non
         raise ValueError(
             f"{kernel} needs registers of type {expected.__name__}, got {type(registers).__name__}"
         )
-    if registers is not None and any(v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()):
+    if registers is not None and any(
+        v % 8 != 0 or not 24 <= v <= 256 for v in vars(registers).values()
+    ):
         raise ValueError(f"Register counts must be multiples of 8 in [24, 256], got {registers}")
 
 
@@ -1824,6 +1826,7 @@ class MlaFwdHeuristicInputs(NamedTuple):
     gather_bwd_recompute_p: bool = False
     has_descale: bool = False
     has_topk_valid_length: bool = False
+    is_sparse_decode: bool = False
     mla_1cta_override: bool | None = None
 
     @property
@@ -2119,7 +2122,7 @@ def validate_mla_fwd_config(config: MlaFwdConfig, inputs: MlaFwdHeuristicInputs)
             raise ValueError("Sparse MLA runs without split-KV")
         if not config.pack_gqa:
             raise ValueError("Sparse MLA packs one token's Q heads (pack_gqa)")
-        if sparse_heads and fwd.num_heads_kv != 1:
+        if sparse_heads and fwd.num_heads_kv != 1 and not inputs.is_sparse_decode:
             raise ValueError("sparse MLA requires a single KV head")
 
 

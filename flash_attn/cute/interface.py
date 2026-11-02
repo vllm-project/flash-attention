@@ -926,6 +926,28 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k
     if qv is not None:
         assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
+    # under 128 query heads per KV head only the decode kernel runs DSA gather natively
+    use_sparse_decode = (
+        qv is not None
+        and q is not None
+        and gather_kv_indices is not None
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and q_dtype in (torch.float16, torch.bfloat16)
+        and seqused_q is None
+        and page_table is None
+        and not requires_grad
+        and not causal
+        and not local
+        and arch // 10 in [10, 11]
+        and head_dim == 64
+        and head_dim_v == 512
+        and qhead_per_kvhead in (8, 16, 32, 64)
+        and output_quant_key is None
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+    )
     num_sms = get_num_sms_for_selection(device.index, arch)
     config, inputs = _get_fwd_config(
         config=config, pack_gqa=pack_gqa, arch=arch, num_sms=num_sms, dtype=q_dtype,
@@ -957,6 +979,7 @@ def _flash_attn_fwd(
             gather_bwd_recompute_p=gather_bwd_recompute_p,
             has_descale=any(t is not None for t in (q_descale, k_descale, v_descale)),
             has_topk_valid_length=gather_kv_valid_length is not None,
+            is_sparse_decode=use_sparse_decode,
         ),
     )
     num_splits = config.num_splits
@@ -981,28 +1004,6 @@ def _flash_attn_fwd(
                 f"got page_size={page_size}."
             )
 
-    # under 128 query heads per KV head only the decode kernel runs DSA gather natively
-    use_sparse_decode = (
-        qv is not None
-        and q is not None
-        and gather_kv_indices is not None
-        and cu_seqlens_q is not None
-        and cu_seqlens_k is not None
-        and q_dtype in (torch.float16, torch.bfloat16)
-        and seqused_q is None
-        and page_table is None
-        and not requires_grad
-        and not causal
-        and not local
-        and arch // 10 in [10, 11]
-        and head_dim == 64
-        and head_dim_v == 512
-        and qhead_per_kvhead in (8, 16, 32, 64)
-        and output_quant_key is None
-        and q_descale is None
-        and k_descale is None
-        and v_descale is None
-    )
     decode_splits = None
     if use_sparse_decode:
         decode_splits = mla_decode_splits(
@@ -1458,7 +1459,7 @@ def _flash_attn_fwd(
             # MLA: the transposed lse_partial view, whose seqlen mode is the contiguous one
             lse_tensor = (
                 to_cute_tensor(lse_partial, assumed_align=4)
-                if qv is None
+                if qv is None or use_sparse_decode
                 else to_cute_tensor(
                     lse_partial_kernel, assumed_align=4,
                     leading_dim=lse_partial_kernel.ndim - 2,

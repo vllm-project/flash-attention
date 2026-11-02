@@ -67,20 +67,35 @@ class BlockInfo:
             n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
+    def has_kv_work(self, n_block_min: Int32, n_block_max: Int32):
+        """Whether a (tile, split) owns KV blocks.
+
+        With SplitKV, ceil-divided ranges can leave a split with no blocks, and the count
+        from get_n_block_min_max can be negative. Every warp role must skip such a split
+        with this same predicate. Without SplitKV this is always True: callers handle an
+        empty range themselves (e.g. with one fully masked iteration).
+        """
+        if const_expr(not self.is_split_kv):
+            return True
+        return n_block_min < n_block_max
+
     @cute.jit
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
-        m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
+        # pack_gqa (backward): a Q position spans qhead_per_kvhead_packgqa consecutive rows, so
+        # position bounds scale by it before they are turned into m blocks.
+        g = self.qhead_per_kvhead_packgqa
+        m_block_max = cute.ceil_div(seqlen_info.seqlen_q * g, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             n_idx_min = n_block * self.tile_n
             m_idx = n_idx_min + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_right = m_idx if const_expr(self.is_causal) else m_idx - self.window_size_right
-            m_block_min = max(m_block_min, m_idx_right // self.tile_m)
+            m_block_min = max(m_block_min, (m_idx_right * g) // self.tile_m)
         if const_expr(self.is_local and self.window_size_left is not None):
             n_idx_max = (n_block + 1) * self.tile_n
             m_idx = n_idx_max + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_left = m_idx + self.window_size_left
-            m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
+            m_block_max = min(m_block_max, cute.ceil_div(m_idx_left * g, self.tile_m))
         return m_block_min, m_block_max
 
     @cute.jit

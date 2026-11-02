@@ -2,7 +2,7 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
@@ -14,6 +14,66 @@ import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
+
+
+@cute.jit
+def load_learnable_sink(
+    learnable_sink: cute.Tensor,
+    head_idx,
+    packed_row,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    pack_gqa: cutlass.Constexpr[bool],
+    qhead_per_kvhead_valid: cutlass.Constexpr[Optional[int]] = None,
+) -> Float32:
+    """Load the sink logit for one output row; see `apply_learnable_sink`.
+
+    With pack_gqa the M tile interleaves the Q heads of one KV head, so `head_idx` is the KV
+    head and the Q head is `packed_row % qhead_per_kvhead`; otherwise `head_idx` is already
+    the Q head and `packed_row` is ignored.
+    Padded Q heads get -inf (no sink); see `pack_gqa.qheads_first_tma_view`.
+    """
+    if cutlass.const_expr(not pack_gqa):
+        return Float32(learnable_sink[head_idx])
+    if cutlass.const_expr(qhead_per_kvhead_valid is None):
+        qhead_per_kvhead_valid = qhead_per_kvhead
+    qhead = packed_row % qhead_per_kvhead
+    sink_val = -Float32.inf
+    if qhead < qhead_per_kvhead_valid:
+        sink_val = Float32(learnable_sink[head_idx * qhead_per_kvhead_valid + qhead])
+    return sink_val
+
+
+@cute.jit
+def apply_learnable_sink(
+    row_max: Float32,
+    row_sum: Float32,
+    sink_val: Float32,
+    scale_log2: Float32,
+    max_offset: Float32 = 0.0,
+    empty_row_sum: Float32 = 1.0,
+) -> tuple[Float32, Float32]:
+    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
+
+    A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
+    units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
+    and the LSE but contributes nothing to O. Kernels fold it in at the end of the KV loop.
+    The stats are an *unscaled* row max and a row sum of exp2(score*scale_log2 - max*scale_log2)
+    terms, so the sink enters as exp2(sink*LOG2_E - row_max*scale_log2 + max_offset). A fully
+    masked row (row_max == -inf) has the sink as its only column, so its stats become
+    row_max = sink/scale (i.e. row_max*scale_log2 == sink*LOG2_E) and row_sum = empty_row_sum,
+    giving O = 0 and lse = sink. Backward: dsink[h] = -sum_rows exp(sink[h] - lse[row,h]) * dpsum[row,h].
+
+    `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
+    bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+    """
+    if row_max == -Float32.inf:
+        row_max = sink_val * (utils.LOG2_E / scale_log2)
+        row_sum = empty_row_sum
+    else:
+        row_sum += cute.math.exp2(
+            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
+        )
+    return row_max, row_sum
 
 
 @cute.jit

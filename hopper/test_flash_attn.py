@@ -1212,3 +1212,59 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # # pytorch_profiler(torch.sum, lse_partial)
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_zero_tokens(dtype, causal, d):
+    """Test that zero-token inputs (seqlen_q=0, total_q=0, or total_k=0) exit early cleanly without TMA errors."""
+    device = "cuda"
+    batch_size = 4
+    nheads = 8
+    nheads_kv = 8
+
+    # Case 1: flash_attn_func with seqlen_q = 0
+    q = torch.empty(batch_size, 0, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, 16, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, 16, nheads_kv, d, device=device, dtype=dtype)
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_softmax_lse=True)
+    assert out.shape == (batch_size, 0, nheads, d)
+    assert lse.shape == (batch_size, nheads, 0)
+
+    # Case 2: flash_attn_varlen_func with total_q = 0 (empty q)
+    q_varlen = torch.empty(0, nheads, d, device=device, dtype=dtype)
+    k_varlen = torch.randn(32, nheads_kv, d, device=device, dtype=dtype)
+    v_varlen = torch.randn(32, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device=device)
+    out, lse = flash_attn_varlen_func(
+        q_varlen, k_varlen, v_varlen,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=0,
+        max_seqlen_k=8,
+        causal=causal,
+        return_softmax_lse=True,
+    )
+    assert out.shape == (0, nheads, d)
+    assert lse.shape == (nheads, 0)
+
+    # Case 3: flash_attn_varlen_func with total_k = 0 (empty k/v)
+    q_varlen = torch.randn(32, nheads, d, device=device, dtype=dtype)
+    k_varlen = torch.empty(0, nheads_kv, d, device=device, dtype=dtype)
+    v_varlen = torch.empty(0, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor([0, 8, 16, 24, 32], dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    out, lse = flash_attn_varlen_func(
+        q_varlen, k_varlen, v_varlen,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=8,
+        max_seqlen_k=0,
+        causal=causal,
+        return_softmax_lse=True,
+    )
+    assert out.shape == (32, nheads, d)
+    assert lse.shape == (nheads, 32)
+

@@ -4355,9 +4355,11 @@ def compile_flash_attn_varlen_func_from_specs(
     q = _make_compile_only_tensor_spec(q_shape, q_dtype)
     k = _make_compile_only_tensor_spec(k_shape, q_dtype)
     v = _make_compile_only_tensor_spec(v_shape, q_dtype, stride=v_stride)
+    # _flash_attn_fwd requires a 32-byte aligned `out` for head_dim_v == 512.
     out = _make_compile_only_tensor_spec(
         (*q_shape[:-1], v_shape[-1]),
         q_dtype,
+        assumed_align=32 if v_shape[-1] == 512 else 16,
     )
     lse = None
     if return_lse:

@@ -684,18 +684,27 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     }
 
     Tensor out;
-    if (out_.has_value()) {
+    if (seqlenq_ngroups_swapped) {
+        // Decode GQA: the splitkv and combine kernels write `out` directly in the final
+        // [batch, num_heads_k, ngroups, head_size] layout (the o_batch/o_head/o_row stride
+        // override below maps the kernel's (batch, head, row) indices onto it), so the
+        // post-kernel transpose + copy is not needed.
+        if (out_.has_value()) {
+            out = out_.value();
+            STD_TORCH_CHECK(out.scalar_type() == q_dtype, "Output must have the same dtype as inputs");
+            CHECK_DEVICE(out);
+            STD_TORCH_CHECK(out.is_contiguous(), "Output tensor must be contiguous");
+            CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
+            out = torch::stable::view(out, {batch_size, num_heads_k, max_seqlen_q, head_size});
+        } else {
+            out = torch::stable::new_empty(q, {batch_size, num_heads_k, max_seqlen_q, head_size});
+        }
+    } else if (out_.has_value()) {
         out = out_.value();
         STD_TORCH_CHECK(out.scalar_type() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         STD_TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
-        if (seqlenq_ngroups_swapped) {
-            // NOTE(woosuk): We create a temporary buffer and copy the result to the `out_` tensor eventually.
-            // This is because we reshaped the `q` tensor for the splik-KV optimization, and the `out_` tensor
-            // has the same shape as the original `q` tensor, not the reshaped one.
-            out = torch::stable::empty_like(q);
-        }
     } else {
         out = torch::stable::empty_like(q);
     }
@@ -742,6 +751,15 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
                      softcap,
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
+    if (seqlenq_ngroups_swapped) {
+        // `out` is allocated in the final [batch, num_heads_k, ngroups, head_size] layout and
+        // the kernel's (batch, head, row) indices map onto (batch, num_heads_k, ngroups), so
+        // the splitkv/combine kernels write the result there directly. Override the strides
+        // that set_params_fprop derived from the packed q layout.
+        params.o_batch_stride = out.stride(0);
+        params.o_head_stride = out.stride(1);
+        params.o_row_stride = out.stride(2);
+    }
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -803,18 +821,10 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     }
 
     if (seqlenq_ngroups_swapped) {
-        int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size};
         int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size};
-        out = torch::stable::transpose(torch::stable::reshape(out, {size_before[0], size_before[1], size_before[2], size_before[3]}), 1, 2);
-        if (out_.has_value()) {
-            // NOTE(woosuk): In this case, we should avoid `out.reshape(size_after)` because it causes
-            // a redundant clone operation. Instead, we directly copy the result to the `out_` tensor.
-            Tensor out_view = torch::stable::view(out_.value(), {batch_size, num_heads_k, max_seqlen_q, head_size});
-            torch::stable::copy_(out_view, out);
-            out = out_.value();
-        } else {
-            out = torch::stable::reshape(out, {size_after[0], size_after[1], size_after[2]});
-        }
+        // `out` is already in the final [batch, num_heads_k, ngroups, head_size] layout (the
+        // kernels wrote it directly); this reshape is a free view.
+        out = torch::stable::reshape(out, {size_after[0], size_after[1], size_after[2]});
         // NOTE(woosuk): The two lines are not needed because out_padded and q_padded are not used.
         // out_padded = out_padded.reshape(size_before).transpose(1, 2).reshape(size_after);
         // q_padded = q_padded.reshape(size_before).transpose(1, 2).reshape(size_after);

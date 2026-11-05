@@ -64,6 +64,9 @@ def elem_pointer(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
 
 
 class dKGemmKernel:
+    # Extra ptxas flags (part of the compile key): no spills either way, -O2 +3-4%.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         topk: int,
@@ -149,13 +152,13 @@ class dKGemmKernel:
 
         # For non-varlen, group batch and seqlen modes into token mode
         if const_expr(not self.varlen):
-            batch_divmod = cute.FastDivmodDivisor(dS.shape[0])
+            batch_divmod = cute.FastDivmodDivisorV2(dS.shape[0])
             dS = cute.group_modes(dS, 0, 2)
             I = cute.group_modes(I, 0, 2)
             Q = cute.group_modes(Q, 0, 2)
             dKaccum = cute.group_modes(dKaccum, 0, 2)
         else:
-            batch_divmod = cute.FastDivmodDivisor(0)
+            batch_divmod = cute.FastDivmodDivisorV2(0)
 
         # Permute everything to (_, heads, tokens) for MMA
         dS_mkl = cute.make_tensor(dS.iterator, cute.select(dS.layout, [2, 1, 0]))
@@ -419,7 +422,7 @@ class dKGemmKernel:
         mdKaccum_nl: Optional[cute.Tensor],
         tiled_copy_I: cute.TiledCopy,
         mI_ml: cute.Tensor,
-        batch_divmod: cute.FastDivmodDivisor,
+        batch_divmod: cute.FastDivmodDivisorV2,
         cuSeqlensQ: Optional[cute.Tensor],
         cuSeqlensK: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,

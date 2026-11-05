@@ -85,7 +85,7 @@ def _run_fa(q, k, v, scale, sk, psc, num_splits, causal):
     seqused_k = torch.tensor([sk], device=DEV, dtype=torch.int32)
     block_table = torch.arange(1, 1 + num_blocks, device=DEV, dtype=torch.int32).reshape(1, -1)
     dynamic_causal = torch.tensor([psc], device=DEV, dtype=torch.int32)
-    out, _ = _flash_attn_fwd(
+    out, *_ = _flash_attn_fwd(
         q, kc, vc,
         cu_seqlens_q=cu_q,
         seqused_k=seqused_k,

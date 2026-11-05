@@ -376,8 +376,9 @@ def test_fp8_output_split_kv():
     _assert_fp8_close(fused_out, q, k, v, out_scale, causal=True)
 
 
-def test_fp8_output_validation_errors():
+def test_fp8_output_validation_errors(monkeypatch):
     """Validation paths fire on any GPU (no kernel launch needed)."""
+    monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "132")
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":

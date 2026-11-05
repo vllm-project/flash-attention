@@ -115,6 +115,15 @@ if (NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_FA_GPU_FLAGS "--threads=${NVCC_THREADS}")
 endif ()
 
+#
+# Set compression mode for CUDA >=13.x.
+#
+if (VLLM_GPU_LANG STREQUAL "CUDA" AND
+    DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    list(APPEND VLLM_FA_GPU_FLAGS "--compress-mode=size")
+endif ()
+
 
 # Other flags
 list(APPEND VLLM_FA_GPU_FLAGS --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math)

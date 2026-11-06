@@ -148,13 +148,21 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // On sm75 the MMA atom K (8) is half the smem copy atom K (16-wide
+    // ldmatrix tile), so one copy K-step feeds several MMA K-steps. Upstream
+    // indexed both with the same loop variable (1:1 holds on sm80+), which
+    // made the copy index run past the smem/register tiles on sm75.
+    constexpr int kMmaPerCopy = decltype(size<2>(tCrA))::value / decltype(size<2>(tCrA_copy_view))::value;
+    static_assert(kMmaPerCopy * decltype(size<2>(tCrA_copy_view))::value == decltype(size<2>(tCrA))::value);
+    static_assert(kMmaPerCopy * decltype(size<2>(tCrB_copy_view))::value == decltype(size<2>(tCrB))::value);
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+        if (i % kMmaPerCopy == 0 && i / kMmaPerCopy + 1 < size<2>(tCrA_copy_view)) {
+            const int ic = i / kMmaPerCopy + 1;
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, ic), tCrA_copy_view(_, _, ic)); }
+            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, ic), tCrB_copy_view(_, _, ic)); }
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }
@@ -172,11 +180,14 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // See gemm() above: decouple smem-copy K-steps from MMA K-steps (sm75).
+    constexpr int kMmaPerCopy = decltype(size<2>(tCrB))::value / decltype(size<2>(tCrB_copy_view))::value;
+    static_assert(kMmaPerCopy * decltype(size<2>(tCrB_copy_view))::value == decltype(size<2>(tCrB))::value);
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
     for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        if (i % kMmaPerCopy == 0 && i / kMmaPerCopy + 1 < size<2>(tCrB_copy_view)) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i / kMmaPerCopy + 1), tCrB_copy_view(_, _, i / kMmaPerCopy + 1));
         }
         cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
     }

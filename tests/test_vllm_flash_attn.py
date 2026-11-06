@@ -522,3 +522,60 @@ def test_sparse_attention_varlen(
         f"{torch.max(torch.abs(out - ref_out))}"
     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(lse - ref_lse))}"
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [(8, 2), (24, 4), (8, 1)])
+def test_flash_attn_varlen_decode_gqa_matches_out_default(
+    dtype: torch.dtype, num_heads: Tuple[int, int]
+) -> None:
+    """A caller-provided `out` must produce the same result as the default path.
+
+    mha_varlen_fwd swaps q to [batch * ngroups, num_heads_k, head_size] for the
+    split-KV decode optimization (max_seqlen_q == 1 and num_heads > num_heads_k).
+    The output is [batch, num_heads, head_size], so the kernels cannot address
+    the caller's buffer without being told its strides. This covers the decode
+    shape that the other varlen tests miss: they use max_seqlen_q > 1, which
+    does not take the swap.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, head_size = 8, 128
+    seqlen_q, seqlen_k = 1, 2048
+    num_query_heads, num_kv_heads = num_heads
+    scale = head_size**-0.5
+
+    q = torch.randn(batch_size * seqlen_q, num_query_heads, head_size, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_k, num_kv_heads, head_size, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_k, num_kv_heads, head_size, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = torch.arange(
+        0, (batch_size + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=device
+    )
+
+    def run(out):
+        return flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            max_seqlen_q=seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=seqlen_k,
+            cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=scale,
+            out=out,
+            fa_version=2,
+        )
+
+    ref = run(None).clone()
+    assert ref.shape == (batch_size * seqlen_q, num_query_heads, head_size)
+
+    out = torch.full_like(ref, float("nan"))
+    returned = run(out)
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(out).any(), "`out` was not written"
+    assert torch.equal(out, ref), "out= result differs from out=None"
+    assert torch.equal(returned, ref), "returned tensor differs from out=None"

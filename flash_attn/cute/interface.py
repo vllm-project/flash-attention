@@ -154,12 +154,6 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
         )
 
 
-# (head_dim, head_dim_v) pairs supported by the SM90 native FP8 (E4M3 Q/K/V) forward.
-_SM90_NATIVE_FP8_HEAD_DIM_CELLS = frozenset(
-    [(head_dim, head_dim) for head_dim in (64, 96, 128, 192, 256)] + [(192, 128)]
-)
-
-
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
@@ -176,28 +170,19 @@ torch2cute_dtype_map = {
 
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Value-independent compile classes of an SM90 native FP8 descale.
-_DESCALE_LAYOUT_NONE = "none"
-_DESCALE_LAYOUT_SCALAR = "scalar"
-_DESCALE_LAYOUT_BOTH_BROADCAST = "both_broadcast"
-_DESCALE_LAYOUT_BATCH_BROADCAST = "batch_broadcast"
-_DESCALE_LAYOUT_HEAD_BROADCAST = "head_broadcast"
-_DESCALE_LAYOUT_CONTIGUOUS = "contiguous"
-
-
 def _classify_descale_layout(t, name, batch_size, num_head_kv, device):
-    """Validate one native FP8 descale and return its value-independent compile class.
+    """Validate one native FP8 descale and return its compile-time layout class: None (absent),
+    () (0-d scalar), or (batch_broadcast, head_broadcast) for a (batch_size, num_head_kv) tensor.
 
-    A descale is a 0-d tensor or a (batch_size, num_head_kv) tensor whose strides are
-    contiguous or broadcast (stride 0) along either or both dimensions. Broadcast
-    descales are used as is, without materializing a contiguous copy.
+    Broadcast (stride 0) descales, e.g. a per-tensor scale passed through .expand(), are used as
+    is instead of being copied to a contiguous tensor.
     """
     if t is None:
-        return _DESCALE_LAYOUT_NONE
+        return None
     assert t.dtype == torch.float32, f"{name} dtype {t.dtype} != expected {torch.float32}"
     assert t.device == device, f"{name} device {t.device} != expected {device}"
     if t.ndim == 0:
-        return _DESCALE_LAYOUT_SCALAR
+        return ()
     assert t.ndim == 2, f"{name} must be rank 0 or rank 2, got rank {t.ndim}"
     expected_shape = (batch_size, num_head_kv)
     assert tuple(t.shape) == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
@@ -205,24 +190,25 @@ def _classify_descale_layout(t, name, batch_size, num_head_kv, device):
     assert batch_stride >= 0 and head_stride >= 0, (
         f"{name} must not have negative strides, got {t.stride()}"
     )
-    if batch_stride == 0 and head_stride == 0:
-        return _DESCALE_LAYOUT_BOTH_BROADCAST
-    if batch_stride == 0 and head_stride == 1:
-        return _DESCALE_LAYOUT_BATCH_BROADCAST
-    if head_stride == 0 and batch_stride > 0:
-        return _DESCALE_LAYOUT_HEAD_BROADCAST
-    if tuple(t.stride()) == _contiguous_stride(t.shape):
-        return _DESCALE_LAYOUT_CONTIGUOUS
-    raise AssertionError(
+    layout = (batch_stride == 0, head_stride == 0)
+    # A non-broadcast dimension must be laid out contiguously.
+    supported = {
+        (True, True): True,
+        (True, False): head_stride == 1,
+        (False, True): True,
+        (False, False): tuple(t.stride()) == _contiguous_stride(t.shape),
+    }[layout]
+    assert supported, (
         f"{name} has unsupported strides {t.stride()}; expected both-broadcast, "
         "batch-broadcast, head-broadcast, or contiguous layout"
     )
+    return layout
 
 
 def _to_cute_descale(t, layout_class):
     if t is None:
         return None
-    if layout_class == _DESCALE_LAYOUT_CONTIGUOUS:
+    if layout_class == (False, False):
         # Contiguous rank-2 descales have a unit head stride. Naming that dimension avoids
         # ambiguous singleton (1, 1) layouts while keeping the batch shape/stride dynamic.
         return to_cute_tensor(t, assumed_align=4, leading_dim=1)
@@ -854,7 +840,14 @@ def _flash_attn_fwd(
         assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn, (
             "SM90 native FP8 requires E4M3 Q, K, and V; E5M2 is not supported"
         )
-        assert (head_dim, head_dim_v) in _SM90_NATIVE_FP8_HEAD_DIM_CELLS, (
+        assert (head_dim, head_dim_v) in {
+            (64, 64),
+            (96, 96),
+            (128, 128),
+            (192, 192),
+            (256, 256),
+            (192, 128),
+        }, (
             "SM90 native FP8 supports equal head_dim/head_dim_v in {64, 96, 128, 192, 256} "
             f"and (192, 128); got ({head_dim}, {head_dim_v})"
         )

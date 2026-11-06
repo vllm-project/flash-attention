@@ -273,6 +273,16 @@ public:
         CUTE_DEVICE StaticVarlenTileScheduler(SharedStorage& shared_storage): shared_storage(shared_storage) {}
 
         static SchedulingAlgo choose_scheduling_algo(SchedulerArguments const& args) {
+            // STANDARD gives every batch ceil(seqlen_q * num_heads / kBlockM) tiles, so it
+            // only covers batches whose query length is at most seqlen_q. The per-batch
+            // lengths are read on the device (cu_seqlens_q / seqused_q / prepare_seqlen_q)
+            // while seqlen_q and the grid are fixed on the host, so a launch captured in a
+            // CUDA graph and replayed with a batch longer than the captured seqlen_q would
+            // leave that batch's remaining tiles uncombined (vllm-project/vllm#62626).
+            // total_q bounds every batch and is fixed per launch as well, so only consider
+            // STANDARD when seqlen_q covers it; LINEARIZE_M_AND_BATCH's grid depends on
+            // total_q and b alone and locates each batch's tiles at run time.
+            if (args.seqlen_q < args.total_q) { return SchedulingAlgo::LINEARIZE_M_AND_BATCH; }
             // Choose the scheduling algorithm based on how dense the grid of tiles that
             // do actual work is. If the grid is more then 50% sparse, we linearize the M
             // and batch. If the grid is more than 50% dense, we use the standard scheduling

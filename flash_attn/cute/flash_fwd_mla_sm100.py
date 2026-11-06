@@ -74,6 +74,7 @@ class FlashAttentionMLAForwardSm100:
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
+        query_group_size: int = 1,
         rescale_threshold: float = 8.0,
     ):
         self.is_causal = is_causal
@@ -106,6 +107,14 @@ class FlashAttentionMLAForwardSm100:
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
         self.has_qk = has_qk
+        # Pack query_group_size queries of 128 // query_group_size heads into each 128-row tile;
+        # the gather list is the union of their top-k with per-query membership bits.
+        self.query_group_size = query_group_size
+        if query_group_size > 1:
+            assert is_topk_gather and not disable_bitmask, "query groups need the top-k bitmask"
+            assert query_group_size in (2, 4, 8), "membership bits hold at most 8 queries"
+            # the causal limit is per tile row group, not per packed query
+            assert not is_causal, "query groups encode causality in the top-k lists"
 
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -563,7 +572,9 @@ class FlashAttentionMLAForwardSm100:
 
         self.sStats_layout = cute.make_layout((self.cta_tile_m, self.cta_group_size))
         self.sScale_layout = cute.make_layout((self.cta_tile_m, self.num_stages_sm_stats))
-        self.sBitmask_layout = cute.make_layout((self.tile_n // 32, self.num_stages_bitmask))
+        self.sBitmask_layout = cute.make_layout(
+            (self.tile_n // 32 * self.query_group_size, self.num_stages_bitmask)
+        )
 
         # fmt: off
         for attr, dtype, layout in [
@@ -1562,6 +1573,7 @@ class FlashAttentionMLAForwardSm100:
                     self.disable_bitmask,
                     sBitmask,
                     pipeline_bitmask,
+                    self.query_group_size,
                 )
 
                 # (seqlen_k, hdim) or (seqlen_k, hdimv)
@@ -2618,6 +2630,12 @@ class FlashAttentionMLAForwardSm100:
             self.num_softmax_threads // 32
         )
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        bitmask_query_offset = None
+        if const_expr(self.query_group_size > 1):
+            # tile rows are query-major, so each query owns cluster_tile_m // group size rows
+            row = cta_rank_in_cluster * self.cta_tile_m + tidx % self.cta_tile_m
+            rows_per_query = self.cluster_tile_m // self.query_group_size
+            bitmask_query_offset = row // rows_per_query * (self.tile_n // 32)
 
         tSAcc = tStS[(None, None), 0, 0, 0]
         tSAcc_staged = [tStS[(None, None), 0, 0, stage] for stage in range(self.num_stages_S)]
@@ -2760,6 +2778,7 @@ class FlashAttentionMLAForwardSm100:
                 warp_idx,
                 store_P=store_P,
                 gRowMax=gRowMax,
+                bitmask_query_offset=bitmask_query_offset,
                 packed_row0=cta_m_block * self.cta_tile_m,
             )
 
@@ -2897,6 +2916,7 @@ class FlashAttentionMLAForwardSm100:
         is_first: Boolean = False,
         store_P: Optional[Callable] = None,
         gRowMax: Optional[cute.Tensor] = None,
+        bitmask_query_offset: Optional[Int32] = None,
         packed_row0: Int32 = 0,
     ):
         leader_warp = warp_idx == 0
@@ -2915,6 +2935,8 @@ class FlashAttentionMLAForwardSm100:
             pipeline_bitmask.consumer_wait(consumer_state_bitmask)
             rBitmask = cute.make_rmem_tensor((self.tile_n // 64,), dtype=Uint32)
             bitmask_col_offset = self.tile_n // 64 if warp_idx >= 2 else 0
+            if const_expr(self.query_group_size > 1):
+                bitmask_col_offset += bitmask_query_offset
             for i in cutlass.range_constexpr(cute.size(rBitmask)):
                 rBitmask[i] = sBitmask[bitmask_col_offset + i, consumer_state_bitmask.index]
 

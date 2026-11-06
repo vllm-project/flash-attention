@@ -213,16 +213,21 @@ def test_grouped_without_valid_length_is_bit_identical():
 
 
 @pytest.mark.parametrize(
-    "option, match", [(dict(causal=True), "causality"), (dict(pack_gqa=False), "pack_gqa")]
+    "option, error, match",
+    [
+        (dict(causal=True), AssertionError, "causality"),
+        # rejected for every sparse MLA call by the MLA config validation
+        (dict(pack_gqa=False), ValueError, "pack_gqa"),
+    ],
 )
-def test_grouped_rejects_unsupported_options(option, match):
+def test_grouped_rejects_unsupported_options(option, error, match):
     """Causality lives in each query's top-k, so a per-tile causal limit would be wrong; and the
     tile row -> query map assumes the heads are packed into the tile rows."""
     group, heads = 8, 16
     kv, k, v = make_flat_kv(4096, "cuda")
     q, qv = make_q(group, heads, "cuda")
     enc = torch.full((1, TILE_N), -1, device="cuda", dtype=torch.int32)
-    with pytest.raises(AssertionError, match=match):
+    with pytest.raises(error, match=match):
         flash_attn_varlen_func(
             q.reshape(1, 128, QK_ROPE_HEAD_DIM), k, v, qv=qv.reshape(1, 128, KV_LORA_RANK),
             cu_seqlens_q=torch.tensor([0, 1], device="cuda", dtype=torch.int32),

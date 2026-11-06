@@ -153,6 +153,12 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
         )
 
 
+# (head_dim, head_dim_v) pairs supported by the SM90 native FP8 (E4M3 Q/K/V) forward.
+_SM90_NATIVE_FP8_HEAD_DIM_CELLS = frozenset(
+    [(head_dim, head_dim) for head_dim in (64, 96, 128, 192, 256)] + [(192, 128)]
+)
+
+
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
@@ -168,6 +174,59 @@ torch2cute_dtype_map = {
 }
 
 _LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+# Value-independent compile classes of an SM90 native FP8 descale.
+_DESCALE_LAYOUT_NONE = "none"
+_DESCALE_LAYOUT_SCALAR = "scalar"
+_DESCALE_LAYOUT_BOTH_BROADCAST = "both_broadcast"
+_DESCALE_LAYOUT_BATCH_BROADCAST = "batch_broadcast"
+_DESCALE_LAYOUT_HEAD_BROADCAST = "head_broadcast"
+_DESCALE_LAYOUT_CONTIGUOUS = "contiguous"
+
+
+def _classify_descale_layout(t, name, batch_size, num_head_kv, device):
+    """Validate one native FP8 descale and return its value-independent compile class.
+
+    A descale is a 0-d tensor or a (batch_size, num_head_kv) tensor whose strides are
+    contiguous or broadcast (stride 0) along either or both dimensions. Broadcast
+    descales are used as is, without materializing a contiguous copy.
+    """
+    if t is None:
+        return _DESCALE_LAYOUT_NONE
+    assert t.dtype == torch.float32, f"{name} dtype {t.dtype} != expected {torch.float32}"
+    assert t.device == device, f"{name} device {t.device} != expected {device}"
+    if t.ndim == 0:
+        return _DESCALE_LAYOUT_SCALAR
+    assert t.ndim == 2, f"{name} must be rank 0 or rank 2, got rank {t.ndim}"
+    expected_shape = (batch_size, num_head_kv)
+    assert tuple(t.shape) == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
+    batch_stride, head_stride = t.stride()
+    assert batch_stride >= 0 and head_stride >= 0, (
+        f"{name} must not have negative strides, got {t.stride()}"
+    )
+    if batch_stride == 0 and head_stride == 0:
+        return _DESCALE_LAYOUT_BOTH_BROADCAST
+    if batch_stride == 0 and head_stride == 1:
+        return _DESCALE_LAYOUT_BATCH_BROADCAST
+    if head_stride == 0 and batch_stride > 0:
+        return _DESCALE_LAYOUT_HEAD_BROADCAST
+    if tuple(t.stride()) == _contiguous_stride(t.shape):
+        return _DESCALE_LAYOUT_CONTIGUOUS
+    raise AssertionError(
+        f"{name} has unsupported strides {t.stride()}; expected both-broadcast, "
+        "batch-broadcast, head-broadcast, or contiguous layout"
+    )
+
+
+def _to_cute_descale(t, layout_class):
+    if t is None:
+        return None
+    if layout_class == _DESCALE_LAYOUT_CONTIGUOUS:
+        # Contiguous rank-2 descales have a unit head stride. Naming that dimension avoids
+        # ambiguous singleton (1, 1) layouts while keeping the batch shape/stride dynamic.
+        return to_cute_tensor(t, assumed_align=4, leading_dim=1)
+    # Scalar and broadcast layouts keep their exact runtime shape and strides.
+    return to_cute_tensor(t, assumed_align=4, fully_dynamic=True)
 
 
 def _contiguous_stride(shape):
@@ -595,6 +654,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
     *,
     config: FwdConfig | MlaFwdConfig | None = None,
 ) -> Tuple[
@@ -611,6 +671,7 @@ def _flash_attn_fwd(
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
             FP8 (e4m3fn) dtype is selected automatically when `output_scale` is set.
+            For SM90 native FP8 (E4M3 Q/K/V), its dtype (fp16 or bf16) is authoritative.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
@@ -625,6 +686,11 @@ def _flash_attn_fwd(
             and above 896 Q saturates silently. Fold larger Q into k_descale.
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
+        q_descale/k_descale/v_descale: FP8 dequantization scales. For SM90 native FP8
+            each is a 0-d tensor or a (batch_size, num_head_kv) float32 tensor, which
+            may be broadcast (stride 0) along either dimension.
+        out_dtype: SM90 native FP8 output dtype, torch.float16 or torch.bfloat16. When
+            omitted, a supplied `out` is authoritative; otherwise the output is bf16.
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     requires_grad = any(
@@ -636,11 +702,6 @@ def _flash_attn_fwd(
     assert v is not None
     # MLA needs K and V to share one descale tensor: check identity before maybe_contiguous
     kv_descale_shared = k_descale is not None and k_descale is v_descale
-    q_descale, k_descale, v_descale = [
-        maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
-    ]
-    if kv_descale_shared:
-        v_descale = k_descale
     page_table = maybe_contiguous(page_table, align_bytes=4)
     learnable_sink = maybe_contiguous(learnable_sink, align_bytes=4)
     gather_kv_indices = maybe_contiguous(gather_kv_indices, align_bytes=16)
@@ -781,8 +842,49 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
+    # SM90 native FP8: E4M3 Q/K/V on FP8 WGMMA, fp16/bf16 output.
+    native_fp8 = arch // 10 == 9 and is_fp8
+    if native_fp8:
+        assert qv is None, "SM90 native FP8 does not support Qv/MLA"
+        assert block_sparse_tensors is None, "SM90 native FP8 does not support block sparsity"
+        assert q is not None and k is not None, (
+            "SM90 native FP8 requires explicit Q, K, and V tensors"
+        )
+        assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn, (
+            "SM90 native FP8 requires E4M3 Q, K, and V; E5M2 is not supported"
+        )
+        assert (head_dim, head_dim_v) in _SM90_NATIVE_FP8_HEAD_DIM_CELLS, (
+            "SM90 native FP8 supports equal head_dim/head_dim_v in {64, 96, 128, 192, 256} "
+            f"and (192, 128); got ({head_dim}, {head_dim_v})"
+        )
+        if any(t is not None and t.requires_grad for t in (q_descale, k_descale, v_descale)):
+            raise NotImplementedError("SM90 native FP8 descales cannot require gradients.")
+    else:
+        q_descale, k_descale, v_descale = [
+            maybe_contiguous(t, align_bytes=4) for t in (q_descale, k_descale, v_descale)
+        ]
+        if kv_descale_shared:
+            v_descale = k_descale
     if (is_fp8 or fp8_kv_dequant) and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
+    native_fp8_out_dtype = None
+    if native_fp8:
+        assert output_scale is None, "SM90 native FP8 does not support FP8 output"
+        assert out_dtype in (None, torch.float16, torch.bfloat16), (
+            "SM90 native FP8 out_dtype must be torch.float16 or torch.bfloat16"
+        )
+        if out is not None:
+            assert out.dtype in (torch.float16, torch.bfloat16), (
+                "SM90 native FP8 out must have dtype torch.float16 or torch.bfloat16"
+            )
+            assert out_dtype is None or out_dtype == out.dtype, (
+                f"SM90 native FP8 out_dtype {out_dtype} does not match out.dtype {out.dtype}"
+            )
+            native_fp8_out_dtype = out.dtype
+        else:
+            native_fp8_out_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    else:
+        assert out_dtype is None, "out_dtype is only supported for SM90 native FP8"
     if output_scale is not None:
         assert output_scale.dtype == torch.float32, "output_scale must be float32"
         assert output_scale.numel() == 1, "output_scale must be a scalar (numel == 1) tensor"
@@ -796,7 +898,9 @@ def _flash_attn_fwd(
         output_quant_key = "kFp8StaticTensorSym"
         output_scale = output_scale.reshape(1)
     else:
-        out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
+        out_torch_dtype = (
+            native_fp8_out_dtype if native_fp8 else torch.bfloat16 if is_fp8 else q_dtype
+        )
         output_quant_key = None
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -843,7 +947,13 @@ def _flash_attn_fwd(
                 lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
         return out, lse, None, None, None
 
-    if is_fp8 or fp8_kv_dequant:
+    descale_layouts = None
+    if native_fp8:
+        descale_layouts = tuple(
+            _classify_descale_layout(t, name, batch_size, num_head_kv, device)
+            for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale"))
+        )
+    elif is_fp8 or fp8_kv_dequant:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
                 _validate_tensor(
@@ -880,15 +990,17 @@ def _flash_attn_fwd(
             t if t is not None else identity_descale
             for t in (q_descale, k_descale, v_descale)
         ]
-    # Expanded scalar scales can have a zero stride even when every size is
-    # one; Tensor.contiguous() may preserve that layout. Copy only those
-    # tensors whose CuTe dynamic leading dimension is not actually unit-stride.
-    q_descale, k_descale, v_descale = [
-        t.clone(memory_format=torch.contiguous_format)
-        if t is not None and t.stride(-1) != 1
-        else t
-        for t in (q_descale, k_descale, v_descale)
-    ]
+    if not native_fp8:
+        # Expanded scalar scales can have a zero stride even when every size is
+        # one; Tensor.contiguous() may preserve that layout. Copy only those
+        # tensors whose CuTe dynamic leading dimension is not actually unit-stride.
+        # SM90 native FP8 keeps scalar and broadcast descales as classified above.
+        q_descale, k_descale, v_descale = [
+            t.clone(memory_format=torch.contiguous_format)
+            if t is not None and t.stride(-1) != 1
+            else t
+            for t in (q_descale, k_descale, v_descale)
+        ]
     if kv_descale_shared:
         v_descale = k_descale
     dtype = torch2cute_dtype_map[q_dtype]
@@ -898,7 +1010,9 @@ def _flash_attn_fwd(
         # fp16 selects the auxiliary layouts; mQ/mO keep the caller's fp16/bf16 dtypes.
         dtype = torch2cute_dtype_map[torch.float16]
     if is_fp8:
-        assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
+        assert arch // 10 == 10 or native_fp8, (
+            "FP8 inputs are only supported on SM90 and SM100 (compute capability 9.x/10.x) for FA4 CuTe."
+        )
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -1414,6 +1528,7 @@ def _flash_attn_fwd(
         tensormap_workspace is not None,
         output_quant_key,
         fp8_kv_dequant,
+        descale_layouts,
         # FP8 MMA uses a fixed fp16 auxiliary dtype, so `dtype` no longer captures
         # native Q/O tensor dtypes. Key on them explicitly for quantization and
         # epilogue selection. This is redundant for the other paths.
@@ -1468,10 +1583,16 @@ def _flash_attn_fwd(
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
-        q_descale_tensor, k_descale_tensor, v_descale_tensor = (
-            to_cute_tensor(t, assumed_align=4, leading_dim=1)
-            for t in (q_descale, k_descale, v_descale)
-        )
+        if native_fp8:
+            q_descale_tensor, k_descale_tensor, v_descale_tensor = (
+                _to_cute_descale(t, layout)
+                for t, layout in zip((q_descale, k_descale, v_descale), descale_layouts)
+            )
+        else:
+            q_descale_tensor, k_descale_tensor, v_descale_tensor = (
+                to_cute_tensor(t, assumed_align=4, leading_dim=1)
+                for t in (q_descale, k_descale, v_descale)
+            )
         descale_tensors_tensor = (
             DescaleTensors(
                 q_descale=q_descale_tensor,
@@ -1574,6 +1695,10 @@ def _flash_attn_fwd(
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
                 fp8_kv_dequant=fp8_kv_dequant,
+                native_fp8=native_fp8,
+                native_fp8_o_dtype=(
+                    torch2cute_dtype_map[out_torch_dtype] if native_fp8 else None
+                ),
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

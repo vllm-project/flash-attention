@@ -307,7 +307,9 @@ def select_sm90_native_fp8_tile(inputs: FwdHeuristicInputs) -> tuple[int, int]:
     if short_decode and head_dim == head_dim_v == 128 and not is_local:
         return 64, 96
     if short_decode and head_dim in (64, 128, 192):
-        return 128, 64 if is_local and page_size == 64 else 96
+        return (64, 64 if is_local and page_size == 64 else 96)
+    if short_decode:
+        return (64, 64)
     if head_dim == 64:
         return 192, 128
     if head_dim <= 96:

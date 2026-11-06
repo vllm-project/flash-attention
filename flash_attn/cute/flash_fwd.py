@@ -261,6 +261,7 @@ class FlashAttentionForwardBase:
         # Thread layouts for copies
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // self.dtype.width
+        o_copy_elems = universal_copy_bits // self.o_dtype.width
         # atom_async_copy: async copy atom for QKV load
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -270,7 +271,7 @@ class FlashAttentionForwardBase:
         # atom_universal_copy: universal copy atom for O store
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
-            self.dtype,
+            self.o_dtype,
             num_bits_per_copy=universal_copy_bits,
         )
         # tQ_layout and tK_layout: thread layout for QK load
@@ -296,10 +297,10 @@ class FlashAttentionForwardBase:
             (self.num_producer_threads // tV_shape_dim_1, tV_shape_dim_1),
             order=(1, 0),
         )
-        # TODO: need a different layout for O if O dtype is not the same as V dtype
         # tO_layout: thread layout for O store
+        tO_shape_dim_1 = sO_layout_atom.outer.shape[1] // o_copy_elems
         tO_layout = cute.make_ordered_layout(
-            (self.num_epilogue_threads // tV_shape_dim_1, tV_shape_dim_1),
+            (self.num_epilogue_threads // tO_shape_dim_1, tO_shape_dim_1),
             order=(1, 0),
         )
         # So that we don't have to check if we overshoot kBlockM when we store O
@@ -307,7 +308,7 @@ class FlashAttentionForwardBase:
 
         # Value layouts for copies
         vQKV_layout = cute.make_layout((1, async_copy_elems))
-        vO_layout = vQKV_layout
+        vO_layout = cute.make_layout((1, o_copy_elems))
 
         self.gmem_tiled_copy_Q = cute.make_tiled_copy_tv(atom_async_copy, tQ_layout, vQKV_layout)
         self.gmem_tiled_copy_K = cute.make_tiled_copy_tv(atom_async_copy, tK_layout, vQKV_layout)

@@ -2658,18 +2658,22 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax.rescale_O(acc_O, scores_scale)
         # ---- 4. O += P @ V; the promoted passes wait for QK and PV ----
         if const_expr(self.qk_split):
-            # The PV passes reuse the scratch: QK must land and fold first.
+            # The PV passes reuse the scratch: fold QK and finish S before they start.
             warpgroup.wait_group(0)
             self._fold_qk_split(acc_S, qk_split_acc)
-        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
-        self.warp_scheduler_barrier_arrive()
-        warpgroup.wait_group(1)
+        else:
+            mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+            self.warp_scheduler_barrier_arrive()
+            warpgroup.wait_group(1)
         pipeline_k.consumer_release_w_index(ks)
         if const_expr(score_mod_fn is not None):
             score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        if const_expr(self.qk_split):
+            mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+            self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         self._prepare_fp8_probabilities(acc_S, tOrP, smem_copy_params.tOrP_res)
         if const_expr(not self.rescale_O_before_gemm):

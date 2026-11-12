@@ -11,6 +11,7 @@ import triton
 from flash_attn.layers.rotary import apply_rotary_emb, apply_rotary_emb_torch
 from flash_attn.layers.rotary import apply_rotary_emb_qkv_, apply_rotary_emb_kv_
 from flash_attn.bert_padding import pad_input, unpad_input
+from vllm_flash_attn.layers.rotary import apply_rotary_emb as apply_vllm_rotary_emb
 
 is_sm8x = torch.cuda.get_device_capability("cuda") >= (8, 0)
 
@@ -92,6 +93,57 @@ def test_rotary_emb_func(inplace, interleaved, rotary_fraction, seqlen_offsets_t
     # Numerical error if we just do any arithmetic
     atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
     assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
+    atol = ((x_pt.grad + 0.3 - 0.3) - x_pt.grad).abs().max().item()
+    assert torch.allclose(x.grad, x_pt.grad, rtol=rtol, atol=2 * atol)
+
+
+@pytest.mark.parametrize(
+    "dtype", ([torch.float16] if not is_sm8x else [torch.float16, torch.bfloat16])
+)
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_vllm_rotary_emb_fp32_cos_sin(inplace, interleaved, dtype):
+    rtol = 1e-3
+    batch_size = 2
+    nheads = 3
+    seqlen = 32
+    headdim = 64
+    rotary_dim = 32
+    device = "cuda"
+    torch.manual_seed(42)
+
+    x = torch.randn(
+        batch_size,
+        seqlen,
+        nheads,
+        headdim,
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    x_pt = x.detach().clone().requires_grad_()
+    x_before = x.detach().clone()
+    cos, sin = generate_cos_sin(seqlen, rotary_dim, device, torch.float32)
+
+    out = apply_vllm_rotary_emb(
+        x, cos, sin, interleaved=interleaved, inplace=inplace
+    )
+    cos_pt, sin_pt = index_cos_sin(cos, sin, 0, seqlen)
+    out_pt = apply_rotary_emb_torch(
+        x_pt.float(), cos_pt, sin_pt, interleaved=interleaved
+    ).to(dtype=dtype)
+
+    assert out.dtype == dtype
+    if not inplace:
+        assert torch.equal(x, x_before)
+    assert torch.equal(out[..., rotary_dim:], x[..., rotary_dim:])
+    atol = ((out_pt + 0.3 - 0.3) - out_pt).abs().max().item()
+    assert torch.allclose(out, out_pt, rtol=rtol, atol=2 * atol)
+
+    grad = torch.randn_like(out)
+    grad_pt = grad.clone()
+    out.backward(grad)
+    out_pt.backward(grad_pt)
     atol = ((x_pt.grad + 0.3 - 0.3) - x_pt.grad).abs().max().item()
     assert torch.allclose(x.grad, x_pt.grad, rtol=rtol, atol=2 * atol)
 

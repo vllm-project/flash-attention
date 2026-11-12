@@ -54,6 +54,7 @@ from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     get_broadcast_dims,
+    get_l2_cache_bytes,
     get_num_sms_for_selection,
     maybe_contiguous,
     to_cute_aux_tensor,
@@ -99,6 +100,10 @@ from flash_attn.cute.block_sparsity import (
 )
 
 BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler gets a batch-lookup aid
+# SM90 head_dim 512: number of hdim chunks K is loaded and released in.
+SM90_HD512_K_CHUNKS: int = 4
+# SM90 head_dim 512: number of CTAs that share each K / V load.
+SM90_HD512_KV_CLUSTER_M: int = 2
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
@@ -907,6 +912,8 @@ def _flash_attn_fwd(
 
     # Tensor hints cannot drive host selection or count as a caller-provided Q bound.
     has_max_seqlen_q_hint = max_seqlen_q is not None and not torch.is_tensor(max_seqlen_q)
+    max_seqlen_q_is_tensor = torch.is_tensor(max_seqlen_q)
+    max_seqlen_k_is_tensor = torch.is_tensor(max_seqlen_k)
     total_k = math.prod(v.shape[:-2])  # K/V tokens stored: dense b*s, varlen total, paged pool
     q_capacity = seqlen_q if cu_seqlens_q is None else total_q
     # A paged sequence is bounded by its page-table row, not the shared KV pool.
@@ -1182,6 +1189,59 @@ def _flash_attn_fwd(
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if qv is None and config.use_2cta_instrs else 1
+    # SM90 head_dim 512 fast path for BF16.
+    sm90_hd512 = (
+        arch // 10 == 9
+        and head_dim == 512
+        and head_dim_v == 512
+        and not fp8_kv_dequant
+        and not config.mma_pv_is_rs
+        and config.intra_wg_overlap
+        and config.tile_m == 64
+        and config.tile_n == 64
+        and not use_block_sparsity
+        and q_dtype == torch.bfloat16
+        and (score_mod is None or softcap is not None)
+        and mask_mod is None
+        and aux_tensors is None
+        and gather_kv_indices is None
+        and scheduler_metadata is None
+    )
+    sm90_hd512_kv_split = sm90_hd512 and page_size in [None, config.tile_n]
+    sm90_kv_cluster_m = 1
+    if (
+        sm90_hd512_kv_split
+        and not max_seqlen_q_is_tensor
+        and max_seqlen_q * (qhead_per_kvhead if config.pack_gqa else 1) > config.tile_m
+        and is_varlen_q
+        and not is_split_kv
+    ):
+        kv_keys = max_seqlen_k if not max_seqlen_k_is_tensor else None
+        if kv_keys is not None and local:
+            kv_keys = min(
+                kv_keys,
+                (window_size_right if window_size_right is not None else kv_keys)
+                + (window_size_left if window_size_left is not None else kv_keys)
+                + 1
+                + config.tile_m,
+            )
+        kv_bytes = (
+            None
+            if kv_keys is None
+            else num_head_kv * kv_keys * (head_dim + head_dim_v) * k.element_size()
+        )
+        # A cluster rounds each sequence's CTA count up to a multiple of 2.
+        # The L2 rule applies only when this does not add a wave.
+        if qhead_per_kvhead <= 2 or (
+            kv_bytes is not None
+            and kv_bytes > get_l2_cache_bytes(device.index)
+            and batch_size * num_head_kv * 2 <= get_num_sms_for_selection(device.index, arch)
+        ):
+            assert SM90_HD512_KV_CLUSTER_M <= 2, "tensormap workspace bound assumes <= 2 CTAs"
+            sm90_kv_cluster_m = SM90_HD512_KV_CLUSTER_M
+            cluster_shape_m = sm90_kv_cluster_m
+    # The split K/V producer is used only with the cluster, whose tail waits for V from warp 1.
+    sm90_hd512_split_kv_producer = sm90_kv_cluster_m > 1
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
@@ -1421,6 +1481,10 @@ def _flash_attn_fwd(
         out_torch_dtype,
         # the decode kernel is a different class with a different grid and smem plan
         decode_splits,
+        sm90_kv_cluster_m,
+        sm90_hd512,
+        sm90_hd512_kv_split,
+        sm90_hd512_split_kv_producer,
     )
 
     if _needs_compile(_flash_attn_fwd.compile_cache, compile_key):
@@ -1574,6 +1638,11 @@ def _flash_attn_fwd(
                 output_quant_key=output_quant_key if not is_split_kv else None,
                 kv_dtype=kv_dtype,  # K/V storage dtype (fp8)
                 fp8_kv_dequant=fp8_kv_dequant,
+                kv_cluster_m=sm90_kv_cluster_m,
+                single_qk_wg=sm90_hd512,
+                kv_split_hdim=sm90_hd512_kv_split,
+                k_chunks=SM90_HD512_K_CHUNKS,
+                split_kv_producer=sm90_hd512_split_kv_producer,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:

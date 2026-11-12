@@ -1189,7 +1189,7 @@ def _flash_attn_fwd(
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if qv is None and config.use_2cta_instrs else 1
-    # SM90 head_dim 512 fast path for BF16.
+    # SM90 head_dim 512 fast path for BF16 and FP16.
     sm90_hd512 = (
         arch // 10 == 9
         and head_dim == 512
@@ -1200,7 +1200,7 @@ def _flash_attn_fwd(
         and config.tile_m == 64
         and config.tile_n == 64
         and not use_block_sparsity
-        and q_dtype == torch.bfloat16
+        and q_dtype in (torch.float16, torch.bfloat16)
         and (score_mod is None or softcap is not None)
         and mask_mod is None
         and aux_tensors is None

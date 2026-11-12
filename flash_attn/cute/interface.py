@@ -2039,6 +2039,7 @@ def _flash_attn_fwd(
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
             output_scale=output_scale,
             _arch=arch,
+            hd512_combine=sm90_hd512,
         )
         if lse is not None and qv is not None:
             lse.copy_(lse_combine)
@@ -4473,7 +4474,8 @@ def compile_flash_attn_varlen_func_from_specs(
 def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, lse_leading_dim, has_virtual_batch_idx,
-    has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key,
+    has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key, split_groups=0,
+    use_pdl=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -4488,6 +4490,8 @@ def _compile_fwd_combine(
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
         output_quant_key=output_quant_key,
+        split_groups=split_groups,
+        use_pdl=use_pdl,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -4567,6 +4571,7 @@ def _flash_attn_fwd_combine(
     output_scale: Optional[torch.Tensor] = None,
     *,
     _arch: Optional[int] = None,
+    hd512_combine: bool = False,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -4585,6 +4590,8 @@ def _flash_attn_fwd_combine(
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
         k_block_size: Block size for head dimension
+        hd512_combine: set by the SM90 hdim 512 forward. Uses the split-group combine when there
+            are few rows and many splits, and launches the combine as a PDL dependent.
 
     Returns:
         None
@@ -4617,6 +4624,24 @@ def _flash_attn_fwd_combine(
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
     tile_m, k_block_size, log_max_splits = combine_kernel_geometry(head_dim, num_splits)
+    # Split-group combine: more CTAs when there are few rows and many splits (decode, MTP verify).
+    # Every hd512 combine is launched as a PDL dependent of the forward kernel.
+    split_groups = 0
+    use_pdl = False
+    if hd512_combine and output_quant_key is None and head_dim == 512:
+        num_rows = out_partial.shape[1] * out_partial.shape[2] * (
+            out_partial.shape[3] if out_partial.dim() == 5 else 1
+        )
+        row_tiles = math.ceil(num_rows / tile_m)
+        num_sms = get_num_sms_for_selection(
+            out.device.index, _get_device_arch() if _arch is None else _arch
+        )
+        for kb in (16, 32, 64):
+            if row_tiles * (head_dim // kb) <= num_sms:
+                # 256 threads x 4 columns each / (8 rows x kb columns) = 128 // kb groups
+                k_block_size, split_groups = kb, 128 // kb
+                break
+        use_pdl = True
 
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
@@ -4649,6 +4674,8 @@ def _flash_attn_fwd_combine(
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,
         output_quant_key,
+        split_groups,
+        use_pdl,
     )
     if _needs_compile(_flash_attn_fwd_combine.compile_cache, compile_key):
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(

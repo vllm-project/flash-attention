@@ -1531,11 +1531,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         if const_expr(self.use_tma_KV)
                         else cutlass.max(n_block_max - 1, 0)
                     )
-                    page_idx = (
-                        mPageTable[batch_idx, n_block]
-                        if const_expr(mPageTable is not None and self.use_tma_KV)
-                        else None
-                    )
+                    # single_qk_wg: issue the Q TMA first, so Q streams in while the first
+                    # page-table entry (needed for the K TMA) is still being read.
+                    q_first = const_expr(self.single_qk_wg and self.use_tma_Q)
+                    if const_expr(q_first):
+                        if warp_idx_in_wg == 0:
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_producer_phase ^= 1
+                    page_idx = None
+                    if const_expr(mPageTable is not None and self.use_tma_KV):
+                        page_idx = mPageTable[batch_idx, n_block]
 
                     # First iteration: load K on pipeline_k, Q on pipeline_q
                     if is_kv_load_warp:
@@ -1554,12 +1560,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             load_K(
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
-                    if const_expr(self.use_tma_Q):
+                    if const_expr(not q_first and self.use_tma_Q):
                         if warp_idx_in_wg == 0:
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                             load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
                             q_producer_phase ^= 1
-                    else:
+                    elif const_expr(not q_first):
                         pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                         pack_gqa.load_Q(
                             mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q

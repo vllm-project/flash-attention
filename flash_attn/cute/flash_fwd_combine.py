@@ -38,6 +38,9 @@ class FlashAttentionForwardCombine:
         num_threads: int = 256,
         stages: int = 4,
         output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        split_groups: int = 0,
+        split_unroll: int = 16,
+        use_pdl: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -64,8 +67,23 @@ class FlashAttentionForwardCombine:
         self.max_splits = 1 << log_max_splits
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
-        self.stages = stages
+        # split_groups > 1 reuses sO as the (split_groups - 1) x tile_m x k_block reduction buffer
+        self.stages = max(stages, split_groups - 1)
         self.output_quant_key = output_quant_key
+        # split_groups >= 1: the threads of a CTA form split_groups groups that each accumulate
+        # splits g, g + split_groups, ... for the whole tile_m x k_block tile with 16-byte loads
+        # to registers (split_unroll in flight), then the groups are summed through smem.
+        self.split_groups = split_groups
+        self.split_unroll = split_unroll
+        # use_pdl: launched as a PDL dependent of the forward kernel, which triggers only at
+        # completion; griddepcontrol_wait before the first read of the partials waits for the
+        # forward grid to finish and flush its writes.
+        self.use_pdl = use_pdl
+        self.sg_vec = 4  # fp32 x 4 = one 16-byte load
+        if split_groups > 0:
+            assert output_quant_key is None and dtype_partial == Float32
+            assert num_threads % split_groups == 0
+            assert (num_threads // split_groups) == tile_m * (k_block_size // self.sg_vec)
 
     @staticmethod
     def can_implement(
@@ -359,6 +377,7 @@ class FlashAttentionForwardCombine:
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -541,17 +560,38 @@ class FlashAttentionForwardCombine:
                 )
 
                 # Load first few stages of O_partial
-                for stage in cutlass.range(self.stages - 1, unroll_full=True):
-                    if stage < num_splits:
-                        load_O_partial(stage, stage)
-                    cute.arch.cp_async_commit_group()
+                if const_expr(self.split_groups == 0):
+                    for stage in cutlass.range(self.stages - 1, unroll_full=True):
+                        if stage < num_splits:
+                            load_O_partial(stage, stage)
+                        cute.arch.cp_async_commit_group()
+                else:
+                    # Split groups load their first splits straight into registers
+                    sg_g, sg_row, sg_cv, sg_row_valid, sg_m_idx, sg_head_idx, sg_gO = (
+                        self.split_group_setup(
+                            tidx,
+                            m_block,
+                            k_block,
+                            max_idx,
+                            seqlen,
+                            seqlen_divmod,
+                            varlen,
+                            mO_partial_cur,
+                        )
+                    )
+                    sg_rO_pre = cute.make_rmem_tensor(
+                        (self.sg_vec, self.split_unroll), self.dtype_partial
+                    )
+                    self.split_group_prefetch(sg_g, sg_row_valid, num_splits, sg_gO, sg_rO_pre)
 
                 # ===============================
                 # Step 3: Load and transpose LSE from smem to registers
                 # ===============================
 
                 # Wait for LSE and initial O partial stages to complete
-                cute.arch.cp_async_wait_group(self.stages - 1)
+                cute.arch.cp_async_wait_group(
+                    self.stages - 1 if const_expr(self.split_groups == 0) else 0
+                )
                 cute.arch.sync_threads()
                 # if cute.arch.thread_idx()[0] == 0:
                 #     # cute.print_tensor(sLSE)
@@ -666,34 +706,37 @@ class FlashAttentionForwardCombine:
                 stage_load = self.stages - 1
                 stage_compute = 0
 
-                # Main accumulation loop
-                for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
-                    # Get scales for this split
-                    scale = cute.make_rmem_tensor(num_rows, Float32)
-                    for m in cutlass.range(num_rows, unroll_full=True):
-                        scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
+                # Main accumulation loop (split groups accumulate in split_group_combine below)
+                if const_expr(self.split_groups == 0):
+                    for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
+                        # Get scales for this split
+                        scale = cute.make_rmem_tensor(num_rows, Float32)
+                        for m in cutlass.range(num_rows, unroll_full=True):
+                            scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
 
-                    # Load next stage if needed
-                    split_to_load = s + self.stages - 1
-                    if split_to_load <= thr_max_valid_split:
-                        load_O_partial(split_to_load, stage_load)
-                    cute.arch.cp_async_commit_group()
-                    stage_load = 0 if stage_load == self.stages - 1 else stage_load + 1
+                        # Load next stage if needed
+                        split_to_load = s + self.stages - 1
+                        if split_to_load <= thr_max_valid_split:
+                            load_O_partial(split_to_load, stage_load)
+                        cute.arch.cp_async_commit_group()
+                        stage_load = 0 if stage_load == self.stages - 1 else stage_load + 1
 
-                    # Wait for the current stage to be ready
-                    cute.arch.cp_async_wait_group(self.stages - 1)
-                    # We don't need __syncthreads() because each thread is just reading its own data from smem
-                    # Copy from smem to registers
-                    cute.autovec_copy(tOsO_partial[None, None, None, stage_compute], tOrO_partial)
-                    stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
+                        # Wait for the current stage to be ready
+                        cute.arch.cp_async_wait_group(self.stages - 1)
+                        # We don't need __syncthreads() because each thread is just reading its own data from smem
+                        # Copy from smem to registers
+                        cute.autovec_copy(
+                            tOsO_partial[None, None, None, stage_compute], tOrO_partial
+                        )
+                        stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
 
-                    # Accumulate scaled partial results
-                    for m in cutlass.range(num_rows, unroll_full=True):
-                        if tOhidx[m] >= 0 and scale[m] > 0.0:
-                            tOrO[None, m, None].store(
-                                tOrO[None, m, None].load()
-                                + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
-                            )
+                        # Accumulate scaled partial results
+                        for m in cutlass.range(num_rows, unroll_full=True):
+                            if tOhidx[m] >= 0 and scale[m] > 0.0:
+                                tOrO[None, m, None].store(
+                                    tOrO[None, m, None].load()
+                                    + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
+                                )
 
                 # ===============================
                 # Step 7: Write final O to gmem
@@ -714,15 +757,167 @@ class FlashAttentionForwardCombine:
                 # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
                 gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
                 # Write final results
-                for m in cutlass.range(num_rows, unroll_full=True):
-                    if tOhidx[m] >= 0:
-                        mO_cur_copy = cute.tiled_divide(
-                            mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
-                        )
-                        for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
-                            k_idx = tOcO[0, 0, k][1] // elems_per_store
-                            if const_expr(self.is_even_k) or tOpO[k]:
-                                cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
+                if const_expr(self.split_groups == 0):
+                    for m in cutlass.range(num_rows, unroll_full=True):
+                        if tOhidx[m] >= 0:
+                            mO_cur_copy = cute.tiled_divide(
+                                mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
+                            )
+                            for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
+                                k_idx = tOcO[0, 0, k][1] // elems_per_store
+                                if const_expr(self.is_even_k) or tOpO[k]:
+                                    cute.copy(
+                                        gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx]
+                                    )
+                else:
+                    self.split_group_combine(
+                        sg_g,
+                        sg_row,
+                        sg_cv,
+                        sg_row_valid,
+                        sg_m_idx,
+                        sg_head_idx,
+                        sg_gO,
+                        sg_rO_pre,
+                        mO_cur,
+                        sLSE,
+                        sMaxValidSplit,
+                        sO,
+                    )
+
+    @cute.jit
+    def split_group_setup(
+        self,
+        tidx: Int32,
+        m_block: Int32,
+        k_block: Int32,
+        max_idx: Int32,
+        seqlen: Int32,
+        seqlen_divmod: FastDivmodDivisorV2,
+        varlen: cutlass.Constexpr[bool],
+        mO_partial_cur: cute.Tensor,
+    ):
+        """split_groups >= 1: thread t is in split group g = t // (num_threads / split_groups) and
+        owns one row and 4 consecutive columns of the tile_m x k_block tile. Returns
+        (g, row, cv, row_valid, m_idx, head_idx, gO) with gO the thread's (4, hdim / 4, num_splits)
+        view of the partial O."""
+        vec = self.sg_vec
+        threads_per_group = const_expr(self.num_threads // self.split_groups)
+        vecs_per_row = const_expr(self.k_block_size // vec)
+        g = tidx // threads_per_group
+        lane = tidx - g * threads_per_group
+        row = lane // vecs_per_row
+        cv = lane - row * vecs_per_row
+        idx = m_block * self.tile_m + row
+        row_valid = idx < max_idx
+        idx_c = idx if row_valid else Int32(0)
+        if const_expr(not varlen):
+            head_idx, m_idx = divmod(idx_c, seqlen_divmod)
+        else:
+            head_idx = idx_c // seqlen
+            m_idx = idx_c - head_idx * seqlen
+        col = k_block * self.k_block_size + cv * vec
+        o_ptr = cute.make_ptr(
+            self.dtype_partial,
+            utils.elem_pointer(mO_partial_cur, (m_idx, col, 0, head_idx)).toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        gO = cute.make_tensor(o_ptr, cute.slice_(mO_partial_cur.layout, (0, None, None, 0)))
+        gO = cute.tiled_divide(gO, (vec,))
+        return g, row, cv, row_valid, m_idx, head_idx, gO
+
+    @cute.jit
+    def split_group_prefetch(
+        self,
+        g: Int32,
+        row_valid: Boolean,
+        num_splits: Int32,
+        gO: cute.Tensor,
+        rO_pre: cute.Tensor,
+    ) -> None:
+        """Load the thread's first `unroll` splits (g, g + G, ...) before the LSEs are reduced.
+        Safe because every split < num_splits writes its partial O (an empty split writes zeros)."""
+        atom_ld = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.dtype_partial, num_bits_per_copy=128
+        )
+        for u in cutlass.range_constexpr(cute.size(rO_pre, mode=[1])):
+            s = g + self.split_groups * u
+            if row_valid and s < num_splits:
+                cute.copy(atom_ld, gO[None, 0, s], rO_pre[None, u])
+
+    @cute.jit
+    def split_group_combine(
+        self,
+        g: Int32,
+        row: Int32,
+        cv: Int32,
+        row_valid: Boolean,
+        m_idx: Int32,
+        head_idx: Int32,
+        gO: cute.Tensor,
+        rO_pre: cute.Tensor,
+        mO_cur: cute.Tensor,
+        sLSE: cute.Tensor,
+        sMaxValidSplit: cute.Tensor,
+        sO: cute.Tensor,
+    ) -> None:
+        """O = sum_s scale[s, row] * O_partial[s] for the thread's 4 columns: group g accumulates
+        splits g, g + G, g + 2G, ... up to the row's last split with a finite LSE (as in the
+        single-group path), `unroll` 16-byte loads in flight; groups 1..G-1 then hand their sums
+        to group 0 through smem (fixed order) and group 0 writes the output."""
+        vec = self.sg_vec
+        unroll = const_expr(cute.size(rO_pre, mode=[1]))
+        num_groups = const_expr(self.split_groups)
+        atom_ld = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self.dtype_partial, num_bits_per_copy=128
+        )
+        acc = cute.make_rmem_tensor(vec, Float32)
+        acc.fill(0.0)
+        max_valid = sMaxValidSplit[row]
+        # number of splits s = g + G * j with s <= max_valid (max_valid >= -1, so never negative)
+        n_iter = (max_valid - g + num_groups) // num_groups
+        if not row_valid:
+            n_iter = Int32(0)
+        for u in cutlass.range_constexpr(unroll):
+            if u < n_iter:
+                sc = sLSE[g + num_groups * u, row]
+                if sc > 0.0:
+                    for i in cutlass.range_constexpr(vec):
+                        acc[i] = acc[i] + sc * rO_pre[i, u]
+        for j0 in cutlass.range(unroll, n_iter, unroll, unroll=1):
+            rv = cute.make_rmem_tensor((vec, unroll), self.dtype_partial)
+            sc = cute.make_rmem_tensor(unroll, Float32)
+            for u in cutlass.range_constexpr(unroll):
+                sc[u] = Float32(0.0)
+                if j0 + u < n_iter:
+                    s = g + num_groups * (j0 + u)
+                    sc[u] = sLSE[s, row]
+                    if sc[u] > 0.0:
+                        cute.copy(atom_ld, gO[None, 0, s], rv[None, u])
+            for u in cutlass.range_constexpr(unroll):
+                if sc[u] > 0.0:
+                    for i in cutlass.range_constexpr(vec):
+                        acc[i] = acc[i] + sc[u] * rv[i, u]
+
+        if g > 0:
+            for i in cutlass.range_constexpr(vec):
+                sO[row, cv * vec + i, g - 1] = acc[i]
+        cute.arch.sync_threads()
+        if g == 0:
+            for gi in cutlass.range_constexpr(num_groups - 1):
+                for i in cutlass.range_constexpr(vec):
+                    acc[i] = acc[i] + sO[row, cv * vec + i, gi]
+            if row_valid:
+                rO = cute.make_rmem_tensor(vec, self.dtype)
+                rO.store(acc.load().to(self.dtype))
+                atom_st = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    self.dtype,
+                    num_bits_per_copy=vec * self.dtype.width,
+                )
+                gOut = cute.tiled_divide(mO_cur[m_idx, None, head_idx], (vec,))
+                cute.copy(atom_st, rO, gOut[None, cv])
 
     @cute.jit
     def load_O_partial(

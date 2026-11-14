@@ -133,6 +133,20 @@ MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 **Interface:** `src/flash_attention_interface.py`
 
+### Windows CMake builds for vLLM
+
+The root CMake build enables MSVC's conforming preprocessor for the FA2 and FA3
+extensions, including CUDA host compilation. On Windows, configuration also runs
+`fix_cutlass_msvc.py` with the selected Python interpreter to patch CUTLASS's
+C++17 detection and make `memsetDevice` host-only. These patches are idempotent
+and modify the local CUTLASS submodule checkout; initialize `csrc/cutlass` before
+configuring. Non-Windows builds do not apply these changes.
+
+With CUDA 13.0 or newer, Windows FA2 builds also emit native `sm_100f` and
+`sm_120f` kernels when the corresponding GPU families are requested, covering
+SM103 and SM120 while retaining the existing `sm_80`/`compute_80` fallback.
+FA2 also defines `_USE_MATH_DEFINES` on Windows for MSVC math constants.
+
 ### NVIDIA CUDA Support
 **Requirements:**
 - CUDA 12.0 and above.

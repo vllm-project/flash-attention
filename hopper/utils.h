@@ -319,6 +319,9 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
 
 #ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
     if constexpr (Use_Two_Level) {
+        // Complete asynchronous MMA before reading its FP32 accumulator, even when wg_wait == -1.
+        // Making completion explicit also avoids conservative ptxas serialization (C7514).
+        warpgroup_wait<0>();
         #pragma unroll
         for (int i = 0; i < cute::size(tCrC); ++i) {
             tCrC(i) = tCrC_original(i) + tCrC(i);  // Add temp results to original

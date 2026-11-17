@@ -4405,6 +4405,7 @@ def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, lse_leading_dim, has_virtual_batch_idx,
     has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key,
+    split_groups=1, stages=4, use_pdl=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -4418,7 +4419,10 @@ def _compile_fwd_combine(
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
+        stages=stages,
         output_quant_key=output_quant_key,
+        split_groups=split_groups,
+        use_pdl=use_pdl,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -4497,6 +4501,8 @@ def _flash_attn_fwd_combine(
     semaphore_to_reset: Optional[torch.Tensor] = None,
     output_scale: Optional[torch.Tensor] = None,
     *,
+    split_groups: int = 1,
+    use_pdl: bool = False,
     _arch: Optional[int] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
@@ -4516,6 +4522,11 @@ def _flash_attn_fwd_combine(
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
         k_block_size: Block size for head dimension
+        split_groups: Thread groups that merge interleaved subsets of the splits in parallel
+            before adding their sums; 1 is the standard combine. Values above 1 use FP32
+            partials and a narrower tile so that more CTAs share the work.
+        use_pdl: Launch with programmatic dependent launch, so the combine can start while
+            the preceding kernel finishes; it waits for that kernel before reading partials.
 
     Returns:
         None
@@ -4548,6 +4559,12 @@ def _flash_attn_fwd_combine(
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
     tile_m, k_block_size, log_max_splits = combine_kernel_geometry(head_dim, num_splits)
+    stages = 4
+    if split_groups > 1:
+        assert out_partial.dtype == torch.float32, "split groups add FP32 partials"
+        # 32-column tiles (more CTAs), each group with its own 8 pipeline stages.
+        tile_m, k_block_size, stages = 8, 32, 8
+        log_max_splits = max(math.ceil(math.log2(num_splits)), 5)
 
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
@@ -4580,6 +4597,9 @@ def _flash_attn_fwd_combine(
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,
         output_quant_key,
+        split_groups,
+        stages,
+        use_pdl,
     )
     if _needs_compile(_flash_attn_fwd_combine.compile_cache, compile_key):
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(

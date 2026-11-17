@@ -22,7 +22,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 
 
 class FlashAttentionForwardCombine:
@@ -303,9 +303,9 @@ class FlashAttentionForwardCombine:
             else Int32(cu_seqlens.shape[0] - 1)
         )
 
-        # Create FastDivmodDivisor objects for efficient division
-        seqlen_divmod = FastDivmodDivisor(seqlen)
-        head_divmod = FastDivmodDivisor(num_head)
+        # Create FastDivmodDivisorV2 objects for efficient division
+        seqlen_divmod = FastDivmodDivisorV2(seqlen)
+        head_divmod = FastDivmodDivisorV2(num_head)
 
         if const_expr(varlen):
             TileScheduler = SingleTileVarlenScheduler
@@ -380,8 +380,8 @@ class FlashAttentionForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        seqlen_divmod: FastDivmodDivisor,
-        head_divmod: FastDivmodDivisor,
+        seqlen_divmod: FastDivmodDivisorV2,
+        head_divmod: FastDivmodDivisorV2,
         varlen: cutlass.Constexpr[bool],
         output_scale: Optional[cute.Tensor],
         tile_sched_params: ParamsBase,
@@ -471,7 +471,7 @@ class FlashAttentionForwardCombine:
                     mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
                     idx = m_block * self.tile_m + mi
                     if idx < max_idx:
-                        # Calculate actual sequence position and head using FastDivmodDivisor
+                        # Calculate actual sequence position and head using FastDivmodDivisorV2
                         if const_expr(not varlen):
                             head_idx, m_idx = divmod(idx, seqlen_divmod)
                         else:

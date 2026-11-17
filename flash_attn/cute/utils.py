@@ -4,14 +4,14 @@ import math
 import hashlib
 import inspect
 import os
-from functools import partial
+from functools import cache, partial
 from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm, nvgpu
 from cutlass._mlir_helpers.arith import recast_type
@@ -63,8 +63,8 @@ POLY_EX2 = {
     ),
 }
 
-_fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
+_fa_disable_s_ping_pong_enabled: bool = os.environ.get("FA_DISABLE_S_PING_PONG", "0") == "1"
 
 
 def _is_cuda_12() -> bool:
@@ -88,8 +88,8 @@ def _is_cuda_12() -> bool:
 _fa_disable_2cta_cuda12: bool = _is_cuda_12()
 
 
-def _get_use_clc_scheduler_default() -> bool:
-    return _fa_clc_enabled
+def _get_disable_s_ping_pong_default() -> bool:
+    return _fa_disable_s_ping_pong_enabled
 
 
 def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
@@ -99,8 +99,54 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_sm100_backend_override() -> Optional[bool]:
+    """FLASH_ATTENTION_SM100_BACKEND=swapab prefers the SM100 SwapAB decode kernel wherever it
+    can serve the call (others run the standard kernel); standard disables it; unset or "auto"
+    leaves it to the forward selector. Read per call."""
+    value = os.getenv("FLASH_ATTENTION_SM100_BACKEND", "auto")
+    overrides = {"auto": None, "swapab": True, "standard": False}
+    if value not in overrides:
+        raise ValueError("FLASH_ATTENTION_SM100_BACKEND must be auto, standard, or swapab")
+    return overrides[value]
+
+
+# The backward env knobs below are read once per process (the backward builds its selection
+# inputs on every call); code that changes one at runtime calls its cache_clear().
+
+
+@cache
+def _get_bwd_pack_gqa_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_PACK_GQA=0/1 forces the SM100 backward GQA head packing off / on
+    (NOTE [bwd pack_gqa] in pack_gqa.py); unset or "auto" leaves it to the heuristic."""
+    value = os.getenv("FLASH_ATTENTION_BWD_PACK_GQA")
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value in ("0", "1"), f"FLASH_ATTENTION_BWD_PACK_GQA must be 0, 1 or auto, got {value}"
+    return value == "1"
+
+
+@cache
+def _get_hd256_generic_bwd() -> bool:
+    """FLASH_ATTENTION_HD256_GENERIC_BWD=1 runs the SM100 hdim 256 backward on
+    FlashAttentionBackwardSm100 (64-row KV tile, serial 2CTA schedule) instead of the dedicated
+    kernels."""
+    return os.getenv("FLASH_ATTENTION_HD256_GENERIC_BWD", "0") == "1"
+
+
+@cache
+def _get_bwd_tile_n_override() -> Optional[int]:
+    """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
+    2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
+    value = os.getenv("FLASH_ATTENTION_BWD_TILE_N")
+    if value is None or value == "":
+        return None
+    tile_n = int(value)
+    assert tile_n in (64, 128), f"FLASH_ATTENTION_BWD_TILE_N must be 64 or 128, got {value}"
+    return tile_n
+
+
 def _compute_base_hash(func: Callable) -> str:
-    """Compute hash from source code or bytecode and closure values."""
+    """Compute a hash from callable code and captured compile-time values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -115,13 +161,22 @@ def _compute_base_hash(func: Callable) -> str:
         for cell in func.__closure__:
             hasher.update(repr(cell.cell_contents).encode())
 
+    # Factory-generated score/mask modifiers often capture specialization values
+    # as defaults instead of closure cells. Those values affect generated code and
+    # therefore must distinguish entries in the compile cache as well.
+    for attr in ("__defaults__", "__kwdefaults__"):
+        values = getattr(func, attr, None)
+        if values is not None:
+            hasher.update(attr.encode())
+            hasher.update(repr(values).encode())
+
     return hasher.hexdigest()
 
 
 def hash_callable(
     func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
 ) -> str:
-    """Hash a callable based on the source code or bytecode and closure values.
+    """Hash a callable based on its code and captured compile-time values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
     metadata dunders are mixed in to produce the final dict-key hash.
@@ -198,7 +253,7 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
-    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
@@ -210,7 +265,7 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
         if const_expr(mPageTable is None)
         else mK.shape[0] * mPageTable.shape[1]
     )
-    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
+    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:

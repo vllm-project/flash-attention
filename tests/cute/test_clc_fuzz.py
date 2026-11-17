@@ -7,13 +7,12 @@ not randomized fuzzing.
 """
 
 from contextlib import contextmanager
-import os
 from unittest import mock
 
 import pytest
 import torch
 
-from flash_attn.cute import utils as cute_utils
+from flash_attn.cute import config as fwd_config
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn.cute.testing import attention_ref
@@ -50,11 +49,41 @@ def _spy_init(self_inner, *a, **kw):
     ))
 
 
+_selected_configs: list[fwd_config.FwdConfig] = []
+
+
+def select_with_clc(inputs):
+    """Default selection, switched to an explicit CLC config where these tests target CLC.
+
+    Targets: dense causal/local and varlen GQA on the standard kernel, so decode calls keep it
+    rather than SwapAB. Dense noncausal and varlen MHA keep their default schedulers.
+    """
+    inputs = inputs._replace(requested_use_swapab=False)
+    config = fwd_config.select_fwd_config(inputs)
+    resolved = inputs._replace(pack_gqa=config.pack_gqa)
+    targeted = (
+        resolved.qhead_per_kvhead > 1 if resolved.is_varlen else resolved.causal or resolved.local
+    )
+    if (
+        targeted
+        and not config.use_clc_scheduler
+        and config.device_capacity in (10, 11)
+        and fwd_config.can_use_clc(
+            resolved,
+            tile_n=config.tile_n,
+            num_splits=config.num_splits,
+            use_2cta_instrs=config.use_2cta_instrs,
+        )
+    ):
+        config = fwd_config.with_clc_scheduler(config, inputs, True)
+    _selected_configs.append(config)
+    return config
+
+
 @contextmanager
 def clc_scheduler_enabled():
     with (
-        mock.patch.dict(os.environ, {"FA_CLC": "1"}, clear=False),
-        mock.patch.object(cute_utils, "_fa_clc_enabled", True),
+        mock.patch("flash_attn.cute.interface.select_fwd_config", select_with_clc),
         mock.patch.object(FlashAttentionForwardSm100, "__init__", _spy_init),
     ):
         yield
@@ -328,7 +357,7 @@ class TestCLCFallback:
         )
 
 
-def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_splits=1):
+def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_splits=1, assert_sched=True):
     kv_heads = kv_heads or heads
     cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32), torch.tensor(seqlens, dtype=torch.int32).cumsum(0)]).to(device="cuda", dtype=torch.int32)
     total = int(cu_seqlens[-1])
@@ -348,7 +377,7 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
         num_splits=num_splits,
     )
     torch.cuda.synchronize()
-    if _captured_schedulers:
+    if assert_sched and _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
         assert_varlen_scheduler(
             sched_cls,
@@ -621,6 +650,46 @@ class TestCLCRepeatability:
     def test_repeat_gqa_mismatch(self, trial):
         torch.random.manual_seed(trial)
         check_output(randn(5, 128, 8, 128), randn(5, 1024, 2, 128), randn(5, 1024, 2, 128))
+
+class TestCLCHd256:
+    """hd256 2CTA supports CLC with dense Q, but not varlen Q."""
+
+    @staticmethod
+    def assert_2cta_without_clc():
+        if not _captured_schedulers:  # compile-cache hit: no new kernel to inspect
+            return
+        _, sched_mode, use_2cta = _captured_schedulers[-1]
+        assert use_2cta, "Expected hd256 to keep 2CTA"
+        assert sched_mode != SchedulingMode.CLC, f"Expected CLC disabled for hd256 2CTA, got {sched_mode!r}"
+
+    @pytest.mark.parametrize("sq,sk,q_heads,kv_heads", [
+        # Partial clusters must round up the LPT block count.
+        (1, 4096, 4, 1),  # decode: single M block
+        (256, 256, 1, 1),
+        (384, 384, 1, 1),  # odd number of M tiles
+        (512, 512, 1, 1),
+    ])
+    def test_causal(self, sq, sk, q_heads, kv_heads):
+        check_output(
+            randn(1, sq, q_heads, 256), randn(1, sk, kv_heads, 256), randn(1, sk, kv_heads, 256),
+            causal=True, assert_2cta=True,
+        )
+
+    def test_causal_several_waves(self):
+        # 4 x 8 heads x 16 tiles of 256 rows: 512 clusters, several waves of CTAs.
+        _selected_configs.clear()
+        check_output(
+            randn(4, 4096, 8, 256), randn(4, 4096, 8, 256), randn(4, 4096, 8, 256),
+            causal=True, assert_2cta=True,
+        )
+        config = _selected_configs[-1]
+        assert config.use_clc_scheduler and config.use_2cta_instrs, config
+
+    @pytest.mark.parametrize("causal", [False, True])
+    def test_varlen_gqa(self, causal):
+        check_varlen_output([300, 129, 257, 64], heads=12, d=256, kv_heads=2, causal=causal, assert_sched=False)
+        self.assert_2cta_without_clc()
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

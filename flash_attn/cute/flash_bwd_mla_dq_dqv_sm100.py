@@ -5,7 +5,7 @@ CuTe DSL implementation of dQ+dQv gemm for DSA backward.
 Performs both dQ = dS @ K and dQv = dS @ V, where K and V are
 gathered according to index tensor mIdxTopK.
 
-This uses MQA with 128 heads.
+This uses MQA with 1 to 128 heads and a fixed 128-row GEMM tile.
 
 Inputs:
     - dS:      [batch, seqlen_q, nheads, top_k] or [total_q, nheads, top_k]
@@ -40,15 +40,20 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from flash_attn.cute.config import sparse_mla_qhead_tile
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
 class dQdQvGemmKernel:
+    # Extra ptxas flags (part of the compile key): 4064 B/thread spilled at the default level,
+    # 0 at -O2, 3.0-4.2x faster on GB300.
+    ptxas_options = "-O2"
+
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -59,17 +64,16 @@ class dQdQvGemmKernel:
     ):
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.nheads = nheads
-        assert self.nheads == 128, (
-            "only 128 heads supported; will expand to include 64 heads in a future PR."
-        )
+        # Head padding: see pack_gqa.qheads_first_tma_view.
+        self.tile_m = sparse_mla_qhead_tile(nheads)
         self.head_dim_k = head_dim_k or 0  # when head_dim_k not provided, dQ is not computed
         self.head_dim_v = head_dim_v
         self.top_k = top_k
         self.tile_k = 128
 
         self.cluster_shape_mn = (1, 2)
-        self.mma_tiler_dQ = (self.nheads, self.head_dim_k, self.tile_k)
-        self.mma_tiler_dQv = (self.nheads, self.head_dim_v // 2, self.tile_k)
+        self.mma_tiler_dQ = (self.tile_m, self.head_dim_k, self.tile_k)
+        self.mma_tiler_dQv = (self.tile_m, self.head_dim_v // 2, self.tile_k)
         self.num_mainloop_iters = self.top_k // self.tile_k
         self.arch = "sm_100"
 
@@ -152,7 +156,7 @@ class dQdQvGemmKernel:
         # Reshape GMEM layouts for static strides                            #
         # ------------------------------------------------------------------ #
         seqlen_q = Int32(0) if const_expr(varlen_q) else mdS.shape[1]
-        seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+        seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
         seqlen_k = Int32(0) if const_expr(varlen_k) else mV.shape[1]
 
         # ---- group batch and seqlen modes in nonvarlen case ----
@@ -187,12 +191,14 @@ class dQdQvGemmKernel:
                 ),
             )
 
-        mdS = static_reshape(mdS, self.nheads, self.top_k)
-        mdQv = static_reshape(mdQv, self.nheads, self.head_dim_v)
+        # Dynamic head extent for the fixed tile; see pack_gqa.qheads_first_tma_view.
+        nheads = self.nheads if self.nheads == self.tile_m else Int32(self.nheads)
+        mdS = static_reshape(mdS, nheads, self.top_k)
+        mdQv = static_reshape(mdQv, nheads, self.head_dim_v)
         mV = static_reshape(mV, self.head_dim_v)
         mIdxTopK = static_reshape(mIdxTopK, self.top_k)
         if const_expr(self.compute_dQ):
-            mdQ = static_reshape(mdQ, self.nheads, self.head_dim_k)
+            mdQ = static_reshape(mdQ, nheads, self.head_dim_k)
             mK = static_reshape(mK, self.head_dim_k)
 
         # ---- layout info ----
@@ -207,6 +213,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         tiled_mma_v = utils.sm100.make_trivial_tiled_mma(
             self.ds_dtype,
+            self.ds_dtype,
             self.ds_major_mode,
             self.kv_major_mode,
             self.acc_dtype,
@@ -215,6 +222,7 @@ class dQdQvGemmKernel:
         )
         if const_expr(self.compute_dQ):
             tiled_mma_k = utils.sm100.make_trivial_tiled_mma(
+                self.ds_dtype,
                 self.ds_dtype,
                 self.ds_major_mode,
                 self.kv_major_mode,
@@ -449,7 +457,7 @@ class dQdQvGemmKernel:
         mIdxTopK: cute.Tensor,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
-        seqlen_q_divmod: FastDivmodDivisor,
+        seqlen_q_divmod: FastDivmodDivisorV2,
         cluster_layout_vmnk: cute.Layout,
         sdS_layout: cute.ComposedLayout,
         sK_layout: Optional[cute.ComposedLayout],
@@ -1268,7 +1276,7 @@ class dQdQvGemmKernel:
     def find_batch_from_q(
         self,
         token: Int32,
-        seqlen_q_divmod: FastDivmodDivisor,
+        seqlen_q_divmod: FastDivmodDivisorV2,
         mCuSeqlensQ: Optional[cute.Tensor],
     ) -> Int32:
         """Find batch index from q token (binary search for varlen, divmod otherwise)"""

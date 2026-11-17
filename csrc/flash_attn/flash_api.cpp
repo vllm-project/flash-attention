@@ -34,6 +34,7 @@
 #include "namespace_config.h"
 #include "hardware_info.h"
 #include "flash.h"
+#include "cuda_check.h"
 #include "static_switch.h"
 
 #define CHECK_DEVICE(x) STD_TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
@@ -1505,8 +1506,11 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
         // block_table only has max_num_blocks_per_seq entries per sequence, so if any sequence length
         // exceeds max_num_blocks_per_seq * page_block_size the kernel reads block_table out of bounds.
         // The kernel itself does no such check, so validate the caller contract here.
-        // Reading the maximum forces a device-to-host sync, so only do it for paged KV.
-        if (paged_KV) {
+        // Reading the maximum synchronizes with the host, so skip this check during graph capture.
+        // Callers must keep sequence lengths within capacity on every graph replay.
+        cudaStreamCaptureStatus capture_status;
+        FLASHATTENTION_CUDA_CHECK(cudaStreamIsCapturing(get_current_cuda_stream(q), &capture_status));
+        if (paged_KV && capture_status == cudaStreamCaptureStatusNone) {
             const int seqlen_knew = k_.has_value() ? k.size(1) : 0;
             const auto max_seqlen_k_tensor = torch::stable::amax(seqlens_k, 0);
             int32_t max_seqlen_k_value;

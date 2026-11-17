@@ -47,8 +47,7 @@ class FlashAttentionMLADecodeSm100:
         )
         h_group = qhead_per_kvhead // num_head_groups
         assert h_group in self.SUPPORTED_HEADS, (
-            f"qhead_per_kvhead // num_head_groups must be in {self.SUPPORTED_HEADS}, "
-            f"got {h_group}"
+            f"qhead_per_kvhead // num_head_groups must be in {self.SUPPORTED_HEADS}, got {h_group}"
         )
 
         self.topk_length = topk_length
@@ -107,12 +106,20 @@ class FlashAttentionMLADecodeSm100:
         # must run inside a traced region; results passed to the kernel explicitly, never via self
         h, tn, dv = self.h, self.tile_n, self.dv_chunk
         mma_S = sm100_utils.make_trivial_tiled_mma(
-            dtype, OperandMajorMode.K, OperandMajorMode.K, self.dtype_acc,
-            CtaGroup.ONE, (tn, h),
+            dtype,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            self.dtype_acc,
+            CtaGroup.ONE,
+            (tn, h),
         )
         mma_O = sm100_utils.make_trivial_tiled_mma(
-            dtype, OperandMajorMode.MN, OperandMajorMode.MN, self.dtype_acc,
-            CtaGroup.ONE, (dv, h),
+            dtype,
+            OperandMajorMode.MN,
+            OperandMajorMode.MN,
+            self.dtype_acc,
+            CtaGroup.ONE,
+            (dv, h),
         )
         # A of S^T (K-major) and A of O^T (MN-major) over the SAME bytes.
         LlatK = sm100_utils.make_smem_layout_a(mma_S, (tn, h, dv), dtype, n_lat)
@@ -171,15 +178,15 @@ class FlashAttentionMLADecodeSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,              # (total_q, h, 64)
-        mQv: cute.Tensor,             # (total_q, h, 512)
-        mK: cute.Tensor,              # (total_k, h_k, 64)
-        mV: cute.Tensor,              # (total_k, h_k, 512)
-        mO: cute.Tensor,              # (total_q, h, 512)  or (S, total_q, h, 512) fp32
+        mQ: cute.Tensor,  # (total_q, h, 64)
+        mQv: cute.Tensor,  # (total_q, h, 512)
+        mK: cute.Tensor,  # (total_k, h_k, 64)
+        mV: cute.Tensor,  # (total_k, h_k, 512)
+        mO: cute.Tensor,  # (total_q, h, 512)  or (S, total_q, h, 512) fp32
         mLSE: Optional[cute.Tensor],  # (S, h, total_q) split, (total_q, h) unsplit, None if unused
         softmax_scale: Float32,
         mCuSeqlensQ: cute.Tensor,
-        mIndexTopk: cute.Tensor,                      # (total_q, topk)
+        mIndexTopk: cute.Tensor,  # (total_q, topk)
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mTopkValidLen: Optional[cute.Tensor] = None,  # (total_q,)
@@ -214,8 +221,7 @@ class FlashAttentionMLADecodeSm100:
         else:
             mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=[0, 2, 1]))
         mK, mV = [
-            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1]))
-            for mX in (mK, mV)
+            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1])) for mX in (mK, mV)
         ]
         # (total_q, topk) -> (topk, total_q)
         mIndexTopk = cute.make_tensor(
@@ -239,9 +245,25 @@ class FlashAttentionMLADecodeSm100:
         grid_dim = (total_q * self.num_ctas_per_token, mV.shape[2], 1)
 
         self.kernel(
-            mQ, mQv, mK, mV, mO, mLSE, mIndexTopk, mTopkValidLen,
-            mCuSeqlensQ, mCuSeqlensK, mSeqUsedK,
-            mma_S, mma_O, LlatK, LlatMN, Lrope, LqtC, LqtR, Lpt,
+            mQ,
+            mQv,
+            mK,
+            mV,
+            mO,
+            mLSE,
+            mIndexTopk,
+            mTopkValidLen,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedK,
+            mma_S,
+            mma_O,
+            LlatK,
+            LlatMN,
+            Lrope,
+            LqtC,
+            LqtR,
+            Lpt,
             softmax_scale * LOG2_E,
             SharedStorage,
         ).launch(
@@ -291,10 +313,15 @@ class FlashAttentionMLADecodeSm100:
 
         batch_idx = get_batch_from_cu_tensor(m_idx, mCuSeqlensQ)
         seqlen = SeqlenInfoQK.create(
-            batch_idx, Int32(1), Int32(1),
-            mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=None, mSeqUsedK=mSeqUsedK,
-            tile_m=self.tile_n, tile_n=self.tile_n,
+            batch_idx,
+            Int32(1),
+            Int32(1),
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=None,
+            mSeqUsedK=mSeqUsedK,
+            tile_m=self.tile_n,
+            tile_n=self.tile_n,
         )
         seqlen_k_limit = seqlen.seqlen_k
 
@@ -356,37 +383,55 @@ class FlashAttentionMLADecodeSm100:
         corr_grp = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_corr_threads)
 
         pl_lat = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_lat.data_ptr(), num_stages=self.n_lat,
-            producer_group=gather_grp, consumer_group=mma_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            barrier_storage=storage.mbar_lat.data_ptr(),
+            num_stages=self.n_lat,
+            producer_group=gather_grp,
+            consumer_group=mma_grp,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
         )
         pl_rope = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_rope.data_ptr(), num_stages=1,
-            producer_group=gather_grp, consumer_group=mma_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            barrier_storage=storage.mbar_rope.data_ptr(),
+            num_stages=1,
+            producer_group=gather_grp,
+            consumer_group=mma_grp,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
         )
         # arrive.noinc does not bump the pending count: arrive count must equal the gather threads
         assert pl_lat.sync_object_full.arrive_count == self.num_gather_threads
         assert pl_rope.sync_object_full.arrive_count == self.num_gather_threads
 
         pl_S = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.mbar_S.data_ptr(), num_stages=1,
-            producer_group=mma_grp, consumer_group=sm_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            barrier_storage=storage.mbar_S.data_ptr(),
+            num_stages=1,
+            producer_group=mma_grp,
+            consumer_group=sm_grp,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
         )
         pl_P = pipeline.PipelineAsyncUmma.create(
-            barrier_storage=storage.mbar_P.data_ptr(), num_stages=1,
-            producer_group=sm_grp, consumer_group=mma_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            barrier_storage=storage.mbar_P.data_ptr(),
+            num_stages=1,
+            producer_group=sm_grp,
+            consumer_group=mma_grp,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
         )
         pl_O = pipeline.PipelineUmmaAsync.create(
-            barrier_storage=storage.mbar_O.data_ptr(), num_stages=1,
-            producer_group=mma_grp, consumer_group=corr_grp,
-            cta_layout_vmnk=cta_layout_vmnk, defer_sync=True,
+            barrier_storage=storage.mbar_O.data_ptr(),
+            num_stages=1,
+            producer_group=mma_grp,
+            consumer_group=corr_grp,
+            cta_layout_vmnk=cta_layout_vmnk,
+            defer_sync=True,
         )
         pl_stats = pipeline.PipelineAsync.create(
-            barrier_storage=storage.mbar_stats.data_ptr(), num_stages=self.num_stages_stats,
-            producer_group=sm_grp, consumer_group=corr_grp, defer_sync=True,
+            barrier_storage=storage.mbar_stats.data_ptr(),
+            num_stages=self.num_stages_stats,
+            producer_group=sm_grp,
+            consumer_group=corr_grp,
+            defer_sync=True,
         )
 
         mbar_Q = storage.mbar_Q.data_ptr()
@@ -394,9 +439,7 @@ class FlashAttentionMLADecodeSm100:
             cute.arch.mbarrier_init(mbar_Q, self.num_corr_threads)
 
         # ==== TMEM ==================================================================
-        tmem_bar = pipeline.NamedBarrier(
-            barrier_id=self.bar_id_tmem, num_threads=self.num_threads
-        )
+        tmem_bar = pipeline.NamedBarrier(barrier_id=self.bar_id_tmem, num_threads=self.num_threads)
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding.data_ptr(),
             barrier_for_retrieve=tmem_bar,
@@ -424,27 +467,87 @@ class FlashAttentionMLADecodeSm100:
         # ==== role dispatch =========================================================
         if warp_idx < self.corr_warp_lo:
             self.softmax_loop(
-                mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
-                pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-                softmax_scale_log2, n_block_lo, num_n_blocks,
+                mIndexTopk,
+                mma_S,
+                accS,
+                sRed,
+                sSmMax,
+                sSmSum,
+                sScale,
+                sPt,
+                pl_S,
+                pl_P,
+                pl_stats,
+                tidx,
+                warp_idx,
+                m_idx,
+                seqlen_k_limit,
+                softmax_scale_log2,
+                n_block_lo,
+                num_n_blocks,
             )
         elif warp_idx < self.mma_warp_id:
             self.corr_epilogue_loop(
-                mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
-                sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
-                tidx, head_kv, m_idx, hg_idx, split_idx,
-                softmax_scale_log2, num_n_blocks,
+                mQ,
+                mQv,
+                mO,
+                mLSE,
+                mma_O,
+                accO,
+                sQtC,
+                sQtR,
+                sScale,
+                sSmMax,
+                sSmSum,
+                sInv,
+                pl_O,
+                pl_stats,
+                mbar_Q,
+                tidx,
+                head_kv,
+                m_idx,
+                hg_idx,
+                split_idx,
+                softmax_scale_log2,
+                num_n_blocks,
             )
         elif warp_idx == self.mma_warp_id:
             self.mma_loop(
-                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+                mma_S,
+                mma_O,
+                sLatK,
+                sLatMN,
+                sRope,
+                sQtC,
+                sQtR,
+                sPt,
+                pl_lat,
+                pl_rope,
+                pl_S,
+                pl_P,
+                pl_O,
+                mbar_Q,
+                num_n_blocks,
             )
         elif warp_idx >= self.gather_warp_lo:
             self.gather_loop(
-                mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
-                tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit,
-                dtype, n_block_lo, num_n_blocks,
+                mIndexTopk,
+                mK,
+                mV,
+                sLatK,
+                sRope,
+                pl_lat,
+                pl_rope,
+                tidx,
+                warp_idx,
+                m_idx,
+                seqlen,
+                batch_idx,
+                head_kv,
+                seqlen_k_limit,
+                dtype,
+                n_block_lo,
+                num_n_blocks,
             )
 
         # ==== TMEM teardown (all 512 threads) =======================================
@@ -455,9 +558,24 @@ class FlashAttentionMLADecodeSm100:
     # ================================================================ gather warps
     @cute.jit
     def gather_loop(
-        self, mIndexTopk, mK, mV, sLatK, sRope, pl_lat, pl_rope,
-        tidx, warp_idx, m_idx, seqlen, batch_idx, head_kv, seqlen_k_limit, dtype,
-        n_block_lo, num_n_blocks,
+        self,
+        mIndexTopk,
+        mK,
+        mV,
+        sLatK,
+        sRope,
+        pl_lat,
+        pl_rope,
+        tidx,
+        warp_idx,
+        m_idx,
+        seqlen,
+        batch_idx,
+        head_kv,
+        seqlen_k_limit,
+        dtype,
+        n_block_lo,
+        num_n_blocks,
     ):
         mgr = CpasyncGatherKVManager.create(
             mIndexTopk[None, m_idx],
@@ -504,8 +622,22 @@ class FlashAttentionMLADecodeSm100:
     # ================================================================== MMA warp
     @cute.jit
     def mma_loop(
-        self, mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-        pl_lat, pl_rope, pl_S, pl_P, pl_O, mbar_Q, num_n_blocks,
+        self,
+        mma_S,
+        mma_O,
+        sLatK,
+        sLatMN,
+        sRope,
+        sQtC,
+        sQtR,
+        sPt,
+        pl_lat,
+        pl_rope,
+        pl_S,
+        pl_P,
+        pl_O,
+        mbar_Q,
+        num_n_blocks,
     ):
         tSrLat = mma_S.make_fragment_A(sLatK)
         tSrRope = mma_S.make_fragment_A(sRope)
@@ -519,8 +651,8 @@ class FlashAttentionMLADecodeSm100:
         states = (
             pipeline.make_pipeline_state(Consumer, self.n_lat),  # cs_lat: S^T reads
             pipeline.make_pipeline_state(Consumer, self.n_lat),  # use_lat: O^T reads
-            pipeline.make_pipeline_state(Consumer, 1),           # cs_rope
-            pipeline.make_pipeline_state(Consumer, 1),           # cs_P
+            pipeline.make_pipeline_state(Consumer, 1),  # cs_rope
+            pipeline.make_pipeline_state(Consumer, 1),  # cs_P
             pipeline.make_pipeline_state(Producer, 1),
             pipeline.make_pipeline_state(Producer, 1),
         )
@@ -529,22 +661,76 @@ class FlashAttentionMLADecodeSm100:
         cute.arch.mbarrier_wait(mbar_Q, Int32(0))
 
         states = self._mma_block(
-            mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-            tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
-            pl_lat, pl_rope, pl_S, pl_P, pl_O, states, True,
+            mma_S,
+            mma_O,
+            sLatK,
+            sLatMN,
+            sRope,
+            sQtC,
+            sQtR,
+            sPt,
+            tSrLat,
+            tSrRope,
+            tSrQtC,
+            tSrQtR,
+            tOrLat,
+            tOrPt,
+            pl_lat,
+            pl_rope,
+            pl_S,
+            pl_P,
+            pl_O,
+            states,
+            True,
         )
         for _ in cutlass.range(num_n_blocks - 1, unroll=1):
             states = self._mma_block(
-                mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-                tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
-                pl_lat, pl_rope, pl_S, pl_P, pl_O, states, False,
+                mma_S,
+                mma_O,
+                sLatK,
+                sLatMN,
+                sRope,
+                sQtC,
+                sQtR,
+                sPt,
+                tSrLat,
+                tSrRope,
+                tSrQtC,
+                tSrQtR,
+                tOrLat,
+                tOrPt,
+                pl_lat,
+                pl_rope,
+                pl_S,
+                pl_P,
+                pl_O,
+                states,
+                False,
             )
 
     @cute.jit
     def _mma_block(
-        self, mma_S, mma_O, sLatK, sLatMN, sRope, sQtC, sQtR, sPt,
-        tSrLat, tSrRope, tSrQtC, tSrQtR, tOrLat, tOrPt,
-        pl_lat, pl_rope, pl_S, pl_P, pl_O, states,
+        self,
+        mma_S,
+        mma_O,
+        sLatK,
+        sLatMN,
+        sRope,
+        sQtC,
+        sQtR,
+        sPt,
+        tSrLat,
+        tSrRope,
+        tSrQtC,
+        tSrQtR,
+        tOrLat,
+        tOrPt,
+        pl_lat,
+        pl_rope,
+        pl_S,
+        pl_P,
+        pl_O,
+        states,
         is_first: cutlass.Constexpr[bool],
     ):
         cs_lat, use_lat, cs_rope, cs_P, ps_S, ps_O = states
@@ -559,20 +745,28 @@ class FlashAttentionMLADecodeSm100:
             fa_sm100_utils.fence_tcgen05_after_thread_sync()
             st = cs_lat.index
             fa_sm100_utils.gemm_ptx_partial(
-                mma_S.op, Int32(self.tmem_off_S),
-                tSrLat[None, None, None, st], tSrQtC[None, None, None, c],
-                sLatK[None, None, None, st], sQtC[None, None, None, c],
-                zero_init=const_expr(c == 0), cta_group=1,
+                mma_S.op,
+                Int32(self.tmem_off_S),
+                tSrLat[None, None, None, st],
+                tSrQtC[None, None, None, c],
+                sLatK[None, None, None, st],
+                sQtC[None, None, None, c],
+                zero_init=const_expr(c == 0),
+                cta_group=1,
             )
             cs_lat.advance()
         pl_rope.consumer_wait(cs_rope)
         cute.arch.fence_view_async_shared()
         fa_sm100_utils.fence_tcgen05_after_thread_sync()
         fa_sm100_utils.gemm_ptx_partial(
-            mma_S.op, Int32(self.tmem_off_S),
-            tSrRope[None, None, None, cs_rope.index], tSrQtR[None, None, None, 0],
-            sRope[None, None, None, cs_rope.index], sQtR[None, None, None, 0],
-            zero_init=False, cta_group=1,
+            mma_S.op,
+            Int32(self.tmem_off_S),
+            tSrRope[None, None, None, cs_rope.index],
+            tSrQtR[None, None, None, 0],
+            sRope[None, None, None, cs_rope.index],
+            sQtR[None, None, None, 0],
+            zero_init=False,
+            cta_group=1,
         )
         pl_S.producer_commit(ps_S)
         ps_S.advance()
@@ -584,10 +778,14 @@ class FlashAttentionMLADecodeSm100:
         for c in cutlass.range_constexpr(self.num_chunks):
             st = use_lat.index
             fa_sm100_utils.gemm_ptx_partial(
-                mma_O.op, Int32(self.tmem_off_O[c]),
-                tOrLat[None, None, None, st], tOrPt[None, None, None, cs_P.index],
-                sLatMN[None, None, None, st], sPt[None, None, None, cs_P.index],
-                zero_init=const_expr(is_first), cta_group=1,
+                mma_O.op,
+                Int32(self.tmem_off_O[c]),
+                tOrLat[None, None, None, st],
+                tOrPt[None, None, None, cs_P.index],
+                sLatMN[None, None, None, st],
+                sPt[None, None, None, cs_P.index],
+                zero_init=const_expr(is_first),
+                cta_group=1,
             )
             # the latent stage stays pinned until exactly here
             pl_lat.consumer_release(use_lat)
@@ -605,18 +803,32 @@ class FlashAttentionMLADecodeSm100:
     # ================================================================ softmax warps
     @cute.jit
     def softmax_loop(
-        self, mIndexTopk, mma_S, accS, sRed, sSmMax, sSmSum, sScale, sPt,
-        pl_S, pl_P, pl_stats, tidx, warp_idx, m_idx, seqlen_k_limit,
-        softmax_scale_log2, n_block_lo, num_n_blocks,
+        self,
+        mIndexTopk,
+        mma_S,
+        accS,
+        sRed,
+        sSmMax,
+        sSmSum,
+        sScale,
+        sPt,
+        pl_S,
+        pl_P,
+        pl_stats,
+        tidx,
+        warp_idx,
+        m_idx,
+        seqlen_k_limit,
+        softmax_scale_log2,
+        n_block_lo,
+        num_n_blocks,
     ):
         h = const_expr(self.h)
         lane_idx = cute.arch.lane_idx()
         mIndexTopk_cur = mIndexTopk[None, m_idx]
 
         thr_mma_S = mma_S.get_slice(0)
-        ld_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32
-        )
+        ld_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32)
         thr_ldS = tcgen05.make_tmem_copy(ld_atom, accS).get_slice(tidx)
         cS = cute.make_identity_tensor((self.tile_n, h))
         cS_t2r = thr_ldS.partition_D(thr_mma_S.partition_C(cS)[(None, None), 0, 0])
@@ -631,22 +843,60 @@ class FlashAttentionMLADecodeSm100:
         states = (
             pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1),
             pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1),
-            pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_stages_stats
-            ),
+            pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_stages_stats),
         )
         states = self._softmax_block(
-            mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
-            thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
-            pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
-            seqlen_k_limit, softmax_scale_log2, n_block_lo, True,
+            mIndexTopk_cur,
+            sRed,
+            sSmMax,
+            sSmSum,
+            sScale,
+            sPt,
+            pt_layout,
+            thr_ldS,
+            tSaccS,
+            tSrS,
+            tSrP,
+            cS_t2r,
+            key_row,
+            pl_S,
+            pl_P,
+            pl_stats,
+            states,
+            tidx,
+            warp_idx,
+            lane_idx,
+            seqlen_k_limit,
+            softmax_scale_log2,
+            n_block_lo,
+            True,
         )
         for i in cutlass.range(num_n_blocks - 1, unroll=1):
             states = self._softmax_block(
-                mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
-                thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
-                pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
-                seqlen_k_limit, softmax_scale_log2, n_block_lo + i + 1, False,
+                mIndexTopk_cur,
+                sRed,
+                sSmMax,
+                sSmSum,
+                sScale,
+                sPt,
+                pt_layout,
+                thr_ldS,
+                tSaccS,
+                tSrS,
+                tSrP,
+                cS_t2r,
+                key_row,
+                pl_S,
+                pl_P,
+                pl_stats,
+                states,
+                tidx,
+                warp_idx,
+                lane_idx,
+                seqlen_k_limit,
+                softmax_scale_log2,
+                n_block_lo + i + 1,
+                False,
             )
         _, ps_P, ps_st = states
         pl_P.producer_tail(ps_P)
@@ -654,10 +904,30 @@ class FlashAttentionMLADecodeSm100:
 
     @cute.jit
     def _softmax_block(
-        self, mIndexTopk_cur, sRed, sSmMax, sSmSum, sScale, sPt, pt_layout,
-        thr_ldS, tSaccS, tSrS, tSrP, cS_t2r, key_row,
-        pl_S, pl_P, pl_stats, states, tidx, warp_idx, lane_idx,
-        seqlen_k_limit, softmax_scale_log2, n_block: Int32,
+        self,
+        mIndexTopk_cur,
+        sRed,
+        sSmMax,
+        sSmSum,
+        sScale,
+        sPt,
+        pt_layout,
+        thr_ldS,
+        tSaccS,
+        tSrS,
+        tSrP,
+        cS_t2r,
+        key_row,
+        pl_S,
+        pl_P,
+        pl_stats,
+        states,
+        tidx,
+        warp_idx,
+        lane_idx,
+        seqlen_k_limit,
+        softmax_scale_log2,
+        n_block: Int32,
         is_first: cutlass.Constexpr[bool],
     ):
         h = const_expr(self.h)
@@ -706,7 +976,8 @@ class FlashAttentionMLADecodeSm100:
                 sSmMax[tidx] = m_new
                 sScale[st_idx, tidx] = (
                     cute.math.exp2((m_old - m_new) * softmax_scale_log2, fastmath=True)
-                    if m_old != -Float32.inf else Float32(0.0)
+                    if m_old != -Float32.inf
+                    else Float32(0.0)
                 )
         bar_sm.arrive_and_wait()
 
@@ -752,10 +1023,29 @@ class FlashAttentionMLADecodeSm100:
     # =========================================== correction + Q^T load + epilogue
     @cute.jit
     def corr_epilogue_loop(
-        self, mQ, mQv, mO, mLSE, mma_O, accO, sQtC, sQtR,
-        sScale, sSmMax, sSmSum, sInv, pl_O, pl_stats, mbar_Q,
-        tidx, head_kv, m_idx, hg_idx, split_idx,
-        softmax_scale_log2, num_n_blocks,
+        self,
+        mQ,
+        mQv,
+        mO,
+        mLSE,
+        mma_O,
+        accO,
+        sQtC,
+        sQtR,
+        sScale,
+        sSmMax,
+        sSmSum,
+        sInv,
+        pl_O,
+        pl_stats,
+        mbar_Q,
+        tidx,
+        head_kv,
+        m_idx,
+        hg_idx,
+        split_idx,
+        softmax_scale_log2,
+        num_n_blocks,
     ):
         h = const_expr(self.h)
         ctid = tidx - self.corr_tid_lo
@@ -783,12 +1073,8 @@ class FlashAttentionMLADecodeSm100:
 
         # ---- TMEM views of the four O^T accumulators -----------------------------
         thr_mma_O = mma_O.get_slice(0)
-        ld_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32
-        )
-        st_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(h)), Float32
-        )
+        ld_atom = cute.make_copy_atom(tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(h)), Float32)
+        st_atom = cute.make_copy_atom(tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(h)), Float32)
         thr_ldO = tcgen05.make_tmem_copy(ld_atom, accO[0]).get_slice(ctid)
         thr_stO = tcgen05.make_tmem_copy(st_atom, accO[0]).get_slice(ctid)
         cO = cute.make_identity_tensor((self.dv_chunk, h))
@@ -852,9 +1138,7 @@ class FlashAttentionMLADecodeSm100:
                 hh = cO_t2r[i][1]
                 # split partials are already divided by this split's row sum, as combine expects
                 if const_expr(self.is_split_kv):
-                    mO[m_idx, dv, head_base + hh, split_idx] = (
-                        tOrO[i] * sInv[hh]
-                    ).to(self.dtype_O)
+                    mO[m_idx, dv, head_base + hh, split_idx] = (tOrO[i] * sInv[hh]).to(self.dtype_O)
                 else:
                     mO[m_idx, dv, head_base + hh] = (tOrO[i] * sInv[hh]).to(self.dtype_O)
 

@@ -25,7 +25,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 set(ignoreMe "${VLLM_PYTHON_PATH}")
 
 # Supported python versions. These should be kept in sync with setup.py.
-set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
+set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13" "3.14")
 
 # Supported NVIDIA architectures.
 set(CUDA_SUPPORTED_ARCHS "8.0;8.6;8.9;9.0")
@@ -131,6 +131,15 @@ get_torch_gpu_compiler_flags(VLLM_FA_GPU_FLAGS ${VLLM_GPU_LANG})
 #
 if (NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_FA_GPU_FLAGS "--threads=${NVCC_THREADS}")
+endif ()
+
+#
+# Set compression mode for CUDA >=13.x.
+#
+if (VLLM_GPU_LANG STREQUAL "CUDA" AND
+    DEFINED CMAKE_CUDA_COMPILER_VERSION AND
+    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+    list(APPEND VLLM_FA_GPU_FLAGS "--compress-mode=size")
 endif ()
 
 

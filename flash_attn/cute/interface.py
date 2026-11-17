@@ -61,7 +61,11 @@ from flash_attn.cute.cute_dsl_utils import (
     validate_output_layout,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm90 import (
+    FlashAttentionForwardSm90,
+    FlashAttentionForwardSm90Fp8KV,
+    Fp8KVDescaleTensors,
+)
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess, PackGQA
@@ -623,6 +627,12 @@ def _flash_attn_fwd(
             page_size 64. Q is split into two E4M3 terms at a fixed scale of 1, so
             the caller must keep |q| <= 448: above 448 the error grows about 10x,
             and above 896 Q saturates silently. Fold larger Q into k_descale.
+            Two kernels serve it. BF16 Q with cu_seqlens_q and seqused_k (no seqused_q,
+            score_mod other than softcap, mask_mod, dynamic_causal or aux_tensors) runs
+            FlashAttentionForwardSm90Fp8KV, which computes PV in FP16 from P * 2^7 and
+            the exactly widened E4M3 V. Other inputs run the FP8 mainloop of
+            FlashAttentionForwardSm90, which computes PV in FP8 from a compensated
+            E4M3 pair of P and promotes it to FP32 per KV block.
         config: Fully resolved forward config, or None for the default: an MlaFwdConfig with qv,
             else a FwdConfig.
     """
@@ -858,28 +868,6 @@ def _flash_attn_fwd(
             "q_descale/k_descale/v_descale are only supported for FP8 inputs"
         )
 
-    if fp8_kv_dequant and any(
-        t is None for t in (q_descale, k_descale, v_descale)
-    ):
-        # DescaleTensors' MLIR reconstruction packs present values positionally.
-        # Materialize every missing slot so configurations such as V-only scaling
-        # cannot shift V into the K field and silently corrupt QK/PV scaling.
-        _ref_descale = next(
-            (t for t in (q_descale, k_descale, v_descale) if t is not None),
-            None,
-        )
-        if _ref_descale is None:
-            identity_descale = torch.ones(
-                (batch_size, num_head_kv), dtype=torch.float32, device=q.device
-            )
-        else:
-            identity_descale = torch.ones_like(
-                _ref_descale, memory_format=torch.contiguous_format
-            )
-        q_descale, k_descale, v_descale = [
-            t if t is not None else identity_descale
-            for t in (q_descale, k_descale, v_descale)
-        ]
     # Expanded scalar scales can have a zero stride even when every size is
     # one; Tensor.contiguous() may preserve that layout. Copy only those
     # tensors whose CuTe dynamic leading dimension is not actually unit-stride.
@@ -1003,6 +991,45 @@ def _flash_attn_fwd(
                 f"FA4 SM90 FP8 MMA requires the paged-KV page_size == tile_n ({config.tile_n}); "
                 f"got page_size={page_size}."
             )
+
+    # SM90 FP8-KV head_dim 512 kernel with an FP16 PV (FlashAttentionForwardSm90Fp8KV). Its
+    # asserts list the kernel limits; this selects the inputs it is validated for. softcap
+    # qualifies both before and after it becomes a score_mod below.
+    use_sm90_fp8kv_hd512 = (
+        fp8_kv_dequant
+        and q_dtype == torch.bfloat16
+        and (config.tile_m, config.tile_n) == (64, 64)
+        and cu_seqlens_q is not None
+        and seqused_q is None
+        and seqused_k is not None
+        and (score_mod is None or softcap is not None)
+        and mask_mod is None
+        and dynamic_causal is None
+        and aux_tensors is None
+    )
+    descale_tensors_cls = Fp8KVDescaleTensors if use_sm90_fp8kv_hd512 else DescaleTensors
+    if fp8_kv_dequant and not use_sm90_fp8kv_hd512 and any(
+        t is None for t in (q_descale, k_descale, v_descale)
+    ):
+        # DescaleTensors' MLIR reconstruction packs present values positionally.
+        # Materialize every missing slot so configurations such as V-only scaling
+        # cannot shift V into the K field and silently corrupt QK/PV scaling.
+        _ref_descale = next(
+            (t for t in (q_descale, k_descale, v_descale) if t is not None),
+            None,
+        )
+        if _ref_descale is None:
+            identity_descale = torch.ones(
+                (batch_size, num_head_kv), dtype=torch.float32, device=q.device
+            )
+        else:
+            identity_descale = torch.ones_like(
+                _ref_descale, memory_format=torch.contiguous_format
+            )
+        q_descale, k_descale, v_descale = [
+            t if t is not None else identity_descale
+            for t in (q_descale, k_descale, v_descale)
+        ]
 
     decode_splits = None
     if use_sparse_decode:
@@ -1414,6 +1441,7 @@ def _flash_attn_fwd(
         tensormap_workspace is not None,
         output_quant_key,
         fp8_kv_dequant,
+        use_sm90_fp8kv_hd512,
         # FP8 MMA uses a fixed fp16 auxiliary dtype, so `dtype` no longer captures
         # native Q/O tensor dtypes. Key on them explicitly for quantization and
         # epilogue selection. This is redundant for the other paths.
@@ -1473,7 +1501,7 @@ def _flash_attn_fwd(
             for t in (q_descale, k_descale, v_descale)
         )
         descale_tensors_tensor = (
-            DescaleTensors(
+            descale_tensors_cls(
                 q_descale=q_descale_tensor,
                 k_descale=k_descale_tensor,
                 v_descale=v_descale_tensor,
@@ -1547,6 +1575,21 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 output_quant_key=output_quant_key,
+            )
+        elif arch // 10 == 9 and use_sm90_fp8kv_hd512:
+            fa_fwd = FlashAttentionForwardSm90Fp8KV(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                is_split_kv=is_split_kv,
+                pack_gqa=config.pack_gqa,
+                tile_m=config.tile_m,
+                tile_n=config.tile_n,
+                score_mod=score_mod,
+                kv_dtype=kv_dtype,
             )
         elif arch // 10 == 9:
             fa_fwd = FlashAttentionForwardSm90(
@@ -1832,7 +1875,7 @@ def _flash_attn_fwd(
         if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             out_call = out_call.view(torch.uint8)
         descale_tensors = (
-            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+            descale_tensors_cls(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
             else None
         )
@@ -1969,6 +2012,12 @@ def _flash_attn_fwd(
             num_splits_dynamic_ptr=num_splits_dynamic,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
             output_scale=output_scale,
+            # The SM90 FP8-KV hd512 kernel's partials: PDL, and split groups past 16 splits.
+            **(
+                dict(split_groups=4 if num_splits > 16 else 1, use_pdl=True)
+                if use_sm90_fp8kv_hd512
+                else {}
+            ),
             _arch=arch,
         )
         if lse is not None and qv is not None:

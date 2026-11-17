@@ -627,7 +627,7 @@ def _flash_attn_fwd(
             page_size 64. Q is split into two E4M3 terms at a fixed scale of 1, so
             the caller must keep |q| <= 448: above 448 the error grows about 10x,
             and above 896 Q saturates silently. Fold larger Q into k_descale.
-            Two kernels serve it. BF16 Q with cu_seqlens_q and seqused_k (no seqused_q,
+            Two kernels serve it. FP16/BF16 Q with cu_seqlens_q and seqused_k (no seqused_q,
             score_mod other than softcap, mask_mod, dynamic_causal or aux_tensors) runs
             FlashAttentionForwardSm90Fp8KV, which computes PV in FP16 from P * 2^7 and
             the exactly widened E4M3 V. Other inputs run the FP8 mainloop of
@@ -997,7 +997,6 @@ def _flash_attn_fwd(
     # qualifies both before and after it becomes a score_mod below.
     use_sm90_fp8kv_hd512 = (
         fp8_kv_dequant
-        and q_dtype == torch.bfloat16
         and (config.tile_m, config.tile_n) == (64, 64)
         and cu_seqlens_q is not None
         and seqused_q is None

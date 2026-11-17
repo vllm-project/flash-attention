@@ -1102,3 +1102,77 @@ def as_shhb_tensor(
             ),
         ),
     )
+
+
+@dsl_user_op
+def e4m3_hi_res_x8(
+    v0: Int32, v1: Int32, v2: Int32, v3: Int32, is_bf16: bool, *, loc=None, ip=None
+) -> list:
+    """Split 8 BF16 or FP16 values q into two E4M3 terms, hi = e4m3(q) and res = e4m3(q - hi).
+
+    The inputs are four 32-bit words of packed pairs. Returns four words: hi of values 0-3,
+    hi of values 4-7, res of values 0-3 and res of values 4-7, one E4M3 byte per value. The
+    arithmetic runs in f16x2 with round-to-nearest and saturating E4M3 conversions, so the bytes
+    equal e4m3(q) and e4m3(float(q) - float(hi)) computed in FP32, except that res is +0 rather
+    than -0 for negative q that rounds to 0 in FP16 (|q| <= 2^-25).
+
+    For BF16 q, hi + res == q exactly for 2^-2 <= |q| <= 448. Below 2^-2 the residual is
+    subnormal and keeps fewer bits, and below 2^-10 both terms are 0. Above 448 hi saturates,
+    above 896 the sum saturates, and values beyond the FP16 range saturate as well. FP16 q keeps
+    at most 8 of its 11 significant bits.
+    """
+    res_ty = llvm.StructType.get_literal([T.i32()] * 4)
+    body = ["{", ".reg .b32 lo, hi, q, h16, r16;", ".reg .b16 h0, h1, h2, h3, r0, r1, r2, r3;"]
+    for i in range(4):
+        if is_bf16:
+            body += [
+                f"shl.b32 lo, ${4 + i}, 16;",
+                f"and.b32 hi, ${4 + i}, 0xffff0000;",
+                "cvt.rn.f16x2.f32 q, hi, lo;",
+            ]
+        else:
+            body += [f"mov.b32 q, ${4 + i};"]
+        body += [
+            f"cvt.rn.satfinite.e4m3x2.f16x2 h{i}, q;",
+            f"cvt.rn.f16x2.e4m3x2 h16, h{i};",
+            "sub.rn.f16x2 r16, q, h16;",
+            f"cvt.rn.satfinite.e4m3x2.f16x2 r{i}, r16;",
+        ]
+    body += [
+        "mov.b32 $0, {h0, h1};",
+        "mov.b32 $1, {h2, h3};",
+        "mov.b32 $2, {r0, r1};",
+        "mov.b32 $3, {r2, r3};",
+        "}",
+    ]
+    res = llvm.inline_asm(
+        res_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip) for x in (v0, v1, v2, v3)],
+        "\n".join(body),
+        "=r,=r,=r,=r,r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def e4m3_2x2_to_f16x2_transposed(x: Int32, *, loc=None, ip=None) -> list:
+    """Transpose a 2 x 2 block of E4M3 values and widen it to FP16, which is exact.
+
+    x holds the bytes [a0, a1, b0, b1] from least to most significant (rows a and b, columns
+    0 and 1). Returns the columns as two f16x2 words, (a0, b0) and (a1, b1), low half first.
+    """
+    res_ty = llvm.StructType.get_literal([T.i32()] * 2)
+    res = llvm.inline_asm(
+        res_ty,
+        [Int32(x).ir_value(loc=loc, ip=ip)],
+        "{\n.reg .b32 t;\n.reg .b16 lo, hi;\nprmt.b32 t, $2, $2, 0x3120;\nmov.b32 {lo, hi}, t;\n"
+        "cvt.rn.f16x2.e4m3x2 $0, lo;\ncvt.rn.f16x2.e4m3x2 $1, hi;\n}",
+        "=r,=r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2)]

@@ -360,13 +360,23 @@ class FlashAttentionForwardBase:
         head_idx: Int32,
         batch_idx: Int32,
         split_idx: Int32 = Int32(0),
+        store_O_fn: Optional[Callable] = None,
     ):
+        """Write LSE, then O.
+
+        store_O_fn: optional callable that writes O from the caller's registers. It receives the
+        (seqlen_q, head_dim_v) output view of this batch, head and split, or
+        ((qhead_per_kvhead, seqlen_q), head_dim_v) with pack_gqa. acc_O, sO, gmem_tiled_copy_O and
+        tma_atom_O are then unused, and tiled_mma only maps this thread's LSE rows.
+        """
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(
             self.tile_m, self.tile_hdimv, self.check_hdim_v_oob, self.qhead_per_kvhead
         )
+        if const_expr(store_O_fn is not None):
+            assert not self.use_tma_O, "store_O_fn writes through a plain (non-TMA) O tensor"
 
-        if const_expr(not self.is_split_kv):
+        if const_expr(not self.is_split_kv and store_O_fn is None):
             rO = cute.make_fragment_like(acc_O, self.o_dtype)
             rO.store(acc_O.load().to(self.o_dtype))
             # Make sure all threads have finished reading V
@@ -414,7 +424,10 @@ class FlashAttentionForwardBase:
         else:
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
 
-        if const_expr(self.is_split_kv):
+        if const_expr(store_O_fn is not None):
+            # Registers to global memory only: no shared memory to order, so no barrier.
+            store_O_fn(mO_cur)
+        elif const_expr(self.is_split_kv):
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
             )

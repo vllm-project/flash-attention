@@ -588,6 +588,7 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     gather_kv_valid_length: Optional[torch.Tensor] = None,
+    gather_kv_query_group_size: int = 1,
     output_scale: Optional[torch.Tensor] = None,
     compile_only: bool = False,
     fp8_kv_dequant: bool = False,
@@ -1167,12 +1168,32 @@ def _flash_attn_fwd(
             assert gather_kv_valid_length.stride(-1) == 1
             assert not requires_grad, "gather_kv_valid_length is forward-only"
             assert not mla_1cta, "gather_kv_valid_length is not supported by the 1CTA MLA kernel"
+
+        if gather_kv_query_group_size != 1:
+            # Each row of qv holds query_group_size queries of 128 // query_group_size heads,
+            # and its gather_kv_indices are their top-k union with membership bits (see
+            # topk_gather_kv.GROUPED_ROW_BITS).
+            assert sparse_kv, "gather_kv_query_group_size requires gather_kv_indices"
+            assert gather_kv_query_group_size in (2, 4, 8), (
+                f"gather_kv_query_group_size must be 2, 4 or 8, got {gather_kv_query_group_size}"
+            )
+            assert num_head == 128 and num_head_kv == 1, (
+                "gather_kv_query_group_size needs 128 query heads (the packed queries) per KV head"
+            )
+            assert config.pack_gqa, (
+                "gather_kv_query_group_size maps tile rows to queries, so it needs pack_gqa"
+            )
+            assert not mla_1cta, "gather_kv_query_group_size runs on the 2CTA MLA kernel"
+            assert not causal, "gather_kv_query_group_size takes causality from the top-k lists"
+            assert not requires_grad, "gather_kv_query_group_size is forward-only"
+
         # Rounding residual fp32(O) - bf16(O), saved so the backward forms dpsum from a
         # near-fp32 O. See AI/SPARSE_MLA_DPSUM_PRECISION.md.
         o_lo = torch.empty_like(out) if requires_grad and sparse_kv else None
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
         assert gather_kv_valid_length is None, "gather_kv_valid_length is only supported with qv"
+        assert gather_kv_query_group_size == 1, "gather_kv_query_group_size is only supported with qv"
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
@@ -1409,6 +1430,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         gather_kv_valid_length is not None,
+        gather_kv_query_group_size,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
         tensormap_workspace is not None,
@@ -1653,6 +1675,7 @@ def _flash_attn_fwd(
                         has_cu_seqlens_q=cu_seqlens_q is not None,
                         disable_bitmask=disable_sparse_kv_bitmask,
                         has_qk=has_qk,
+                        query_group_size=gather_kv_query_group_size,
                         rescale_threshold=mla_fwd_rescale_threshold,
                         use_clc_scheduler=config.use_clc_scheduler,
                     )
@@ -3919,6 +3942,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         disable_scheduler_metadata: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        gather_kv_query_group_size: int = 1,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3957,6 +3981,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_kv_valid_length=gather_kv_valid_length,
+            gather_kv_query_group_size=gather_kv_query_group_size,
             out=out,
             output_scale=output_scale,
             scheduler_metadata=scheduler_metadata,
@@ -4036,9 +4061,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 o_lo=o_lo,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 13), dsink, *((None,) * 18)
+                return dqv, dv, None, None, *((None,) * 13), dsink, *((None,) * 19)
             else:
-                return dq, dk, dv, dqv, *((None,) * 13), dsink, *((None,) * 18)
+                return dq, dk, dv, dqv, *((None,) * 13), dsink, *((None,) * 19)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -4072,7 +4097,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 18)
+            return dq, dk, dv, None, *((None,) * 13), dsink, *((None,) * 19)
 
 
 def _validate_gather_bwd_kwargs(
@@ -4224,6 +4249,7 @@ def flash_attn_varlen_func(
     gather_kv_valid_length: Optional[torch.Tensor] = None,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    gather_kv_query_group_size: int = 1,
 ):
     """
     Tensor arguments:
@@ -4291,6 +4317,11 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p, making the whole backward transient bounded by the chunk.
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
+
+    gather_kv_query_group_size: number of queries packed into each row of qv (2, 4 or 8). The
+        row holds the 128 // gather_kv_query_group_size heads of each query, query-major, and
+        its gather_kv_indices entries are row | (membership << 24) with -1 padding, where bit t
+        of membership marks the top-k of query t. Rows must be below 2**24 - 1. Forward only.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -4332,6 +4363,7 @@ def flash_attn_varlen_func(
         disable_scheduler_metadata,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        gather_kv_query_group_size,
     )
 
 

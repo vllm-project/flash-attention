@@ -49,6 +49,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int* const tile_count_semaphore,
         int* const prepare_seqlen_q_ptr,
         int* const num_splits_dynamic_ptr,
+        int const* const num_splits_per_request,
         int* const varlen_batch_idx_ptr,
         // int* const num_n_blocks_ptr,
         int* const num_nheads_in_l2_ptr,
@@ -141,7 +142,11 @@ __global__ void prepare_varlen_num_blocks_kernel(
     };
     
     int num_splits_dynamic;
-    if (int(gridDim.x) > 1 || num_splits_static == 1) {
+    if (num_splits_per_request) {
+        num_splits_dynamic = batch_idx < num_batch && lane < kNumBatchPerWarp
+            ? std::max(1, std::min(num_splits_per_request[batch_idx], num_splits_static)) : 1;
+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
+    } else if (int(gridDim.x) > 1 || num_splits_static == 1) {
         // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
         // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
         num_splits_dynamic = 1;
@@ -212,7 +217,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
 } // flash
 
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa,
-                               int blockM, int blockN, bool enable_pdl) {
+                               int blockM, int blockN, bool enable_pdl,
+                               int const* num_splits_per_request) {
     int qhead_per_khead = cutlass::ceil_div(params.h, params.h_k);
     int num_warps = cutlass::ceil_div(params.b, 31); // warp switch will cap this at 32
     int num_ctas = cutlass::ceil_div(params.b, 31 * 32);
@@ -238,6 +244,7 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 params.tile_count_semaphore,
                 params.prepare_seqlen_q_ptr,
                 params.num_splits_dynamic_ptr,
+                num_splits_per_request,
                 params.varlen_batch_idx_ptr,
                 // params.num_n_blocks_ptr,
                 params.num_nheads_in_l2_ptr,

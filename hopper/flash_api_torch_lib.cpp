@@ -64,7 +64,10 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         const std::optional<Tensor> &s_aux_,
         int const cp_world_size,
         int const cp_rank,
-        const std::optional<Tensor> &cp_tot_seqused_k
+        const std::optional<Tensor> &cp_tot_seqused_k,
+        const std::optional<Tensor> &out_accum,
+        const std::optional<Tensor> &softmax_lse_accum,
+        bool use_fixed_mma_warpgroups
 );
 
 // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
@@ -92,7 +95,9 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        const std::optional<Tensor> &num_splits_per_request,
+        bool use_fixed_mma_warpgroups
 );
 
 namespace {
@@ -157,7 +162,10 @@ std::vector<Tensor> mha_fwd_stable(
     std::optional<Tensor> s_aux,
     int64_t cp_world_size,
     int64_t cp_rank,
-    std::optional<Tensor> cp_tot_seqused_k) {
+    std::optional<Tensor> cp_tot_seqused_k,
+    std::optional<Tensor> out_accum,
+    std::optional<Tensor> softmax_lse_accum,
+    bool use_fixed_mma_warpgroups) {
   return mha_fwd(
       q, k, v,
       k_new,
@@ -193,7 +201,10 @@ std::vector<Tensor> mha_fwd_stable(
       s_aux,
       narrow_int64_to_int(cp_world_size, "cp_world_size"),
       narrow_int64_to_int(cp_rank, "cp_rank"),
-      cp_tot_seqused_k);
+      cp_tot_seqused_k,
+      out_accum,
+      softmax_lse_accum,
+      use_fixed_mma_warpgroups);
 }
 
 Tensor mha_fwd_get_scheduler_metadata_stable(
@@ -219,7 +230,9 @@ Tensor mha_fwd_get_scheduler_metadata_stable(
     bool has_softcap,
     int64_t num_splits,
     std::optional<bool> pack_gqa,
-    int64_t sm_margin) {
+    int64_t sm_margin,
+    std::optional<Tensor> num_splits_per_request,
+    bool use_fixed_mma_warpgroups) {
   return mha_fwd_get_scheduler_metadata(
       narrow_int64_to_int(batch_size, "batch_size"),
       narrow_int64_to_int(max_seqlen_q, "max_seqlen_q"),
@@ -243,7 +256,9 @@ Tensor mha_fwd_get_scheduler_metadata_stable(
       has_softcap,
       narrow_int64_to_int(num_splits, "num_splits"),
       pack_gqa,
-      narrow_int64_to_int(sm_margin, "sm_margin"));
+      narrow_int64_to_int(sm_margin, "sm_margin"),
+      num_splits_per_request,
+      use_fixed_mma_warpgroups);
 }
 
 } // namespace
@@ -288,7 +303,10 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    Tensor?  s_aux,"
             "    int      cp_world_size,"
             "    int      cp_rank,"
-            "    Tensor?  cp_tot_seqused_k) -> Tensor[]");
+            "    Tensor?  cp_tot_seqused_k,"
+            "    Tensor!? out_accum=None,"
+            "    Tensor!? softmax_lse_accum=None,"
+            "    bool     use_fixed_mma_warpgroups=False) -> Tensor[]");
 
     ops.def("get_scheduler_metadata("
             "    int      batch_size,"
@@ -313,7 +331,9 @@ STABLE_TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "    bool     has_softcap,"
             "    int      num_splits,"
             "    bool?    pack_gqa,"
-            "    int      sm_margin) -> Tensor");
+            "    int      sm_margin,"
+            "    Tensor?  num_splits_per_request=None,"
+            "    bool     use_fixed_mma_warpgroups=False) -> Tensor");
 }
 
 STABLE_TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, ops) {

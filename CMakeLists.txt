@@ -182,6 +182,8 @@ if (FA2_ENABLED)
         # FLASHATTENTION_DISABLE_UNEVEN_K
         # FLASHATTENTION_DISABLE_LOCAL
         FLASHATTENTION_DISABLE_PYBIND
+        # vLLM does not call flash_attn_with_kvcache (#107), so do not build the append-KV kernels.
+        FLASHATTENTION_DISABLE_APPENDKV
         # Stable-ABI build: USE_CUDA allows access to CUDA shims
         USE_CUDA
         # TORCH_TARGET_VERSION pins torch 2.10+ and bans unstable usage

@@ -1461,6 +1461,9 @@ mha_fwd_kvcache(Tensor q,                 // batch_size x seqlen_q x num_heads x
                      );
 
     Tensor k, v, k_padded, v_padded;
+#ifdef FLASHATTENTION_DISABLE_APPENDKV
+    STD_TORCH_CHECK(!k_.has_value() && !v_.has_value(), "This flash attention build does not support appending KV.");
+#endif
     if (k_.has_value()) {
         STD_TORCH_CHECK(v_.has_value(), "If key is supplied, value must also be passed in");
         STD_TORCH_CHECK(seqlens_k_.has_value(), "If key is supplied, seqlens_k must also be passed in");

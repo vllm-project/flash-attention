@@ -1,5 +1,4 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
-import fcntl
 import hashlib
 import os
 import pickle
@@ -19,13 +18,21 @@ import tvm_ffi
 from cutlass.cutlass_dsl import JitCompiledFunction
 from flash_attn.cute.fa_logging import fa_log
 
+if os.name == "nt":
+    from flash_attn.cute import _filelock as fcntl
+else:
+    import fcntl
+
 # Pre-load cute DSL runtime libraries with RTLD_GLOBAL so that their symbols
 # (e.g. _cudaLibraryLoadData) are visible to .so modules loaded later via dlopen.
 # Upstream cute.runtime.load_module loads these without RTLD_GLOBAL, which causes
 # "undefined symbol" errors when loading cached kernels from disk.
 for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
     if Path(_lib_path).exists():
-        ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
+        if os.name == "nt":
+            ctypes.CDLL(_lib_path, mode=getattr(ctypes, "RTLD_GLOBAL", 0))
+        else:
+            ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function

@@ -38,6 +38,8 @@ class FlashAttentionForwardCombine:
         num_threads: int = 256,
         stages: int = 4,
         output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        split_groups: int = 1,
+        use_pdl: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -54,6 +56,10 @@ class FlashAttentionForwardCombine:
         :param stages: number of pipeline stages
         :param output_quant_key: compile-time tag for fused quant output,
             see FlashAttentionForwardBase for more details.
+        :param split_groups: number of thread groups that each merge every split_groups-th
+            split before the group sums are added; 1 merges all splits in one pass
+        :param use_pdl: launch with programmatic dependent launch; the kernel waits for the
+            preceding kernel (griddepcontrol.wait) before it reads the partials
         """
         self.dtype = dtype
         self.dtype_partial = dtype_partial
@@ -66,6 +72,11 @@ class FlashAttentionForwardCombine:
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
         self.output_quant_key = output_quant_key
+        self.split_groups = split_groups
+        self.use_pdl = use_pdl
+        assert num_threads % split_groups == 0
+        # The group sums are added in FP32 through the O partial staging buffer.
+        assert split_groups == 1 or dtype_partial == Float32
 
     @staticmethod
     def can_implement(
@@ -110,7 +121,9 @@ class FlashAttentionForwardCombine:
             128 if self.k_block_size % 128 == 0 else (64 if self.k_block_size % 64 == 0 else 32)
         )
         gmem_threads_per_row = k_block_gmem // async_copy_elems
-        assert self.num_threads % gmem_threads_per_row == 0
+        # Each split group loads and stores its own copy of the tile.
+        o_threads = self.num_threads // self.split_groups
+        assert o_threads % gmem_threads_per_row == 0
 
         # Async copy atom for O partial load
         atom_async_copy_partial = cute.make_copy_atom(
@@ -119,7 +132,7 @@ class FlashAttentionForwardCombine:
             num_bits_per_copy=universal_copy_bits,
         )
         tOpartial_layout = cute.make_ordered_layout(
-            (self.num_threads // gmem_threads_per_row, gmem_threads_per_row),
+            (o_threads // gmem_threads_per_row, gmem_threads_per_row),
             order=(1, 0),
         )
         vOpartial_layout = cute.make_layout((1, async_copy_elems))  # 4 vals per load
@@ -201,9 +214,13 @@ class FlashAttentionForwardCombine:
             smem_layout_atom_lse, (self.max_splits, self.tile_m), (0, 1)
         )
 
-        # O partial shared memory layout (simple layout for pipeline stages)
+        # O partial shared memory layout (simple layout for pipeline stages), stages per group
         self.smem_layout_o = cute.make_ordered_layout(
-            (self.tile_m, self.k_block_size, self.stages), order=(1, 0, 2)
+            (self.tile_m, self.k_block_size, self.stages * self.split_groups), order=(1, 0, 2)
+        )
+        # The group sums, one FP32 per thread and tile element, reuse that buffer.
+        assert self.split_groups == 1 or cute.cosize(self.smem_layout_o) >= (
+            self.tile_m * self.k_block_size * self.split_groups
         )
 
     @cute.jit
@@ -359,6 +376,7 @@ class FlashAttentionForwardCombine:
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -495,7 +513,13 @@ class FlashAttentionForwardCombine:
                 # Step 2: Load O_partial for pipeline stages
                 # ===============================
 
-                gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_slice(tidx)
+                # Split group grp merges splits grp, grp + G, ... in its own stages
+                # [grp * stages, (grp + 1) * stages); tidx_o is the thread within its group.
+                G = const_expr(self.split_groups)
+                o_threads = const_expr(self.num_threads // G)
+                tidx_o = tidx if const_expr(G == 1) else tidx % o_threads
+                grp = Int32(0) if const_expr(G == 1) else tidx // o_threads
+                gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_slice(tidx_o)
                 cO = cute.make_identity_tensor((self.tile_m, self.k_block_size))
                 tOcO = gmem_thr_copy_O_partial.partition_D(cO)
                 tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
@@ -542,8 +566,12 @@ class FlashAttentionForwardCombine:
 
                 # Load first few stages of O_partial
                 for stage in cutlass.range(self.stages - 1, unroll_full=True):
-                    if stage < num_splits:
-                        load_O_partial(stage, stage)
+                    if const_expr(G == 1):
+                        if stage < num_splits:
+                            load_O_partial(stage, stage)
+                    else:
+                        if grp + stage * G < num_splits:
+                            load_O_partial(grp + stage * G, grp * self.stages + stage)
                     cute.arch.cp_async_commit_group()
 
                 # ===============================
@@ -666,17 +694,26 @@ class FlashAttentionForwardCombine:
                 stage_load = self.stages - 1
                 stage_compute = 0
 
-                # Main accumulation loop
-                for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
+                # Main accumulation loop: this group's splits grp, grp + G, ...
+                num_group_splits = (
+                    thr_max_valid_split + 1
+                    if const_expr(G == 1)
+                    else (thr_max_valid_split + G - grp) // G
+                )
+                for i in cutlass.range(num_group_splits, unroll=4 if const_expr(G == 1) else 2):
+                    s = i if const_expr(G == 1) else grp + i * G
                     # Get scales for this split
                     scale = cute.make_rmem_tensor(num_rows, Float32)
                     for m in cutlass.range(num_rows, unroll_full=True):
                         scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
 
                     # Load next stage if needed
-                    split_to_load = s + self.stages - 1
+                    split_to_load = s + (self.stages - 1) * G
                     if split_to_load <= thr_max_valid_split:
-                        load_O_partial(split_to_load, stage_load)
+                        load_O_partial(
+                            split_to_load,
+                            stage_load if const_expr(G == 1) else grp * self.stages + stage_load,
+                        )
                     cute.arch.cp_async_commit_group()
                     stage_load = 0 if stage_load == self.stages - 1 else stage_load + 1
 
@@ -684,7 +721,17 @@ class FlashAttentionForwardCombine:
                     cute.arch.cp_async_wait_group(self.stages - 1)
                     # We don't need __syncthreads() because each thread is just reading its own data from smem
                     # Copy from smem to registers
-                    cute.autovec_copy(tOsO_partial[None, None, None, stage_compute], tOrO_partial)
+                    cute.autovec_copy(
+                        tOsO_partial[
+                            None,
+                            None,
+                            None,
+                            stage_compute
+                            if const_expr(G == 1)
+                            else grp * self.stages + stage_compute,
+                        ],
+                        tOrO_partial,
+                    )
                     stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
 
                     # Accumulate scaled partial results
@@ -694,6 +741,28 @@ class FlashAttentionForwardCombine:
                                 tOrO[None, m, None].load()
                                 + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
                             )
+
+                if const_expr(G > 1):
+                    # Add the group sums through the O partial staging buffer, now idle; group
+                    # 0 writes the result.
+                    num_vals = const_expr(cute.size(tOrO))
+                    rO_flat = cute.make_tensor(tOrO.iterator, cute.make_layout(num_vals))
+                    sGroupSum = cute.make_tensor(
+                        sO.iterator, cute.make_layout((o_threads, num_vals, G))
+                    )
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
+                    for v in cutlass.range_constexpr(num_vals):
+                        sGroupSum[tidx_o, v, grp] = rO_flat[v]
+                    cute.arch.sync_threads()
+                    for v in cutlass.range_constexpr(num_vals):
+                        group_sum = sGroupSum[tidx_o, v, 0]
+                        for g in cutlass.range_constexpr(1, G):
+                            group_sum = group_sum + sGroupSum[tidx_o, v, g]
+                        rO_flat[v] = group_sum
+                    if grp != 0:
+                        for m in cutlass.range(num_rows, unroll_full=True):
+                            tOhidx[m] = -1
 
                 # ===============================
                 # Step 7: Write final O to gmem
@@ -712,7 +781,7 @@ class FlashAttentionForwardCombine:
                 mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
                 elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
                 # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
-                gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+                gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx_o)
                 # Write final results
                 for m in cutlass.range(num_rows, unroll_full=True):
                     if tOhidx[m] >= 0:

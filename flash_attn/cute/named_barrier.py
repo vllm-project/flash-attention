@@ -23,6 +23,26 @@ class NamedBarrierFwd(enum.IntEnum):
     PSyncRAW = enum.auto()
 
 
+class NamedBarrierFwdSm90Fp8KV(enum.IntEnum):
+    """Barrier IDs of the SM90 FP8-KV head_dim 512 forward (FlashAttentionForwardSm90Fp8KV).
+
+    That kernel uses none of the NamedBarrierFwd warp-scheduler, dequant or P-sync barriers, so
+    it reuses their IDs for its own hand-offs between the softmax and PV warp groups. The PV
+    warp groups quantize Q with NamedBarrierFwd.NarrowQ, which keeps its ID.
+    PFull0 + s / PEmpty0 + s: P slot s is full (softmax -> PV) / empty (PV -> softmax).
+    """
+
+    QReady = 2  # FP8 Q terms written (PV -> softmax)
+    PFull0 = 3
+    PFull1 = 4
+    PEmpty0 = 5
+    PEmpty1 = 6
+    RowStats = 7  # final row scales and LSE written (softmax -> PV)
+
+
+assert NamedBarrierFwd.NarrowQ not in set(NamedBarrierFwdSm90Fp8KV)
+
+
 class NamedBarrierFwdSm100(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
     TmemPtr = enum.auto()

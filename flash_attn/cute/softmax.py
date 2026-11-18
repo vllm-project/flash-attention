@@ -288,6 +288,16 @@ class Softmax(ParamsBase):
         return row_scale
 
     @cute.jit
+    def rescale_O_if_needed(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
+        """rescale_O, skipped when every row scale of the warp is exactly 1 (the row max did
+        not change), which is the common case once the row max has settled."""
+        needs_rescale = row_scale[0] != 1.0
+        for r in cutlass.range(1, cute.size(row_scale), unroll_full=True):
+            needs_rescale = needs_rescale | (row_scale[r] != 1.0)
+        if cute.arch.vote_any_sync(needs_rescale):
+            self.rescale_O(acc_O, row_scale)
+
+    @cute.jit
     def rescale_O(self, acc_O: cute.Tensor, row_scale: cute.Tensor) -> None:
         """Scale each row of acc_O by the given scale tensor.
         :param acc_O: input tensor

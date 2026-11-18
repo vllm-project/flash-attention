@@ -21,6 +21,8 @@ class NamedBarrierFwd(enum.IntEnum):
     PSync = enum.auto()
     # hdim>256: RAW on sP, after the P store + proxy fence, before the PV GEMM.
     PSyncRAW = enum.auto()
+    # hdim 512 with single_qk_wg: final per-row O scale from MMA WG 0 to WG 1.
+    RowStat = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

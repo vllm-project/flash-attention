@@ -50,6 +50,11 @@ def _get_device_arch_and_num_sms(device_index: int) -> tuple[int, int]:
     return properties.major * 10 + properties.minor, properties.multi_processor_count
 
 
+@lru_cache
+def get_l2_cache_bytes(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).L2_cache_size
+
+
 def get_num_sms_for_selection(device_index: int, arch: int) -> int:
     """Return the SM count of the matching local GPU or cross-compilation target."""
     override = os.getenv("FLASH_ATTENTION_NUM_SMS")

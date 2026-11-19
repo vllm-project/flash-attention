@@ -36,6 +36,16 @@
   #define DROPOUT_SWITCH BOOL_SWITCH
 #endif
 
+#ifdef FLASHATTENTION_DISABLE_APPENDKV
+  #define APPENDKV_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;   \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define APPENDKV_SWITCH BOOL_SWITCH
+#endif
+
 #ifdef FLASHATTENTION_DISABLE_ALIBI
   #define ALIBI_SWITCH(COND, CONST_NAME, ...)   \
   [&] {                                         \

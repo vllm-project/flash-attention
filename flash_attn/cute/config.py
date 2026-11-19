@@ -185,6 +185,11 @@ class FwdHeuristicInputs(NamedTuple):
     def is_hdim256(self) -> bool:
         return self.head_dim == 256 and self.head_dim_v == 256
 
+    @property
+    def is_sm90_native_fp8(self) -> bool:
+        """E4M3 Q/K/V on SM90; the SM90 FP8-KV dequant path has fp16/bf16 Q."""
+        return self.device_capacity == 9 and "float8" in self.dtype
+
 
 def num_splits_heuristic(
     total_mblocks: int,
@@ -286,6 +291,55 @@ def fit_sm90_tile_to_block_sparsity(
     if sparse_block_size_kv < tile_n and sparse_block_size_kv % 16 == 0:
         tile_n = sparse_block_size_kv
     return tile_m, tile_n
+
+
+def select_sm90_native_fp8_tile(inputs: FwdHeuristicInputs) -> tuple[int, int]:
+    """Return (tile_m, tile_n) for the SM90 native FP8 forward.
+
+    Native Hopper FP8 WGMMA requires RS PV and a K extent divisible by 32. The tiles
+    follow FA3's Hopper FP8 tiles where this kernel's shared memory allows.
+    """
+    head_dim, head_dim_v, page_size = inputs.head_dim, inputs.head_dim_v, inputs.page_size
+    is_local, qhead_per_kvhead = inputs.local, inputs.qhead_per_kvhead
+    short_decode = inputs.max_seqlen_q * qhead_per_kvhead <= 64
+    if short_decode and head_dim == head_dim_v == 96:
+        return 64, 128
+    if short_decode and head_dim == head_dim_v == 128 and not is_local:
+        return 64, 96
+    if short_decode and head_dim in (64, 128, 192):
+        return (64, 64 if is_local and page_size == 64 else 96)
+    if short_decode:
+        return (64, 64)
+    if head_dim == 64:
+        return 192, 128
+    if head_dim <= 96:
+        return 192 if qhead_per_kvhead == 1 else 128, 64 if page_size is not None else 96
+    if head_dim <= 128:
+        return 128, 192
+    if head_dim <= 192:
+        return 128, 128 if head_dim_v <= 128 else 96
+    # FA3's 128x128 d256 tile exceeds this kernel's shared-memory budget because the
+    # native FP8 V tile is staged twice (row-major load + K-major PV operand).
+    return 128, 64
+
+
+def fits_two_ctas_sm90_native_fp8(tile_m: int, tile_n: int, head_dim: int, head_dim_v: int) -> bool:
+    """Whether two single-warpgroup native FP8 CTAs (tile_m 64, hdim_v <= 128) fit on one SM,
+    i.e. a 2-stage pipeline fits in half of the SM's shared memory.
+
+    Shared memory per CTA: per stage K + V as loaded + the transposed V
+    (tile_n x (hdim + 2 * hdim_v) bytes), plus the Q / O tile and 1 KB of barriers. An H100 / H200
+    SM has 228 KB of shared memory and reserves 1 KB per CTA (CUTLASS's get_smem_capacity_in_bytes
+    gives the 227 KB per-CTA maximum, not the per-SM total).
+    """
+    smem_per_sm, reserved_per_cta, num_stages = 228 * 1024, 1024, 2
+    smem_bytes = (
+        max(tile_m * head_dim, 2 * tile_m * head_dim_v)
+        + 1024
+        + num_stages * tile_n * (head_dim + 2 * head_dim_v)
+    )
+    budget = smem_per_sm // 2 - reserved_per_cta - 1024
+    return tile_m == 64 and head_dim_v <= 128 and smem_bytes <= budget
 
 
 # === SM100 TUNING KNOBS (agent-editable) ===
@@ -564,6 +618,9 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
     match inputs.device_capacity:
         case 8:
             tile_n = 64
+        case 9 if inputs.is_sm90_native_fp8:
+            tile_m, tile_n = select_sm90_native_fp8_tile(inputs)
+            mma_pv_is_rs, intra_wg_overlap = True, True
         case 9:
             tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap = select_sm90_tile(
                 inputs.head_dim,
@@ -597,6 +654,9 @@ def select_initial_fwd_tile(inputs: FwdHeuristicInputs) -> tuple[int, int, bool,
             mma_pv_is_rs = inputs.requested_mma_pv_is_rs
         if inputs.requested_intra_wg_overlap is not None:
             intra_wg_overlap = inputs.requested_intra_wg_overlap
+        # Native FP8 WGMMA requires RS PV.
+        if inputs.is_sm90_native_fp8:
+            mma_pv_is_rs = True
     return tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap
 
 
@@ -1356,6 +1416,11 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         raise ValueError("SM120 forward only supports num_splits=1")
 
     tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap = select_initial_fwd_tile(inputs)
+    # SM90 native FP8 matches FA3's paged non-TMA launch policy: K/V without TMA use the
+    # PackGQA Q/O copies.
+    if inputs.is_sm90_native_fp8 and inputs.page_size not in (None, tile_n):
+        pack_gqa = True
+        inputs = inputs._replace(pack_gqa=pack_gqa)
     is_sm100_family = device_capacity in (10, 11)
     packed_seqlen_q = inputs.packed_max_seqlen_q
     # Two Q tiles exceed TMEM capacity at hdim_v 256.
@@ -1383,6 +1448,17 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
         else:
             num_splits = 1
+    # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
+    # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
+    # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
+    if inputs.is_sm90_native_fp8:
+        mblocks = max(1, total_mblocks)
+        if num_splits > 1:
+            num_splits = min(num_splits, max(1, num_n_blocks), max(1, inputs.num_sms // mblocks))
+        if inputs.requested_num_splits is None and fits_two_ctas_sm90_native_fp8(
+            tile_m, tile_n, inputs.head_dim, inputs.head_dim_v
+        ):
+            num_splits = max(num_splits, min(2 * inputs.num_sms // mblocks, num_n_blocks // 4, 128))
     if inputs.requested_num_splits is None and num_splits > 1:
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))
 
@@ -1655,6 +1731,8 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
                 raise ValueError("SM80 forward does not support paged KV")
             case 9 if config.tile_m not in (64, 128, 192):
                 raise ValueError(f"SM90 tile_m must be 64, 128, or 192, got {config.tile_m}")
+            case 9 if inputs.is_sm90_native_fp8 and not config.mma_pv_is_rs:
+                raise ValueError("SM90 native FP8 requires mma_pv_is_rs=True")
             case 12 if inputs.page_size is not None or inputs.use_block_sparsity:
                 raise ValueError("SM120 forward does not support paged KV or block sparsity")
         neutral = _FWD_SM100_ONLY_NEUTRAL_FIELDS

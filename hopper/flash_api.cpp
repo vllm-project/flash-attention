@@ -298,6 +298,13 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // HEADDIM_SWITCH(params.d, [&] {
     //     run_mha_fwd_<cutlass::half_t, kHeadSize>(params, stream);
     // });
+    // Early exit for zero-token segments to avoid cuTensorMapEncodeTiled
+    // rejecting zero extents in TMA descriptor initialization.
+    bool const is_varlen = params.cu_seqlens_q != nullptr;
+    int const effective_total_q = !is_varlen ? params.seqlen_q * params.b : params.total_q;
+    if (effective_total_q == 0) {
+        return;
+    }
     STD_TORCH_CHECK(params.num_splits >= 1);
     ARCH_SWITCH(params.arch, Arch, [&] {
         SPLIT_SWITCH(params.num_splits > 1, Split, [&] {

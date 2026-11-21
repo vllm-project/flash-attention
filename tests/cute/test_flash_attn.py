@@ -4591,6 +4591,69 @@ def test_flash_attn_fp8_qkv_descales_sm90(descale_layout, out_dtype):
     assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
 
 
+@pytest.mark.skipif(not IS_SM90, reason="SM90 FP8 Q/K/V")
+@pytest.mark.parametrize("layout", ["dense", "varlen", "packed"])
+@pytest.mark.parametrize("num_splits", [1, 3])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_qkv_unused_v_cache_sm90(layout, num_splits):
+    """SM90 FP8 Q/K/V (native_fp8) bounds non-paged V loads by seqlen_k.
+
+    E4M3 NaN rows past seqlen_k must not reach O, where P = 0 meets them in P @ V. dense and
+    varlen bound each sequence by seqused_k; packed sequences end at cu_seqlens_k, followed by
+    unused rows.
+    """
+    device, fp8, seqlen = "cuda", torch.float8_e4m3fn, 73
+    torch.random.manual_seed(0)
+    q, k, v = (
+        torch.randn(2, s, 8, 64, device=device, dtype=torch.bfloat16) for s in (1, 128, 128)
+    )
+    v[:, seqlen:] = 0
+    poisoned = v.clone()
+    poisoned[:, seqlen:] = float("nan")
+    q, k, v, poisoned = (x.to(fp8) for x in (q, k, v, poisoned))
+
+    def kv_input(t):
+        if layout == "dense":
+            return t
+        if layout == "varlen":
+            return t.flatten(0, 1)
+        return torch.cat([t[:, :seqlen].flatten(0, 1), t[:, seqlen:].flatten(0, 1)])
+
+    def int32(values):
+        return torch.tensor(values, device=device, dtype=torch.int32)
+
+    cu_k = {"varlen": [0, 128, 256], "packed": [0, seqlen, 2 * seqlen]}.get(layout)
+    outputs = [
+        flash_attn_varlen_func(
+            q if layout == "dense" else q.flatten(0, 1),
+            kv_input(k),
+            kv_input(value),
+            cu_seqlens_q=None if layout == "dense" else int32([0, 1, 2]),
+            cu_seqlens_k=None if cu_k is None else int32(cu_k),
+            seqused_k=None if layout == "packed" else int32([seqlen, seqlen]),
+            max_seqlen_q=1,
+            max_seqlen_k=128,
+            num_splits=num_splits,
+            return_lse=True,
+        )
+        for value in (v, poisoned)
+    ]
+    if is_fake_mode():
+        return
+    out = outputs[0][0].reshape(2, 1, 8, 64)
+    assert out.isfinite().all()
+    assert torch.equal(outputs[0][0], outputs[1][0])
+    assert torch.equal(outputs[0][1], outputs[1][1])
+    q_ref, k_ref, v_ref = (x.to(torch.bfloat16) for x in (q, k[:, :seqlen], v[:, :seqlen]))
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref)
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, upcast=False, reorder_ops=True, intermediate_dtype=fp8
+    )
+    print_diff_stats("Output", out, out_ref, out_pt)
+    assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
+    assert (out - out_ref).abs().mean().item() <= 3 * (out_pt - out_ref).abs().mean().item()
+
+
 @pytest.mark.skipif(not IS_SM90, reason="SM90 hdim 512 forward")
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])

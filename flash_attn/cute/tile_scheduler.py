@@ -1472,7 +1472,8 @@ class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
     """Varlen scheduler for launches where every batch has exactly one M block (decode).
 
     The grid is (head, split, batch), so each CTA reads its tile coordinates directly from
-    blockIdx instead of searching the cumulative M-block counts in global memory.
+    blockIdx instead of searching the cumulative M-block counts in global memory. Each CTA
+    gets exactly one tile, which lets the kernel reuse that tile's seqlens.
     """
 
     def __init__(
@@ -1496,6 +1497,11 @@ class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
     @staticmethod
     def get_grid_shape(params, *, loc=None, ip=None):
         d = params.decoder
+        # blockIdx maps directly to (head, split, batch): the inherited CLC and per-batch
+        # metadata paths are not implemented here.
+        assert params.scheduling_mode == SchedulingMode.STATIC
+        assert d.virtual_batch_idx_ptr is None and d.num_splits_dynamic_ptr is None
+        assert not d.nested_mbh_coord
         return (d.num_head, d.num_splits, d.num_batch)
 
     @cute.jit

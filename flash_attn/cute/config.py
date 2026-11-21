@@ -1448,16 +1448,14 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
             num_splits = num_splits_heuristic(total_mblocks, inputs.num_sms, num_n_blocks, 128)
         else:
             num_splits = 1
-    # SM90 native FP8: static splits own whole N tiles, so splits beyond the tile count
-    # are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
-    # With the auto heuristic, splits also fill the second CTA slot when two CTAs fit per SM.
-    if inputs.is_sm90_native_fp8:
+    # SM90 native FP8 auto splits: static splits own whole N tiles, so splits beyond the tile
+    # count are empty, and once the M blocks fill the SMs more splits only add FP32 partials.
+    # Splits also fill the second CTA slot when two CTAs fit per SM.
+    if inputs.is_sm90_native_fp8 and inputs.requested_num_splits is None:
         mblocks = max(1, total_mblocks)
         if num_splits > 1:
             num_splits = min(num_splits, max(1, num_n_blocks), max(1, inputs.num_sms // mblocks))
-        if inputs.requested_num_splits is None and fits_two_ctas_sm90_native_fp8(
-            tile_m, tile_n, inputs.head_dim, inputs.head_dim_v
-        ):
+        if fits_two_ctas_sm90_native_fp8(tile_m, tile_n, inputs.head_dim, inputs.head_dim_v):
             num_splits = max(num_splits, min(2 * inputs.num_sms // mblocks, num_n_blocks // 4, 128))
     if inputs.requested_num_splits is None and num_splits > 1:
         num_splits = max(num_splits, fixed_seqlen_k_num_splits(inputs))

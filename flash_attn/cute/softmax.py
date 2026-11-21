@@ -281,16 +281,11 @@ class Softmax(ParamsBase):
                 LOG2_E = math.log2(math.e)
                 if row_max[r] == -Float32.inf:
                     row_max_scaled = sink_val_cur * LOG2_E
+                sink_log2 = sink_val_cur * LOG2_E - row_max_scaled
                 if cutlass.const_expr(self.max_offset != 0):
-                    # The probabilities carry a 2**max_offset bias; give the sink the same.
-                    row_sum[r] += cute.math.exp2(
-                        sink_val_cur * LOG2_E - row_max_scaled + Float32(self.max_offset),
-                        fastmath=True,
-                    )
-                else:
-                    row_sum[r] += cute.math.exp2(
-                        sink_val_cur * LOG2_E - row_max_scaled, fastmath=True
-                    )
+                    # P carries a 2**max_offset bias; give the sink the same.
+                    sink_log2 = sink_log2 + Float32(self.max_offset)
+                row_sum[r] += cute.math.exp2(sink_log2, fastmath=True)
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]

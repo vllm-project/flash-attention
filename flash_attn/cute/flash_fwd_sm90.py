@@ -634,8 +634,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             and mPageTable is None
             and (mCuSeqlensK is not None or mSeqUsedK is not None)
             and not (isinstance(mV.stride[0], int) and mV.stride[0] == 0)
-            # Native FP8 loads V in load_native_fp8, which does not bound V yet.
-            and not self.native_fp8
         )
         if const_expr(self.ragged_tma_V):
             assert tensormap_workspace is not None, "ragged V TMA loads need a tensormap workspace"
@@ -1123,6 +1121,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     mQ,
                     mK,
                     mV,
+                    mV_gmem,
+                    tensormap_workspace,
                     sQ,
                     sK,
                     sVLoad,
@@ -1746,6 +1746,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        mV_gmem: Optional[cute.Tensor],
+        tensormap_workspace: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sVLoad: cute.Tensor,
@@ -1770,6 +1772,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         operand into sV and hand it to the MMA warpgroups through pipeline_v (FA3's
         Transpose_V scheme). With TMA K/V, warp 0 only issues loads while warps 1-3 transpose.
         Paged K/V whose page size differs from tile_n is loaded as several TMA boxes per tile.
+        Non-paged varlen / seqused_k V loads are bounded by seqlen_k as in load().
         """
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
@@ -1781,6 +1784,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         transpose_v = partial(
             self._transpose_v_stage_native_fp8, pipeline_vload, pipeline_v, sVLoad, sV, tidx
         )
+        # Ragged V as in load(): warp 0, which issues the K/V TMA loads, owns this CTA's copy
+        # of the V descriptor (TensorMapManager acts on warp 0 only).
+        tensormap_manager = None
+        tensormap_V_gmem = None
+        v_desc_ptr = None
+        if const_expr(self.ragged_tma_V):
+            tensormap_manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+            bidx, bidy, bidz = cute.arch.block_idx()
+            gdx, gdy, _ = cute.arch.grid_dim()
+            cta_linear_idx = bidx + bidy * gdx + bidz * gdx * gdy
+            if cta_linear_idx >= cute.size(tensormap_workspace, mode=[0]):
+                # An undersized workspace would silently corrupt memory: fail loudly instead.
+                cute.arch.inline_ptx("trap;", read_only_args=[])
+            tensormap_V_gmem = tensormap_manager.get_tensormap_ptr(
+                tensormap_workspace[(cta_linear_idx, None)].iterator
+            )
+            v_desc_ptr = tensormap_manager.get_tensormap_ptr(
+                tensormap_V_gmem, cute.AddressSpace.generic
+            )
+            tensormap_manager.init_tensormap_from_atom(tma_atom_V, tensormap_V_gmem, 0)
+            tensormap_manager.fence_tensormap_initialization()
+        # The V extent depends on the batch only: rewrite the descriptor when it changes.
+        v_desc_batch_idx = Int32(-1)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1790,6 +1816,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self._seqlen_first is None)
                 else self._seqlen_first
             )
+            if const_expr(self.ragged_tma_V) and batch_idx != v_desc_batch_idx:
+                # Shrink the rows extent (mode 0) of V to this sequence's end: packed
+                # layouts count absolute rows, dense layouts per-batch rows. Extents >= 1.
+                v_desc_batch_idx = batch_idx
+                v_rows_end = (
+                    seqlen.offset_k + seqlen.seqlen_k
+                    if const_expr(seqlen.has_cu_seqlens_k)
+                    else seqlen.seqlen_k
+                )
+                v_rows_end = cutlass.max(v_rows_end, 1)
+                v_shape = list(mV_gmem.shape)
+                v_shape[0] = v_rows_end
+                mV_bounded = cute.make_tensor(
+                    mV_gmem.iterator, cute.make_layout(tuple(v_shape), stride=mV_gmem.stride)
+                )
+                tensormap_manager.update_tensormap(
+                    (mV_bounded,), (tma_atom_V,), (tensormap_V_gmem,), 0, (None,)
+                )
+                tensormap_manager.fence_tensormap_update(tensormap_V_gmem)
+                cute.arch.inline_ptx(
+                    "prefetch.tensormap [{$r0}];", read_only_args=[tensormap_V_gmem.toint()]
+                )
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -1848,7 +1896,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
                     tma_load_K_fn = copy_utils.tma_producer_copy_fn(tma_load_K_fn, pipeline_k)
                     tma_load_V_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV, sVLoad
+                        tma_atom_V,
+                        0,
+                        cute.make_layout(1),
+                        gV,
+                        sVLoad,
+                        **({"tma_desc_ptr": v_desc_ptr} if const_expr(self.ragged_tma_V) else {}),
                     )
                     tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_vload)
             else:
@@ -2541,7 +2594,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 )
-                qk_descale, v_descale_tile = self._load_native_fp8_descales(
+                qk_descale, v_descale_tile = self._load_effective_descales(
                     descale_tensors, batch_idx, head_idx_kv
                 )
                 if const_expr(self.score_mod is None):
@@ -2928,6 +2981,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         return kv_consumer_state
 
+    @staticmethod
+    def _read_descale(t: cute.Tensor, batch_idx: Int32, kv_head_idx: Int32):
+        """One descale from (B, Hkv) storage, possibly broadcast, or a 0-d scalar (native FP8)."""
+        return t[()] if const_expr(len(t.shape) == 0) else t[batch_idx, kv_head_idx]
+
     @cute.jit
     def _load_effective_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
         """Load effective QK score and V output descales, defaulting to identity."""
@@ -2935,43 +2993,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         v_descale = Float32(1.0)
         if const_expr(descale_tensors is not None):
             if const_expr(descale_tensors.q_descale is not None):
-                qk_descale = qk_descale * Float32(descale_tensors.q_descale[batch_idx, kv_head_idx])
+                qk_descale = qk_descale * Float32(
+                    self._read_descale(descale_tensors.q_descale, batch_idx, kv_head_idx)
+                )
             if const_expr(descale_tensors.k_descale is not None):
-                qk_descale = qk_descale * Float32(descale_tensors.k_descale[batch_idx, kv_head_idx])
+                qk_descale = qk_descale * Float32(
+                    self._read_descale(descale_tensors.k_descale, batch_idx, kv_head_idx)
+                )
             if const_expr(descale_tensors.v_descale is not None):
-                v_descale = Float32(descale_tensors.v_descale[batch_idx, kv_head_idx])
-        return qk_descale, v_descale
-
-    @cute.jit
-    def _load_native_fp8_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
-        """Load native FP8 QK score and V output descales from scalar or (B, Hkv) storage."""
-        qk_descale = Float32(1.0)
-        v_descale = Float32(1.0)
-        if const_expr(descale_tensors is not None):
-            if const_expr(descale_tensors.q_descale is not None):
-                q_descale = descale_tensors.q_descale
-                q_scale = (
-                    q_descale[()]
-                    if const_expr(len(q_descale.shape) == 0)
-                    else q_descale[batch_idx, kv_head_idx]
+                v_descale = Float32(
+                    self._read_descale(descale_tensors.v_descale, batch_idx, kv_head_idx)
                 )
-                qk_descale = qk_descale * Float32(q_scale)
-            if const_expr(descale_tensors.k_descale is not None):
-                k_descale = descale_tensors.k_descale
-                k_scale = (
-                    k_descale[()]
-                    if const_expr(len(k_descale.shape) == 0)
-                    else k_descale[batch_idx, kv_head_idx]
-                )
-                qk_descale = qk_descale * Float32(k_scale)
-            if const_expr(descale_tensors.v_descale is not None):
-                v_descale_tensor = descale_tensors.v_descale
-                v_scale = (
-                    v_descale_tensor[()]
-                    if const_expr(len(v_descale_tensor.shape) == 0)
-                    else v_descale_tensor[batch_idx, kv_head_idx]
-                )
-                v_descale = Float32(v_scale)
         return qk_descale, v_descale
 
     @cute.jit

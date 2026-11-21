@@ -1541,6 +1541,8 @@ def _flash_attn_fwd(
     )
     # SM90 native FP8 launch-shape choices; each one is part of the compile key.
     heads_per_tile = qhead_per_kvhead if config.pack_gqa else 1
+    # One M block per batch sizes the grid from max_seqlen_q, so (as in FA2's varlen grid) a
+    # caller's max_seqlen_q must bound every batch's query length; without one it is total_q.
     native_fp8_one_m_block_per_batch = (
         native_fp8
         and cu_seqlens_q is not None

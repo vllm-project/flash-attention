@@ -77,7 +77,7 @@ void set_params_fprop(Flash_fwd_params &params,
 std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
     const int head_size_rounded, const float p_dropout,
-    const int num_splits, const int num_sm, const Tensor &ref);
+    const int num_splits, const int num_sm, const Tensor &ref, const int window_size_left=-1);
 
 void set_params_alibi(Flash_fwd_params &params, std::optional<Tensor> &alibi_slopes_, int batch_size, int num_heads);
 

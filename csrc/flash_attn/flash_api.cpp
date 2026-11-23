@@ -350,8 +350,8 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     if (window_size_left >= 0) {
-        // Splits cover only the blocks inside the window, see compute_attn_1rowblock_splitkv.
-        num_n_blocks = std::min(num_n_blocks, (window_size_left + max_seqlen_q + block_n - 1) / block_n + 1);
+        // Packed decode splits only the blocks inside the window, see compute_attn_1rowblock_splitkv.
+        num_n_blocks = std::min(num_n_blocks, (window_size_left + block_n) / block_n + 1);
     }
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -644,7 +644,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
     if (is_causal) { window_size_right = 0; }
     // A single query sits at the last key position, so no key is to its right.
-    if (max_seqlen_q == 1) { window_size_right = -1; }
+    if (max_seqlen_q == 1 && !is_causal) { window_size_right = -1; }
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 
@@ -653,7 +653,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
     // With a left window, the kernel masks every row of the group as the last query (params.seqlenq_ngroups_swapped).
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && q.size(0) == batch_size && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = torch::stable::reshape(torch::stable::transpose(torch::stable::reshape(q, {batch_size, num_heads_k, ngroups, head_size}), 1, 2), {batch_size * ngroups, num_heads_k, head_size});
@@ -829,12 +829,13 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
         int64_t lse_size_after[] = {num_heads * max_seqlen_q, batch_size};
 
 
-        if (params.num_splits > 1){
+        if (params.num_splits > 1 || !paged_KV){
             // When KV-split is enabled (num_splits > 1), LSE is first computed partially through lse_accum tensors. Then, an additional kernel, combine_attn_seqk_parallel, reduces these partials into the final LSE.
             // This kernel produces LSE in a [seqlen_q, h, b] layout which can be directly used as it is already in the canonical form.
+            // The standard (non-split) forward kernel, used without paged KV, writes the same layout (get_lse_tile).
             softmax_lse = torch::stable::reshape(softmax_lse, {lse_size_after[0], lse_size_after[1]});
         }else{
-            // The standard forward kernel produces LSE in a [b, h, seqlen_q] layout.
+            // The split kernel with a single split (always used with paged KV) writes LSE in a [h, b, seqlen_q] layout.
             // It must be transposed to the canonical [seqlen_q, h, b] layout.
             softmax_lse = torch::stable::reshape(torch::stable::transpose(torch::stable::reshape(softmax_lse, {lse_size_before[0], lse_size_before[1], lse_size_before[2]}), 1, 2), {lse_size_after[0], lse_size_after[1]});
         }

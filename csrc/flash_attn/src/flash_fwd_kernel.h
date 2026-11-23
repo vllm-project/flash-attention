@@ -532,13 +532,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    // With a left window, split only the blocks inside the window.
-    const int n_block_window_min = !Is_local
+    // Packed decode with a left window splits only the blocks inside the window. Its rows are all the last
+    // query, so the window starts at key actual_seqlen_k - 1 - window_size_left.
+    const int n_block_window_min = !(Is_local && params.seqlenq_ngroups_swapped)
         ? 0
-        : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+        : std::max(0, (binfo.actual_seqlen_k - 1 - params.window_size_left) / kBlockN);
     const int n_blocks = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     const int n_blocks_per_split = (n_blocks - n_block_window_min + num_n_splits - 1) / num_n_splits;
-    const int n_block_min = n_block_window_min + n_split_idx * n_blocks_per_split;
+    const int n_block_min = !Is_local
+        ? n_block_window_min + n_split_idx * n_blocks_per_split
+        : std::max(n_block_window_min + n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = std::min(n_blocks, n_block_window_min + (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,

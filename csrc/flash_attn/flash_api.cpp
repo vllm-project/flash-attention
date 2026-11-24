@@ -644,7 +644,7 @@ mha_varlen_fwd(Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
     if (is_causal) { window_size_right = 0; }
     // A single query sits at the last key position, so no key is to its right.
-    if (max_seqlen_q == 1 && !is_causal) { window_size_right = -1; }
+    if (max_seqlen_q == 1 && !is_causal && !alibi_slopes_.has_value()) { window_size_right = -1; }
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
     if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
 

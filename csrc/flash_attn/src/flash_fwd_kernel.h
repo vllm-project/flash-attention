@@ -89,7 +89,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
-    if (Is_causal || Is_local) {
+    // Packed GQA rows are all the last query, which sees every key up to actual_seqlen_k.
+    if (Is_causal || (Is_local && !params.seqlenq_ngroups_swapped)) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
@@ -543,7 +544,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         ? n_block_window_min + n_split_idx * n_blocks_per_split
         : std::max(n_block_window_min + n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = std::min(n_blocks, n_block_window_min + (n_split_idx + 1) * n_blocks_per_split);
-    if (Is_causal || Is_local) {
+    if (Is_causal || (Is_local && !params.seqlenq_ngroups_swapped)) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }

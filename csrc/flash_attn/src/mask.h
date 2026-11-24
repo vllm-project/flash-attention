@@ -172,7 +172,7 @@ struct Mask {
                     const int row_idx_base = row_idx_offset + mi * warp_row_stride;
                     #pragma unroll
                     for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                        const int row_idx = seqlenq_ngroups_swapped ? max_seqlen_q - 1 : row_idx_base + i * 8;
+                        const int row_idx = Is_local && seqlenq_ngroups_swapped ? max_seqlen_q - 1 : row_idx_base + i * 8;
                         const int col_idx_limit_left = std::max(0, row_idx + max_seqlen_k - max_seqlen_q - window_size_left);
                         const int col_idx_limit_right = std::min(max_seqlen_k, row_idx + 1 + max_seqlen_k - max_seqlen_q + window_size_right);
                         #pragma unroll

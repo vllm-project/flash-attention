@@ -70,7 +70,23 @@ def _ref_causal(q, k, v, scale):
     return torch.matmul(p, vf).transpose(0, 1).to(DT)
 
 
-def _run_fa(q, k, v, scale, sk, psc, num_splits, causal):
+def _ref_window(q, k, v, scale, window_left, window_right):
+    """Bottom-right aligned sliding-window reference: query i attends to keys in
+    [i + (Sk - Sq) - window_left, i + (Sk - Sq) + window_right]."""
+    sq, hq, d = q.shape
+    sk = k.shape[0]
+    qf = q.float().transpose(0, 1)
+    kf = _rep(k.float(), hq).transpose(0, 1)
+    vf = _rep(v.float(), hq).transpose(0, 1)
+    s = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    qi = torch.arange(sq, device=DEV).view(1, sq, 1) + (sk - sq)
+    ki = torch.arange(sk, device=DEV).view(1, 1, sk)
+    s = s.masked_fill((ki > qi + window_right) | (ki < qi - window_left), float("-inf"))
+    p = s.softmax(-1)
+    return torch.matmul(p, vf).transpose(0, 1).to(DT)
+
+
+def _run_fa(q, k, v, scale, sk, psc, num_splits, causal, window_size=(None, None)):
     """Single-sequence paged forward through the low-level cute entrypoint."""
     sq, hq, d = q.shape
     hkv = k.shape[1]
@@ -94,6 +110,8 @@ def _run_fa(q, k, v, scale, sk, psc, num_splits, causal):
         page_table=block_table,
         softmax_scale=scale,
         causal=causal,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
         dynamic_causal=dynamic_causal,
         num_splits=num_splits,
         return_lse=True,
@@ -145,3 +163,29 @@ def test_dynamic_causal_causal_splitkv(seqlen_q, seqlen_k, num_splits, head_dim)
     torch.cuda.synchronize()
     err = _rel_err(out, _ref_causal(q, k, v, scale))
     assert err < 2e-2, f"causal psc=1 rel_err={err:.3e}"
+
+
+# Symmetric window as vLLM passes for sliding layers of a mixed causal/bidirectional
+# batch (the kernel compiles local, causal=False). psc == 1 must give causal
+# sliding-window attention: no key to the right of the diagonal, even inside the
+# static right window.
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 512), (256, 2048), (600, 600), (128, 1024)])
+@pytest.mark.parametrize("num_splits", [1, 2])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("window", [127, 300])
+@pytest.mark.parametrize("psc", [0, 1])
+def test_dynamic_causal_local_window(seqlen_q, seqlen_k, num_splits, head_dim, window, psc):
+    torch.manual_seed(0)
+    q = torch.randn(seqlen_q, 16, head_dim, device=DEV, dtype=DT)
+    k = torch.randn(seqlen_k, 2, head_dim, device=DEV, dtype=DT)
+    v = torch.randn(seqlen_k, 2, head_dim, device=DEV, dtype=DT)
+    scale = head_dim ** -0.5
+
+    out = _run_fa(
+        q, k, v, scale, seqlen_k, psc=psc, num_splits=num_splits, causal=False,
+        window_size=(window, window),
+    )
+    torch.cuda.synchronize()
+    ref = _ref_window(q, k, v, scale, window, 0 if psc else window)
+    err = _rel_err(out, ref)
+    assert err < 2e-2, f"local window={window} psc={psc} rel_err={err:.3e}"

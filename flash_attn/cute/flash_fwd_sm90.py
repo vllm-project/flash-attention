@@ -216,7 +216,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     @cute.jit
     def _transpose_v_ldsm_native_fp8(
-        self, sVLoad: cute.Tensor, sV: cute.Tensor, tidx: Int32, stage_idx: Int32
+        self,
+        sVLoad: cute.Tensor,
+        sV: cute.Tensor,
+        tidx: Int32,
+        stage_idx: Int32,
+        row_lo: Optional[Int32],
+        row_hi: Int32,
     ) -> None:
         """Producer-side V transpose (sVLoad row-major -> sV K-major) with LDSM.T / STSM.
 
@@ -237,6 +243,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         first_warp = const_expr(self.num_threads_per_warp_group // cute.arch.WARP_SIZE - num_warps)
         warp_idx = cute.arch.make_warp_uniform(tidx // cute.arch.WARP_SIZE) - first_warp
         lane = cute.arch.lane_idx()
+        t0 = lane % 4
+        # Only the blocks that straddle seqlen_k or the local window's left edge have rows to
+        # zero (warp-uniform).
+        mask_rows = row_hi < self.tile_n
+        if const_expr(row_lo is not None):
+            mask_rows = mask_rows or row_lo > 0
         # One LDSM.T x4 + STSM x4 pair moves a 16 x 32 (n x d) unit. With (t0, t1) =
         # (lane % 4, lane // 4), LDSM.T gives matrix j, byte (b, e) = V[8 * (j % 2) + 2 * t0 + e,
         # 16 * (j // 2) + 2 * t1 + b], and STSM writes register j, byte b to V^T row
@@ -273,6 +285,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             tTranssVLoad[None, unit_a // units_d, unit_a % units_d],
                             tTransrVLoad_a,
                         )
+                        if mask_rows:
+                            self._mask_v_rows_native_fp8(
+                                tTransrVLoad_a, 16 * (unit_a // units_d), t0, row_lo, row_hi
+                            )
                         if const_expr(unit_b < num_units):
                             tTransrVLoad_b = cute.make_rmem_tensor_like(tTranssVLoad[None, 0, 0])
                             cute.copy(
@@ -280,6 +296,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 tTranssVLoad[None, unit_b // units_d, unit_b % units_d],
                                 tTransrVLoad_b,
                             )
+                            if mask_rows:
+                                self._mask_v_rows_native_fp8(
+                                    tTransrVLoad_b, 16 * (unit_b // units_d), t0, row_lo, row_hi
+                                )
                             self._stsm_v_native_fp8(
                                 r2s_tiled_copy_v,
                                 tTransrVLoad_a,
@@ -296,6 +316,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 tTransrVLoad_a,
                                 tTranssV[None, unit_a // units_d, unit_a % units_d],
                             )
+
+    @cute.jit
+    def _mask_v_rows_native_fp8(
+        self,
+        tTransrVLoad: cute.Tensor,
+        n_base: Int32,
+        t0: Int32,
+        row_lo: Optional[Int32],
+        row_hi: Int32,
+    ) -> None:
+        # Zero the V rows outside [row_lo, row_hi) of one LDSM.T'd 16 x 32 unit. Matrix j's
+        # 32-bit register holds rows n_base + 8 * (j % 2) + 2 * t0 + e in its e-th 16-bit half
+        # (see _transpose_v_ldsm_native_fp8). Masked scores give P = 0, but 0 * NaN = NaN in the
+        # P @ V MMA, and page bytes past seqlen_k or left of the local window can encode E4M3
+        # NaN (0x7F / 0xFF).
+        rVLoad = cute.recast_tensor(tTransrVLoad, Int32)
+        for j in cutlass.range_constexpr(4):
+            row0 = n_base + 8 * (j % 2) + 2 * t0
+            keep0 = row0 < row_hi
+            keep1 = row0 + 1 < row_hi
+            if const_expr(row_lo is not None):
+                keep0 = keep0 and row0 >= row_lo
+                keep1 = keep1 and row0 + 1 >= row_lo
+            keep = Int32(0)
+            if keep0:
+                keep = keep | Int32(0x0000FFFF)
+            if keep1:
+                keep = keep | Int32(-65536)  # 0xFFFF0000
+            rVLoad[j] = rVLoad[j] & keep
 
     @cute.jit
     def _stsm_v_native_fp8(
@@ -1781,9 +1830,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_stages
         )
-        transpose_v = partial(
-            self._transpose_v_stage_native_fp8, pipeline_vload, pipeline_v, sVLoad, sV, tidx
-        )
         # Ragged V as in load(): warp 0, which issues the K/V TMA loads, owns this CTA's copy
         # of the V descriptor (TensorMapManager acts on warp 0 only).
         tensormap_manager = None
@@ -1955,6 +2001,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else:
                         n_block_min = Int32(0)
                         n_block_max = n_block_max_full
+            # Keys below kv_idx_min are left of the local window for every query row of this
+            # m_block (as in get_n_block_min_max), so the MMA warps mask them.
+            kv_idx_min = None
+            if const_expr(self.is_local and block_info.window_size_left is not None):
+                m_idx_min = m_block * self.tile_m
+                if const_expr(block_info.qhead_per_kvhead_packgqa > 1):
+                    m_idx_min = m_idx_min // block_info.qhead_per_kvhead_packgqa
+                kv_idx_min = (
+                    m_idx_min + seqlen.seqlen_k - seqlen.seqlen_q - block_info.window_size_left
+                )
+            transpose_v = partial(
+                self._transpose_v_stage_native_fp8,
+                pipeline_vload,
+                pipeline_v,
+                sVLoad,
+                sV,
+                tidx,
+                kv_idx_min=kv_idx_min,
+                kv_idx_max=seqlen.seqlen_k,
+            )
             n_block = (
                 n_block_max - 1 if const_expr(self.use_tma_KV) else cutlass.max(n_block_max - 1, 0)
             )
@@ -2080,6 +2146,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         q_producer_phase ^= 1
         transpose_lag = const_expr(self.num_stages - 1)
         v_transpose_state = kv_producer_state.clone()
+        n_block_transpose = n_block
         num_pending = Int32(1)
         for i in cutlass.range(num_blocks - 1, unroll=1):
             kv_producer_state.advance()
@@ -2099,11 +2166,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
                 )
             if transpose_ready:
-                transpose_v(v_transpose_state)
+                transpose_v(v_transpose_state, n_block_transpose)
+                n_block_transpose -= 1
                 v_transpose_state.advance()
                 num_pending -= 1
         for i in cutlass.range(num_pending, unroll=1):
-            transpose_v(v_transpose_state)
+            transpose_v(v_transpose_state, n_block_transpose)
+            n_block_transpose -= 1
             v_transpose_state.advance()
         kv_producer_state.advance()
         return kv_producer_state
@@ -2149,7 +2218,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(load_Q_cpasync is not None):
                 load_Q_cpasync()
             for i in cutlass.range(num_blocks, unroll=1):
-                transpose_v(kv_producer_state)
+                transpose_v(kv_producer_state, n_block - i)
                 kv_producer_state.advance()
         return kv_producer_state
 
@@ -2235,11 +2304,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sV: cute.Tensor,
         tidx: Int32,
         producer_state: pipeline.PipelineState,
+        n_block: Int32,
+        kv_idx_min: Optional[Int32],
+        kv_idx_max: Int32,
     ):
-        """Wait for one loaded V stage, transpose it into sV, publish it to the MMA warps."""
+        """Wait for block n_block's V stage, transpose it into sV, publish it to the MMA warps.
+        V rows at kv index < kv_idx_min (if given) or >= kv_idx_max are zeroed."""
         pipeline_vload.consumer_wait_w_index_phase(producer_state.index, producer_state.phase ^ 1)
         pipeline_v.producer_acquire(producer_state)
-        self._transpose_v_ldsm_native_fp8(sVLoad, sV, tidx, producer_state.index)
+        row_lo = None
+        if const_expr(kv_idx_min is not None):
+            row_lo = kv_idx_min - n_block * self.tile_n
+        row_hi = kv_idx_max - n_block * self.tile_n
+        self._transpose_v_ldsm_native_fp8(sVLoad, sV, tidx, producer_state.index, row_lo, row_hi)
         cute.arch.fence_view_async_shared()
         pipeline_v.producer_commit(producer_state)
         pipeline_vload.consumer_release_w_index(producer_state.index)

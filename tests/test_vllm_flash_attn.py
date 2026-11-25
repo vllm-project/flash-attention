@@ -522,3 +522,57 @@ def test_sparse_attention_varlen(
         f"{torch.max(torch.abs(out - ref_out))}"
     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(lse - ref_lse))}"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_flash_attn_varlen_zero_tokens(
+    head_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Test vLLM flash_attn_varlen_func with zero-token inputs (total_q=0 or total_k=0)."""
+    torch.set_default_device("cuda")
+    num_heads = 4
+    batch_size = 3
+
+    # Case 1: total_q = 0
+    query = torch.empty(0, num_heads, head_size, dtype=dtype)
+    key = torch.randn(30, num_heads, head_size, dtype=dtype)
+    value = torch.randn_like(key)
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 10, 20, 30], dtype=torch.int32)
+
+    out, lse = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=0,
+        max_seqlen_k=10,
+        return_softmax_lse=True,
+    )
+    assert out.shape == (0, num_heads, head_size)
+    assert lse.shape == (num_heads, 0)
+
+    # Case 2: total_k = 0
+    query = torch.randn(30, num_heads, head_size, dtype=dtype)
+    key = torch.empty(0, num_heads, head_size, dtype=dtype)
+    value = torch.empty(0, num_heads, head_size, dtype=dtype)
+    cu_seqlens_q = torch.tensor([0, 10, 20, 30], dtype=torch.int32)
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32)
+
+    out, lse = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=10,
+        max_seqlen_k=0,
+        return_softmax_lse=True,
+    )
+    assert out.shape == (30, num_heads, head_size)
+    assert lse.shape == (num_heads, 30)
+

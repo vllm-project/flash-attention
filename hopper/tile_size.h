@@ -56,8 +56,11 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             // Decode tiles — independent of two-level accumulation setting
             if (headdim <= 96) {
                 return {64, 128, true, true};
-            } else {
+            } else if (headdim <= 128) {
                 return {64, 96, true, true};
+            } else {
+                // Avoid register spills from two-level accumulation + FP8 V transpose at hd256
+                return {64, 64, true, false};
             }
         } else {
             // Prefill tiles — two-level accumulation needs smaller tiles to reduce
@@ -73,7 +76,9 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             } else if (headdim <= 192) {
                 return {128, 96, true, true};
             } else {
-                return {128, is_local ? 64 : 128, true, !paged_kv_non_TMA};  // TODO: FP8 prefill ~0.54x of BF16 with two-level accum at hd256
+                // Use 1 MMA warpgroup (kBlockM=64, 256 regs/thread) with IntraWGOverlap=false
+                // to avoid heavy register spilling from two-level accum at hd256 (kBlockN=128 fits SMEM).
+                return {64, is_local ? 64 : 128, true, false};
             }
 #else
             if (headdim <= 64) {

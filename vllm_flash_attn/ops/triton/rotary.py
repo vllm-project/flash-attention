@@ -146,13 +146,14 @@ def apply_rotary(
     Arguments:
         x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim).
-        cos: (seqlen_ro, rotary_dim / 2)
-        sin: (seqlen_ro, rotary_dim / 2)
+        cos: (seqlen_ro, rotary_dim / 2). May have a different floating-point
+            dtype than x.
+        sin: (seqlen_ro, rotary_dim / 2). Must have the same dtype as cos.
         seqlen_offsets: integer or integer tensor of size (batch,)
         cu_seqlens: (batch + 1,) or None
         max_seqlen: int
     Returns:
-        y: (batch, seqlen, nheads, headdim)
+        y: (batch, seqlen, nheads, headdim), with the same dtype as x.
     """
     is_varlen = cu_seqlens is not None
     if not is_varlen:
@@ -173,9 +174,6 @@ def apply_rotary(
     assert (
         cos.dtype == sin.dtype
     ), f"cos and sin must have the same dtype, got {cos.dtype} and {sin.dtype}"
-    assert (
-        x.dtype == cos.dtype
-    ), f"Input and cos/sin must have the same dtype, got {x.dtype} and {cos.dtype}"
 
     cos, sin = cos.contiguous(), sin.contiguous()
     if isinstance(seqlen_offsets, torch.Tensor):

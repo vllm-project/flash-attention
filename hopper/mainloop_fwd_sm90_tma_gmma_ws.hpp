@@ -1345,6 +1345,9 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
+            // Local attention offsets K by n_offset (see BlockMN::get_n_block_min_max), so its block
+            // bounds must use the shifted seqlen_k, as BlockMN does; CP does not apply to local.
+            int const tot_seqlen_k = Is_local ? seqlen_k : seqlen_info.tot_seqlen_k;
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
                 auto mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
                 int const m_idx_min = !PackGQA ? m_block * kBlockM : params.qhead_per_khead_divmod.divide(m_block * kBlockM);
@@ -1353,7 +1356,7 @@ struct CollectiveMainloopFwdSm90 {
                 // cp_world_size is guaranteed to be greater than 0
                 int const n_block_min_causal_local_mask =
                     std::max(n_block_min,
-                             (m_idx_min + seqlen_info.tot_seqlen_k - seqlen_q + params.window_size_right) /
+                             (m_idx_min + tot_seqlen_k - seqlen_q + params.window_size_right) /
                              seqlen_info.cp_world_size /
                              kBlockN);
                 #pragma unroll 1
@@ -1370,7 +1373,7 @@ struct CollectiveMainloopFwdSm90 {
                 ? n_block_min
                 : std::max(n_block_min,
                            cute::ceil_div(
-                           cute::ceil_div(m_idx_max + seqlen_info.tot_seqlen_k - seqlen_q - params.window_size_left - seqlen_info.cp_rank,
+                           cute::ceil_div(m_idx_max + tot_seqlen_k - seqlen_q - params.window_size_left - seqlen_info.cp_rank,
                                           seqlen_info.cp_world_size),
                            kBlockN));
             auto no_mask_fn = [](auto& tSrS, int n_block) { };

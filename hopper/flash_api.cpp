@@ -604,7 +604,9 @@ mha_fwd_get_scheduler_metadata(
         bool has_softcap,
         int num_splits,
         std::optional<bool> pack_gqa_,
-        int const sm_margin
+        int const sm_margin,
+        const std::optional<Tensor> &num_splits_per_request,
+        bool use_fixed_mma_warpgroups
         ) {
 
     STD_TORCH_CHECK(qkv_dtype == ScalarType::Half || qkv_dtype == ScalarType::BFloat16 || qkv_dtype == ScalarType::Float8_e4m3fn,
@@ -664,6 +666,7 @@ mha_fwd_get_scheduler_metadata(
     // set to use in split heuristic
     params.num_splits_dynamic_ptr = reinterpret_cast<int*>(1);
 
+    params.use_fixed_mma_warpgroups = use_fixed_mma_warpgroups;
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
@@ -681,6 +684,19 @@ mha_fwd_get_scheduler_metadata(
     // Otherwise the kernel will be launched from cuda:0 device
     // Cast to char to avoid compiler warning about narrowing
     auto device_guard = make_cuda_guard_from_tensor(seqused_k);
+    int const* request_splits = nullptr;
+    if (num_splits_per_request.has_value()) {
+        const auto &splits = num_splits_per_request.value();
+        CHECK_DEVICE(splits);
+        CHECK_CONTIGUOUS(splits);
+        CHECK_SHAPE(splits, batch_size);
+        STD_TORCH_CHECK(splits.get_device_index() == seqused_k.get_device_index()
+                        && splits.scalar_type() == ScalarType::Int,
+                        "num_splits_per_request must be int32 on the KV lengths device");
+        STD_TORCH_CHECK(use_dynamic_split,
+                        "num_splits_per_request requires an enabled dynamic split schedule");
+        request_splits = splits.const_data_ptr<int>();
+    }
     // This needs to be set after get_num_splits
     Tensor tile_count_semaphore;  // Contains the semaphore and optionally num_splits_dynamic
     bool const scheduler_needs_semaphore = params.arch >= 90 || params.num_splits > 1;
@@ -719,7 +735,7 @@ mha_fwd_get_scheduler_metadata(
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto stream = get_current_cuda_stream(seqused_k.get_device_index());
-        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
+        prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/, request_splits);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
     return tile_count_semaphore;
@@ -771,7 +787,10 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
         const std::optional<Tensor> &s_aux_, // (h)
         int const cp_world_size,  // context parallelism (cp) world size
         int const cp_rank,         // cp rank
-        const std::optional<Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
+        const std::optional<Tensor> &cp_tot_seqused_k_, // b. total seqused_k in cp world
+        const std::optional<Tensor> &out_accum_,
+        const std::optional<Tensor> &softmax_lse_accum_,
+        bool use_fixed_mma_warpgroups
         ) {
 
     auto dprops = get_device_prop();
@@ -1055,6 +1074,7 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
     params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
 
+    params.use_fixed_mma_warpgroups = use_fixed_mma_warpgroups;
     params.pagedkv_tma = get_pagedkv_tma(params);
     params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
     // printf("Num splits = %d.\n", params.num_splits);
@@ -1188,6 +1208,12 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
 
     Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = ScalarType::Float;
+    STD_TORCH_CHECK(out_accum_.has_value() == softmax_lse_accum_.has_value(),
+                    "Provide both split accumulators together");
+    if (out_accum_.has_value()) {
+        STD_TORCH_CHECK(is_varlen_q && params.num_splits > 1,
+                        "External split accumulators require varlen split attention");
+    }
     if (params.num_splits > 1) {
         STD_TORCH_CHECK(params.num_splits <= 256, "num_splits > 256 not supported");
         if (!is_varlen_q) {
@@ -1195,6 +1221,23 @@ mha_fwd(Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens
             softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, batch_size, num_heads, seqlen_q}, ScalarType::Float);
             params.oaccum_batch_stride = out_accum.stride(1);
             params.lseaccum_batch_stride = softmax_lse_accum.stride(1);
+        } else if (out_accum_.has_value()) {
+            out_accum = out_accum_.value();
+            softmax_lse_accum = softmax_lse_accum_.value();
+            CHECK_DEVICE(out_accum);
+            CHECK_DEVICE(softmax_lse_accum);
+            CHECK_CONTIGUOUS(out_accum);
+            CHECK_CONTIGUOUS(softmax_lse_accum);
+            STD_TORCH_CHECK(out_accum.scalar_type() == ScalarType::Float
+                            && softmax_lse_accum.scalar_type() == ScalarType::Float
+                            && out_accum.get_device_index() == q.get_device_index()
+                            && softmax_lse_accum.get_device_index() == q.get_device_index(),
+                            "Split accumulators must be FP32 on the query device");
+            STD_TORCH_CHECK(out_accum.dim() == 4 && out_accum.size(2) >= total_q,
+                            "Split accumulators must fit all query tokens");
+            const int64_t token_capacity = out_accum.size(2);
+            CHECK_SHAPE(out_accum, params.num_splits, num_heads, token_capacity, head_size_v);
+            CHECK_SHAPE(softmax_lse_accum, params.num_splits, num_heads, token_capacity);
         } else {
             out_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q, head_size_v}, outaccum_type);
             softmax_lse_accum = torch::stable::new_empty(q, {params.num_splits, num_heads, total_q}, ScalarType::Float);

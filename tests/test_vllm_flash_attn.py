@@ -522,3 +522,73 @@ def test_sparse_attention_varlen(
         f"{torch.max(torch.abs(out - ref_out))}"
     torch.testing.assert_close(lse, ref_lse, atol=2e-2, rtol=1e-2), \
         f"{torch.max(torch.abs(lse - ref_lse))}"
+
+
+@pytest.mark.parametrize("kv_lens", [[16, 40, 33], [17, 40, 1328], [1, 300, 4096, 2049]])
+@pytest.mark.parametrize("num_heads", [(8, 2), (16, 4), (128, 1)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("sliding_window", [None, 16, 1024])
+@pytest.mark.parametrize("pad_max_seqlen_k", [False, True])
+@pytest.mark.parametrize("num_splits", [0, 1])
+@torch.inference_mode()
+def test_varlen_decode_sliding_window_gqa(
+        kv_lens: List[int],
+        num_heads: Tuple[int, int],
+        head_size: int,
+        sliding_window: Optional[int],
+        pad_max_seqlen_k: bool,
+        num_splits: int,
+) -> None:
+    """Single-token GQA decode packs the query heads of a KV head into one tile,
+    with or without a sliding window. Covers more than 64 query heads per KV head,
+    windows longer than the context, and the padded max_seqlen_k that vLLM's
+    CUDA graphs pass. Output and LSE are checked against float32."""
+    if 2 not in VERSIONS:
+        pytest.skip("FA2 is not supported on this device")
+    torch.set_default_device("cuda")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    block_size = 16
+    num_blocks = 2048
+    num_query_heads, num_kv_heads = num_heads
+    num_seqs = len(kv_lens)
+    max_seqlen_k = 8192 if pad_max_seqlen_k else max(kv_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
+    key_cache = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    value_cache = torch.randn_like(key_cache)
+    block_tables = torch.randint(0, num_blocks,
+                                 (num_seqs, (max_seqlen_k + block_size - 1) // block_size),
+                                 dtype=torch.int32)
+    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+
+    output, lse = flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=torch.arange(num_seqs + 1, dtype=torch.int32),
+        seqused_k=torch.tensor(kv_lens, dtype=torch.int32),
+        max_seqlen_q=1,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        return_softmax_lse=True,
+        num_splits=num_splits,
+        fa_version=2,
+    )
+
+    group = num_query_heads // num_kv_heads
+    for i, kv_len in enumerate(kv_lens):
+        blocks = block_tables[i, :(kv_len + block_size - 1) // block_size]
+        k = key_cache[blocks].view(-1, num_kv_heads, head_size)[:kv_len].float()
+        v = value_cache[blocks].view(-1, num_kv_heads, head_size)[:kv_len].float()
+        start = 0 if sliding_window is None else max(0, kv_len - sliding_window)
+        k = k[start:].repeat_interleave(group, dim=1)
+        v = v[start:].repeat_interleave(group, dim=1)
+        scores = torch.einsum("hd,khd->hk", query[i].float() * scale, k)
+        ref_output = torch.einsum("hk,khd->hd", torch.softmax(scores, dim=-1), v)
+        torch.testing.assert_close(output[i].float(), ref_output, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(lse[:, i], torch.logsumexp(scores, dim=-1), atol=1e-3, rtol=0)

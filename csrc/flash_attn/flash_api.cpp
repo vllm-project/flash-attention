@@ -299,15 +299,44 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     });
 }
 
+// Split count with the lowest modeled time, ceil(waves) * (KV blocks per split + overhead),
+// where the overhead covers a split's prologue, epilogue and combine.
+inline int num_splits_wave_aware(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+    constexpr int kSplitOverheadBlocks = 2;
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    int best_splits = 1;
+    long long best_cost = std::numeric_limits<long long>::max();
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        const int blocks_per_split = ceildiv(num_n_blocks, num_splits);
+        if (num_splits > 1 && blocks_per_split == ceildiv(num_n_blocks, num_splits - 1)) { continue; }
+        const long long waves = ceildiv(batch_nheads_mblocks * num_splits, num_SMs);
+        const long long cost = waves * (blocks_per_split + kSplitOverheadBlocks) + (num_splits > 1 ? kSplitOverheadBlocks : 0);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best_splits = num_splits;
+        }
+    }
+    return best_splits;
+}
+
 // Find the number of splits that maximizes the occupancy. For example, if we have
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
 // better than having 3 splits (efficiency = 0.67). However, we also don't want too many
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
-inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+inline int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, bool is_decode = false) {
     // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) {
+        // Unless the last wave would be mostly empty (e.g. 1.2 waves run as 2). For decode, splitting
+        // the KV then evens out the waves.
+        const float n_waves = float(batch_nheads_mblocks) / num_SMs;
+        if (is_decode && n_waves / std::ceil(n_waves) < 0.75f) {
+            return num_splits_wave_aware(batch_nheads_mblocks, num_SMs, num_n_blocks, max_splits);
+        }
+        return 1;
+    }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
@@ -359,7 +388,7 @@ std::tuple<Tensor, Tensor> set_params_splitkv(Flash_fwd_params &params, const in
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128, /*is_decode=*/num_m_blocks == 1);
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::stable::new_empty(ref, {params.num_splits, batch_size, num_heads, max_seqlen_q}, ScalarType::Float);
